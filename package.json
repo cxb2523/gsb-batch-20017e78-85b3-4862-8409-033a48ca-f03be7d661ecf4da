@@ -36,7 +36,9 @@
     "watch": "tsc --watch",
     "lint": "eslint .",
     "prepublishOnly": "npm run build",
-    "docs": "typedoc"
+    "docs": "typedoc",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --loader ./test/esm-loader.mjs ./dist-test/test/bootstrap.js"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "^5.10.0",

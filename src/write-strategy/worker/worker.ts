@@ -13,6 +13,7 @@ class Context {
   private readonly _frameBufferFiller: FrameBufferFiller
   private readonly _fillInterval: number
   private _timerId: number = 0
+  private _stopReported = false
 
   /**
    * Creates an instance ofContext.
@@ -36,17 +37,24 @@ class Context {
     }
     this._timerId = self.setInterval(() => {
       if (!this._frameBufferFiller.fill(this._frameBufferWriter)) {
-        this.stopFrames()
+        // End of data: clear the interval before reporting stop, and report at
+        // most once so a late timer tick cannot send a second 'stop' message.
         self.clearInterval(this._timerId)
         this._timerId = 0
+        this.stopFrames()
       }
     }, this._fillInterval)
   }
 
   /**
-   * Stops the buffer filling process.
+   * Reports that no more frames will be produced.
+   * Idempotent: only the first call posts the 'stop' message to the strategy.
    */
   public stopFrames() {
+    if (this._stopReported) {
+      return
+    }
+    this._stopReported = true
     const message: MessageToStrategy = {
       type: 'stop',
       stopFrames: this._frameBufferWriter.totalFrames,
@@ -141,11 +149,10 @@ export class BufferFillWorker<FillerParams> {
 
   /**
    * Stops the buffer filling process.
+   * A 'stop' message arriving before initialization or after teardown is ignored
+   * instead of throwing, so the main thread can always release the worker safely.
    */
   private stop(): void {
-    if (!this._context) {
-      throw new Error('Error: Context is not created.')
-    }
-    this._context.stop()
+    this._context?.stop()
   }
 }

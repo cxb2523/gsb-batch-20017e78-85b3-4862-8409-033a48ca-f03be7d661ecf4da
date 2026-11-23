@@ -26,6 +26,7 @@ class Context<FillerParams> {
   private readonly _bufferContext: FillerFrameBufferContext
   private readonly _fillerParam: FillerParams
   private readonly _worker: Worker
+  private _stopped = false
 
   /**
    * Creates an instance of PlayContext.
@@ -52,9 +53,17 @@ class Context<FillerParams> {
 
   /**
    * Handles messages from the worker.
+   *
+   * A worker-reported 'stop' and a user-triggered node.stop() can race. Both end
+   * up calling OutputStreamNode.stop(), whose state machine makes the transition
+   * idempotent; once this context has been torn down the worker is already
+   * terminated, so late messages are ignored here as well.
    * @param ev - The message event from the worker.
    */
   private handleWorkerMessage(ev: MessageEvent<MessageToStrategy>): void {
+    if (this._stopped) {
+      return
+    }
     if (ev.data.type === 'stop') {
       this._node.stop(ev.data.stopFrames)
     }
@@ -93,10 +102,23 @@ class Context<FillerParams> {
   }
 
   /**
-   * Stops the worker and terminates it.
+   * Stops the worker: asks it to clear its fill interval, detaches message
+   * handling and terminates it.
+   *
+   * Idempotent so that a worker-reported stop racing with a user stop cannot
+   * terminate (or post to) an already released worker a second time.
    */
   public stopped() {
+    if (this._stopped) {
+      return
+    }
+    this._stopped = true
+    // Ask the worker side to clear its interval timer before the worker is
+    // terminated, exercising the BufferFillWorker 'stop' message path and
+    // guaranteeing no timer survives.
+    const message: MessageToWorker<FillerParams> = { type: 'stop' }
     this._worker.onmessage = null
+    this._worker.postMessage(message)
     this._worker.terminate()
   }
 }
@@ -143,12 +165,21 @@ export class WorkerBufferWriteStrategy<FillerParam> implements BufferWriteStrate
   }
 
   /**
+   * Releases the worker as soon as the node begins stopping, so the worker is
+   * terminated and its fill interval cleared while the processor stop is still
+   * in flight. Idempotent: a worker-reported stop racing with a user stop runs
+   * this release only once.
+   */
+  onStopping(): void {
+    this._context?.stopped()
+  }
+
+  /**
    * Stops the strategy.
+   * Idempotent: the worker (and its interval timer) is released only once,
+   * even if the node stop chain were to invoke teardown more than once.
    */
   onStopped(): void {
-    if (!this._context) {
-      throw new Error('Invalid state: context is null.')
-    }
-    this._context.stopped()
+    this._context?.stopped()
   }
 }

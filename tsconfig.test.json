@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist-test",
+    "module": "esnext",
+    "target": "es2022",
+    "moduleResolution": "bundler",
+    "sourceMap": false,
+    "declaration": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": [
+      "node",
+      "audioworklet"
+    ]
+  },
+  "include": ["src", "test"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-test",
+    "example",
+    "src/stream-node-factory.ts",
+    "src/index.ts"
+  ]
+}

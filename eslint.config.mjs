@@ -5,7 +5,7 @@ import tsEslint from 'typescript-eslint'
 
 export default [
   {
-    ignores: ['**/dist/*', '**/node_modules/*', '**/docs/*'],
+    ignores: ['**/dist/*', '**/dist-test/*', '**/node_modules/*', '**/docs/*'],
   },
   {
     files: ['**/*.ts'],
@@ -14,6 +14,7 @@ export default [
       parserOptions: {
         project: [
           './tsconfig.json',
+          './tsconfig.test.json',
           './example/tsconfig.json',
         ],
       },
@@ -27,4 +28,11 @@ export default [
   },
   ...tsEslint.configs.recommended,
   stylistic.configs['recommended'],
+  {
+    // The offline test runner reports results through the console.
+    files: ['test/**/*.ts'],
+    rules: {
+      'no-console': 'off',
+    },
+  },
 ]

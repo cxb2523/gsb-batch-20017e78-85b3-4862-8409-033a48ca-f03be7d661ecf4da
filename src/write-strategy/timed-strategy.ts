@@ -20,11 +20,17 @@ class PlayContext {
    */
   constructor(node: OutputStreamNode, writer: FrameBufferWriter, filler: FrameBufferFiller, fillInterval: number) {
     this._timerId = window.setInterval(() => {
+      // Once the timer has been cleared or the node has left the 'started' state,
+      // this callback must do nothing: no more filler calls, no stop() on a
+      // node that is stopping or already stopped.
       if (!this._timerId || !node.isStart) {
         return
       }
       try {
         if (!filler.fill(writer)) {
+          // The filler reported end-of-data: clear the interval first so it can
+          // never fire again, then run the node stop chain exactly once.
+          this.cleanup()
           node.stop(writer.totalFrames)
         }
       }
@@ -37,6 +43,8 @@ class PlayContext {
 
   /**
    * Cleans up the timer.
+   * Idempotent: calling it more than once (e.g. interval exhaustion followed by
+   * strategy teardown) never clears an unrelated timer.
    */
   public cleanup() {
     if (this._timerId) {
@@ -99,5 +107,13 @@ export class TimedBufferWriteStrategy implements BufferWriteStrategy {
   onStopped(): void {
     this._context?.cleanup()
     this._context = null
+  }
+
+  /**
+   * Releases the fill interval as soon as the node begins stopping, so no
+   * filler callback (and no strategy-triggered node.stop) can occur afterwards.
+   */
+  onStopping(): void {
+    this._context?.cleanup()
   }
 }

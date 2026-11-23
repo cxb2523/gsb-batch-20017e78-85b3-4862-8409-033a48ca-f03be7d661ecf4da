@@ -28,6 +28,10 @@ export class OutputStreamNode extends AudioWorkletNode {
   private readonly _totalReadFrames: BigUint64Array
   private readonly _strategy: BufferWriteStrategy
   private _state: StreamState = 'ready'
+  // Completion signal shared by every stop() call while the node is stopping,
+  // so repeated stop() calls always observe the same stopping/stopped transition.
+  private _stopPromise: Promise<void> | null = null
+  private _resolveStop: (() => void) | null = null
 
   /**
    * Creates an instance of OutputStreamNode.
@@ -78,12 +82,17 @@ export class OutputStreamNode extends AudioWorkletNode {
       throw new Error('Cannot start playback. Node is not connected.')
     }
     switch (this._state) {
-      case 'ready':
+      case 'ready': {
         this._state = 'started'
         if (!this._strategy.onStart(this)) {
-          this.stop(this.totalWriteFrames)
+          // The strategy could not start (e.g. the filler had no data). Nothing is
+          // processing audio, so there is no processor stop handshake to wait for:
+          // tear the node down immediately and report the failed start.
+          this.handleStopped()
+          return false
         }
         return true
+      }
       case 'started':
         return false
       default:
@@ -95,6 +104,10 @@ export class OutputStreamNode extends AudioWorkletNode {
    * Stop the node processing at a given frame position.
    * Returns a Promise that resolves when the node has completely stopped.
    * The node is disconnected once stopping is complete.
+   *
+   * The started -> stopping -> stopped transition happens at most once:
+   * repeated calls while 'stopping' return the same pending completion promise,
+   * and calls after the node has 'stopped' return the already-settled promise.
    * @param framePosition - The frame position at which to stop the processing, in frames.
    *                   If framePosition is 0 or if the current playback frame position has already passed the specified value,
    *                   the node will stop immediately.
@@ -102,26 +115,44 @@ export class OutputStreamNode extends AudioWorkletNode {
    */
   public stop(framePosition: bigint = BigInt(0)): Promise<void> {
     switch (this._state) {
-      case 'started':
-        return new Promise((resolve) => {
-          this._state = 'stopping'
-          const message: MessageToProcessor = { type: 'stop', framePosition: framePosition }
-          this.port.postMessage(message)
-          this.addEventListener(StopEvent.type, () => {
-            resolve()
-          }, { once: true })
+      case 'started': {
+        const stopPromise = new Promise<void>((resolve) => {
+          this._resolveStop = resolve
         })
+        this._stopPromise = stopPromise
+        this._state = 'stopping'
+        // Release strategy-owned recurring work (timers, workers) immediately so
+        // nothing keeps filling the buffer while the processor stop is in flight.
+        this._strategy.onStopping()
+        const message: MessageToProcessor = { type: 'stop', framePosition: framePosition }
+        this.port.postMessage(message)
+        return stopPromise
+      }
       case 'ready':
+        // Playback never started: no processor stop handshake is required.
         this.handleStopped()
-        break
-      case 'stopped':
-        break
+        return this.stopCompletion()
       case 'stopping':
-        break
+        // Another stop() call (user or strategy) is already in flight: share its signal.
+        return this.stopCompletion()
+      case 'stopped':
+        // Teardown has already completed: reuse the same settled signal.
+        return this.stopCompletion()
       default:
         throw new Error(`Cannot stop playback. Current state: ${this._state}`)
     }
-    return Promise.resolve()
+  }
+
+  /**
+   * Returns the shared stop completion promise, creating an already-resolved one
+   * for transitions that do not go through the stopping state (e.g. stop() in 'ready').
+   * @returns The promise that resolves once the node has stopped.
+   */
+  private stopCompletion(): Promise<void> {
+    if (this._stopPromise === null) {
+      this._stopPromise = Promise.resolve()
+    }
+    return this._stopPromise
   }
 
   /**
@@ -145,13 +176,22 @@ export class OutputStreamNode extends AudioWorkletNode {
   /**
    * Handles the stopping of the node.
    * Disconnects the node and closes the port.
+   *
+   * This is the single teardown point of the stop chain: it is idempotent, so a
+   * processor 'stop' message racing with a strategy-triggered stop() cannot tear
+   * the node (and its strategy resources) down twice.
    */
   private handleStopped() {
+    if (this._state === 'stopped') {
+      return
+    }
+    this._state = 'stopped'
     this._strategy.onStopped()
     this.disconnect()
     this.port.close()
     this.port.onmessage = null
-    this._state = 'stopped'
+    this._resolveStop?.()
+    this._resolveStop = null
   }
 
   /**

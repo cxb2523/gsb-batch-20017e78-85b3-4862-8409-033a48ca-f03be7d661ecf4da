@@ -43,6 +43,12 @@ export class ManualBufferWriteStrategy implements BufferWriteStrategy {
   }
 
   /**
+   * Notifies the strategy that the node is stopping.
+   * The manual strategy owns no recurring work, so there is nothing to release.
+   */
+  onStopping(): void {}
+
+  /**
    * Stops the strategy.
    */
   onStopped(): void {}
