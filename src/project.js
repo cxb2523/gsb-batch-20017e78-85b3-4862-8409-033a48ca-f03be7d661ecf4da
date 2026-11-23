@@ -77,6 +77,9 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
   if (qp !== undefined && !(Number.isInteger(qp) && qp >= 0 && qp <= 51)) throw new Error(`qp must be a whole number from 0 to 51, not ${JSON.stringify(qp)}`);
   if (codec !== undefined && !['auto', 'h264', 'hevc'].includes(codec)) throw new Error(`codec must be auto, h264 or hevc, not ${JSON.stringify(codec)}`);
   const tmp = mkdtempSync(join(tmpdir(), 'motlab-project-')), partial = out + '.part';
+  // The cache is pruned only once the whole render has produced its output. A cancel or a failure throws before this
+  // flips, so an interrupted run neither deletes parts another render may reference nor registers half-finished ones.
+  let committed = false;
   try {
     // One MP4 per scene. The first scene picks the encoder and the rest are forced to the same one, so the parts
     // can be joined without re-encoding.
@@ -90,30 +93,39 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
     const hash = f => createHash('sha256').update(readFileSync(join(dir, f))).digest('hex');
     const hashes = scenes.map(s => hash(s.file));
     const key = o => createHash('sha256').update(JSON.stringify(o)).digest('hex');
+    const mp4Of = k => join(cacheRoot, k + '.mp4'), jsonOf = k => join(cacheRoot, k + '.json');
     // A part is reused only when its cached file still probes as the manifest says, and its encoder and colour range
-    // match the first part, because a stream copy join is only safe when codec, encoder and resolution match.
+    // match the first part, because a stream copy join is only safe when codec, encoder and resolution match. A part
+    // that fails any of these is rendered again instead of being joined into an inconsistent video.
     const getPart = async (k, forced, label, log, render) => {
       used.add(k);
       let suffix = '';
       if (!forced) {
         let m = null;
-        try { m = JSON.parse(readFileSync(join(cacheRoot, k + '.json'), 'utf8')); } catch {}
-        if (m?.key === k && existsSync(join(cacheRoot, k + '.mp4'))) {
-          const v = await probeVideo(join(cacheRoot, k + '.mp4')).catch(() => null);
+        try { m = JSON.parse(readFileSync(jsonOf(k), 'utf8')); } catch {}
+        if (m?.key === k && existsSync(mp4Of(k))) {
+          const v = await probeVideo(mp4Of(k)).catch(() => null);
           if (v && v.frames === m.frames && Math.abs(v.duration - m.duration) <= 0.5 / p.fps && v.width === m.width && v.height === m.height
               && (!parts[0] || (m.hw === parts[0].hw && m.codec === parts[0].codec && m.fullRange === parts[0].fullRange))) {
             log(`${label} (cached)`);
-            return { out: join(cacheRoot, k + '.mp4'), width: m.width, height: m.height, duration: m.duration, frames: m.frames, pageFrames: m.pageFrames, fullRange: m.fullRange, codec: m.codec, hw: m.hw };
+            return { out: mp4Of(k), width: m.width, height: m.height, duration: m.duration, frames: m.frames, pageFrames: m.pageFrames, fullRange: m.fullRange, codec: m.codec, hw: m.hw };
           }
         }
         suffix = ' (no cached part, rendering it)';
       }
       log(label + suffix);
       const summary = await render();
+      // Commit the media first, then the manifest, by an atomic rename. A cancel or crash in here leaves at most an
+      // unreferenced .new file; with no manifest the part can never be picked up, so an unfinished part is never
+      // registered as reusable. renderVideo only returns after its own probe passed, so this is a complete part.
       try {
         mkdirSync(cacheRoot, { recursive: true });
-        writeFileSync(join(cacheRoot, k + '.json'), JSON.stringify({ key: k, codec: summary.codec, hw: summary.hw, fullRange: summary.fullRange,
-          width: summary.width, height: summary.height, frames: summary.frames, pageFrames: summary.pageFrames, duration: summary.duration }));
+        const manifest = JSON.stringify({ key: k, codec: summary.codec, hw: summary.hw, fullRange: summary.fullRange,
+          width: summary.width, height: summary.height, frames: summary.frames, pageFrames: summary.pageFrames, duration: summary.duration });
+        const manifestTmp = jsonOf(k) + '.new';
+        rmSync(manifestTmp, { force: true });   // clear a temp file a crashed earlier attempt left for this key
+        writeFileSync(manifestTmp, manifest);
+        rmSync(jsonOf(k), { force: true }); renameSync(manifestTmp, jsonOf(k));
       } catch (e) { log(`(could not save the cached part: ${e.message})`); }
       return summary;
     };
@@ -127,8 +139,11 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
       signal.throwIfAborted();
       if (jobs[j].kind === 'scene') {
         const k = key({ kind: 'scene', file: scene.file, hash: hashes[i], fps: p.fps, scale, qp, codec, version: VERSION, head: transitionHead(into), tail: transitionTail(next) });
-        const part = await getPart(k, !only || only.includes(i + 1), `\nScene ${i + 1}/${scenes.length}: ${scene.file}`, log, () => renderVideo({ page: join(dir, scene.file), root: dir,
-          out: join(cacheRoot, k + '.mp4'), fps: p.fps, scale, qp, codec, log, signal, progress, head: transitionHead(into), tail: transitionTail(next), ...same() }));
+        // Without --only every part is a cache candidate, so a render restarted after a cancel reuses the parts that
+        // had finished. With --only only the selected scenes are forced to render again.
+        const forced = !!only && only.includes(i + 1);
+        const part = await getPart(k, forced, `\nScene ${i + 1}/${scenes.length}: ${scene.file}`, log, () => renderVideo({ page: join(dir, scene.file), root: dir,
+          out: mp4Of(k), fps: p.fps, scale, qp, codec, log, signal, progress, head: transitionHead(into), tail: transitionTail(next), ...same() }));
         // a stream copy join of parts with different sizes makes an MP4 that changes resolution partway through
         if (parts[0] && (part.width !== parts[0].width || part.height !== parts[0].height))
           throw Object.assign(new Error(`${scene.file} is ${part.width}x${part.height} but ${scenes[0].file} is ${parts[0].width}x${parts[0].height}. All scenes in a project must have the same canvas size`), { final: true });
@@ -140,14 +155,14 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
       const query = new URLSearchParams({ from: scene.file, to: scenes[i + 1].file, offset: (from.pageFrames - transitionTail(next)) / p.fps, frames: next.n,
         fps: p.fps, ...(next.layer ? { layer: next.layer } : { type: next.type, ease: next.ease, params: JSON.stringify(next.params) }) });
       return getPart(tk, !only || only.includes(i + 1) || only.includes(i + 2), `\nTransition ${i + 1} to ${i + 2}: ${next.layer ? `layer ${next.layer}` : next.type}, ${next.n} frames`, log,
-        () => renderVideo({ url: '__motlab/transition.html', query: String(query), root: dir, out: join(cacheRoot, tk + '.mp4'),
+        () => renderVideo({ url: '__motlab/transition.html', query: String(query), root: dir, out: mp4Of(tk),
           fps: p.fps, scale, qp, codec, log, signal, progress, ...same() }));
     };
     // Runs the parts that have no result yet, `width` at a time. When one fails the others are stopped, and the parts
     // that finished are kept. A part's log is printed in one piece when it ends, so parallel logs do not interleave.
     const runAll = async width => {
-      const ctrl = new AbortController(), stop = () => ctrl.abort(signal.reason);
-      signal?.addEventListener('abort', stop);
+      const ctrl = new AbortController(), stop = () => ctrl.abort(signal?.reason);
+      if (signal) signal.addEventListener('abort', stop);
       let free = width; const waiting = [];
       const slot = () => free > 0 ? (free--, Promise.resolve()) : new Promise(r => waiting.push(r));
       const release = () => waiting.length ? waiting.shift()() : free++;
@@ -181,6 +196,11 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
       progress = true; await runAll(1);
     }
     const duration = parts.reduce((sum, s) => sum + s.duration, 0);
+    // Reject before starting ffmpeg when the parts cannot be joined consistently. The colour-range check used to run
+    // only here too, but a cached part with another encoder or range is already re-rendered inside getPart; this is
+    // the backstop that keeps an inconsistent set from ever reaching the concat.
+    if (parts.some(s => s.fullRange !== parts[0].fullRange)) throw new Error('the scenes were encoded with different colour ranges');
+    if (parts.some(s => s.codec !== parts[0].codec || s.hw !== parts[0].hw)) throw new Error('the scenes were encoded with different encoders');
 
     let audio;
     if (p.audio?.length) {
@@ -197,17 +217,24 @@ export async function renderProject({ dir, out, scale, only, parallel, qp, codec
     // Written beside the output first and renamed when complete, so a stopped or failed render leaves no half file.
     signal?.throwIfAborted();
     mkdirSync(dirname(out), { recursive: true });
-    if (parts.some(s => s.fullRange !== parts[0].fullRange)) throw new Error('the scenes were encoded with different colour ranges');
     await finalize({ inputs: parts.map(s => s.out), codec: parts[0].codec, fps: p.fps, audio, out: partial, duration, tmp, signal, fullRange: parts[0].fullRange });
     rmSync(out, { force: true }); renameSync(partial, out);
+    committed = true;   // the output exists; only now may the cache of parts this render did not use be pruned
     // Parts from earlier edits that this render did not use would pile up: one scene edited three times leaves
-    // three versions of its part. A finished render clears out the ones it did not use.
+    // three versions of its part. A finished render clears out the ones it did not use. A cancelled or failed render
+    // never reaches here, so a part still referenced by a next render is never deleted.
     let pruned = 0;
     try {
-      const stale = [...new Set(readdirSync(cacheRoot).map(f => f.match(/^([0-9a-f]{64})\.(mp4|json)$/)?.[1]).filter(Boolean))].filter(k => !used.has(k));
-      for (const k of stale) { rmSync(join(cacheRoot, k + '.mp4'), { force: true }); rmSync(join(cacheRoot, k + '.json'), { force: true }); pruned++; }
+      const stale = [...new Set(readdirSync(cacheRoot).map(f => f.match(/^([0-9a-f]{64})\.(mp4|json|json\.new)$/)?.[1]).filter(Boolean))].filter(k => !used.has(k));
+      for (const k of stale) { for (const f of [k + '.mp4', k + '.json', k + '.json.new']) rmSync(join(cacheRoot, f), { force: true }); }
+      pruned = stale.length;
     } catch {}
     if (pruned) log(`(removed ${pruned} unused cached part${pruned === 1 ? '' : 's'})`);
     log(`\nSAVED ${out} (${scenes.length} scenes${parts.length > scenes.length ? `, ${parts.length - scenes.length} transitions` : ''}, ${duration.toFixed(3)} s${audio ? `, ${p.audio.length} audio files` : ''})`);
-  } finally { rmSync(partial, { force: true }); rmSync(tmp, { recursive: true, force: true }); }
+  } finally {
+    // An interrupted render leaves no half output: the .part (finalize's target) and the temp folder always go. A
+    // render that renamed its output first set committed, so this rmSync is then a harmless no-op.
+    rmSync(partial, { force: true }); rmSync(tmp, { recursive: true, force: true });
+    if (!committed && signal?.aborted) log('\nRender cancelled; finished parts are kept, unfinished parts were not cached.');
+  }
 }

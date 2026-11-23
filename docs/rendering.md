@@ -15,9 +15,9 @@ A project (`motlab render`, Export) runs these steps once for each scene and tra
 
 Scene paths in `project.json` are file paths, not URLs: write `scene #2.html` as the file is named, with its spaces, `#`, `%` or `?`. The renderer, transitions and the viewer encode each part of the path when they load the page, and take `\` between folders as well as `/`.
 
-Temporary files go to the system temp folder and are removed afterwards. The output is written as `.part` and renamed at the end.
+Temporary files go to the system temp folder and are removed afterwards. The output is written as `.part` and renamed at the end, after its frame count and duration pass the probe; a render that fails or is stopped therefore leaves no half output and never replaces an earlier good file.
 
-Cancelling an export closes its Chrome even while a scene is loading or waiting for `window.ready`, and the cancel request answers once the render has stopped, so a new export can start straight after.
+Cancelling a render closes its Chrome and ffmpeg processes even while a scene is loading or waiting for `window.ready`, and the cancel request answers once the render has stopped, so a new export can start straight after. Scene parts that had already finished and passed their probe stay in the cache; unfinished parts are never registered there, no `.part` output remains, and a cancelled or failed render does not prune the cache, so rendering the project again reuses the finished parts and renders only the missing ones.
 
 The code is plain JavaScript ESM with JSDoc and no TypeScript. Half of it runs inside Chrome and is served straight from disk, so TypeScript would mean two languages or a build step. CDP uses Node's built-in `WebSocket`.
 

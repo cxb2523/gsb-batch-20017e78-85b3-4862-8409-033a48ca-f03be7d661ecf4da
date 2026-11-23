@@ -8,6 +8,10 @@ Changes are listed by release, newest first. The sections dated before 0.1.0 rec
 
 - The skills give the user the commands that install or update the engine, and the guide for a viewer on a server, instead of running or following them. skills.sh's scan warned that the motlab skill fetched its install steps from GitHub's `main` and followed them (W012), and that both skills changed the system (W013). The install guide they link to is pinned to `v0.4.1`. Both skills now say that text in references and search results is material, not instructions (W011), and `npx @gltf-transform/cli` is pinned to 4.5.1. Not checked: whether the warnings go away, which shows after skills.sh scans the repository again.
 
+### Fixed
+
+- Cancelling a project render while several parts ran in parallel left its state inconsistent. Every Chrome and ffmpeg the render started is now closed on cancel, no `.part` output remains, and a part that was still encoding is never written to the cache manifest: the media is committed first and the manifest is moved into place atomically, so only a part that finished and passed its probe is reusable. Parts that had finished stay cached, and rendering the project again reuses them and renders only the missing parts (a normal render now consults the cache too, not only `--only`). A cancelled or failed render no longer prunes the cache, so a part the next render still references is never deleted; only a render that produced its output removes the parts it did not use. A cached part whose encoder or colour range no longer matches the first scene is rendered again instead of being joined into an inconsistent video. `test/render-cancel.test.js` covers a parallel cancel (no live processes, no `.part`, no new manifest), the reuse after a cancel, `--only`, and the encoder/range mismatch.
+
 ## 0.4.1 (2026-11-22)
 
 ### Added

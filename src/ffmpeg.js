@@ -3,13 +3,34 @@ import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+// The child processes a render still has running, so cancellation and tests can tell that none was left behind.
+const live = new Set();
+export const liveProcessCount = () => live.size;
+
 export function run(cmd, args, signal) {   // signal: an AbortSignal that kills the process
   return new Promise((ok, no) => {
-    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], signal });
+    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    live.add(p);
+    const gone = () => live.delete(p);
+    // Kill it ourselves on abort as well as through spawn's signal option: on Windows the option only terminates the
+    // direct child, and an explicit kill makes the intent independent of libuv internals. Idempotent and a no-op once
+    // the process has exited.
+    const onAbort = () => { try { p.kill(); } catch {} };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
     let out = '', err = '';
     p.stdout.on('data', d => out += d); p.stderr.on('data', d => err += d);
-    p.on('error', e => no(e.name === 'AbortError' ? signal.reason : new Error(`${cmd} could not start: ${e.message}`)));
-    p.on('close', code => code === 0 ? ok(out) : no(new Error(`${cmd} exited with ${code}: ${err.trim().split('\n').slice(-6).join('\n')}`)));
+    p.on('error', e => {
+      gone(); signal?.removeEventListener('abort', onAbort);
+      no(signal?.aborted ? signal.reason : new Error(`${cmd} could not start: ${e.message}`));
+    });
+    p.on('close', code => {
+      gone(); signal?.removeEventListener('abort', onAbort);
+      if (signal?.aborted) return no(signal.reason);   // a non-zero exit on cancel is the abort, not an ffmpeg failure
+      code === 0 ? ok(out) : no(new Error(`${cmd} exited with ${code}: ${err.trim().split('\n').slice(-6).join('\n')}`));
+    });
   });
 }
 

@@ -1,5 +1,5 @@
 // Launches headless Chrome on the real GPU and talks to it over the DevTools protocol (no dependency: Node's WebSocket).
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -63,6 +63,22 @@ export const SANDBOX_FLAGS = typeof process.getuid === 'function' && process.get
 
 const live = new Set();
 process.on('exit', () => { for (const c of live) c.killSync(); });
+// How many Chrome instances this process launched and has not closed, so cancellation tests can prove none leaked.
+export const liveChromeCount = () => live.size;
+
+// Reap the whole browser tree, not only the main process: on Windows proc.kill() ends the browser but leaves its
+// renderer and GPU children running, which a cancel must not leave behind. This targets one PID tree, never an image
+// name, so it cannot touch another Chrome or any unrelated process.
+function killTree(proc) {
+  if (process.platform === 'win32') {
+    try { execFileSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); return; }
+    catch { /* the tree is already gone, or taskkill is unavailable: fall back to the direct signal */ }
+  } else if (proc.pid) {
+    try { process.kill(-proc.pid, 'SIGKILL'); return; }   // the new process group a detached Chrome got
+    catch { /* not a group leader anymore */ }
+  }
+  try { proc.kill('SIGKILL'); } catch {}
+}
 
 export async function launchChrome({ chromePath, extraArgs = [] }) {
   const profile = mkdtempSync(join(tmpdir(), 'motlab-chrome-'));
@@ -72,7 +88,7 @@ export async function launchChrome({ chromePath, extraArgs = [] }) {
     '--no-first-run', '--no-default-browser-check', '--hide-scrollbars', '--mute-audio',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     '--window-size=1920,1080', ...extraArgs, 'about:blank',
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+  ], { stdio: ['ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' });   // its own process group, reaped by killTree
 
   const wsUrl = await new Promise((ok, no) => {
     let err = '';
@@ -109,10 +125,12 @@ export async function launchChrome({ chromePath, extraArgs = [] }) {
 
   const chrome = {
     send, on,
-    killSync() { try { proc.kill(); } catch {} try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} },
+    killSync() { killTree(proc); try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} },
     async close() {
       live.delete(chrome);
       if (proc.exitCode !== null || proc.signalCode !== null) return chrome.killSync();
+      // Ask Chrome to shut down first (it closes its own children), then reap whatever remains so no renderer or GPU
+      // process outlives the render, including after a cancel.
       const gone = new Promise(r => proc.once('exit', r));
       try { await Promise.race([send('Browser.close'), new Promise(r => setTimeout(r, 2000))]); } catch {}
       await Promise.race([gone, new Promise(r => setTimeout(r, 3000))]);
