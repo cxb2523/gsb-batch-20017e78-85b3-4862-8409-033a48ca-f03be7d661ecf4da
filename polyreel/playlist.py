@@ -158,8 +158,13 @@ class Playlists:
         self._changed()
 
     def remove(self, item: Item) -> None:
+        """Take the item out of whichever list it is in.
+
+        Playing items are removed too: the window is responsible for stopping
+        and reclaiming their tile when this fires (it subscribes to changes).
+        """
         lst = self.list_of(item)
-        if lst is not None and lst is not self.playing:
+        if lst is not None:
             lst.remove(item)
             self._changed()
 
@@ -177,7 +182,12 @@ class Playlists:
         return True
 
     def clear(self) -> None:
+        """Empty every list, including the one currently playing.
+
+        The window stops and reclaims the tiles of playing items in response.
+        """
         self.played.clear()
+        self.playing.clear()
         self.queued.clear()
         self._changed()
 

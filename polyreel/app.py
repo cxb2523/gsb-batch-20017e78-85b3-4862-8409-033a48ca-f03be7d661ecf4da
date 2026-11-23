@@ -81,7 +81,8 @@ class Stage(QWidget):
 class MainWindow(QMainWindow):
     _planned = Signal(object)    # a plan worked out on a background thread
 
-    def __init__(self, paths: list[str], profile: bool = False) -> None:
+    def __init__(self, paths: list[str], profile: bool = False,
+                 tile_factory=None, prober: "Prober | None" = None) -> None:
         super().__init__()
         self._profile_forced = profile    # --profile: log this run whatever the setting
         self.setWindowTitle("Polyreel")
@@ -95,6 +96,8 @@ class MainWindow(QMainWindow):
         self.stage = Stage(self)
         self.setCentralWidget(self.stage)
 
+        # Injectable so the app can run on test doubles without libmpv.
+        self._tile_factory = tile_factory
         self.tiles: dict[int, VideoTile] = {}   # item id -> tile
         self.pool: list[VideoTile] = []         # idle tiles ready for reuse
         self.all_tiles: list[VideoTile] = []
@@ -153,7 +156,9 @@ class MainWindow(QMainWindow):
         self.tray: QSystemTrayIcon | None = None
         self._setup_tray()
 
-        self.prober = Prober(self)
+        if prober is None:
+            prober = Prober(self)
+        self.prober = prober
         self.prober.probed.connect(self._probed)
 
         self._skipped = 0
@@ -384,7 +389,6 @@ class MainWindow(QMainWindow):
             self.pl.start(it)
             tile = self._acquire()
             self.tiles[it.id] = tile
-            tile.user_muted = s.sound == "silent"   # new videos start muted in silent mode
             self._to_load.append((tile, it))
         self._load_next()
         self.layout_ = p.layout
@@ -413,9 +417,14 @@ class MainWindow(QMainWindow):
         started = []
         while self._to_load and len(self._loading) < START_PARALLEL:
             tile, it = self._to_load.pop(0)
-            if self.tiles.get(it.id) is not tile:
+            # The item may have been removed (or the tile bumped/reused)
+            # after the layout was applied but before its load started:
+            # never start a video that is no longer in the playing set.
+            if it not in self.pl.playing or self.tiles.get(it.id) is not tile:
                 continue                  # skipped or bumped before it started
             tile.load(it, start=it.resume_pos, hwdec=self.settings.hwdec)
+            tile.user_muted = self.settings.sound == "silent"   # new videos start muted in silent mode
+            tile.set_muted(tile.user_muted)
             tile.set_paused(self.paused_all)
             self._loading.append(tile)
             started.append(tile)
@@ -431,18 +440,30 @@ class MainWindow(QMainWindow):
     def _acquire(self) -> VideoTile:
         if self.pool:
             return self.pool.pop()
-        tile = VideoTile(self.stage, hwdec=self.settings.hwdec)
-        tile.double_clicked.connect(self._tile_double_clicked)
-        tile.right_clicked.connect(lambda t: self.show_menu(QCursor.pos(), t))
-        tile.finished.connect(self._tile_finished)
-        tile.failed.connect(self._tile_failed)
-        tile.shape_changed.connect(self._tile_shape)
+        if self._tile_factory is not None:
+            tile = self._tile_factory(self.stage)
+        else:
+            tile = VideoTile(self.stage, hwdec=self.settings.hwdec)
+            tile.double_clicked.connect(self._tile_double_clicked)
+            tile.right_clicked.connect(lambda t: self.show_menu(QCursor.pos(), t))
+            tile.finished.connect(self._tile_finished)
+            tile.failed.connect(self._tile_failed)
+            tile.shape_changed.connect(self._tile_shape)
         self.all_tiles.append(tile)
         return tile
 
     def _release(self, tile: VideoTile) -> None:
-        tile.stop()
-        tile.set_muted(True)
+        """Return a tile to the idle pool fully reset.
+
+        It must be stopped, detached from its item, paused and muted, with no
+        per-item sound choices left, so the next item it loads starts clean.
+        """
+        tile.stop()                       # stops playback and clears tile.item
+        tile.set_paused(True)             # a reused tile never starts paused-state confused
+        tile.set_muted(True)              # never let the next item's first frame be heard
+        tile.set_volume(100)
+        tile.user_muted = False
+        tile.keep_sound = False
         self.pool.append(tile)
 
     def _rect_for(self, r: L.Rect, sx: float = 1.0, sy: float = 1.0) -> QRect:
@@ -624,11 +645,55 @@ class MainWindow(QMainWindow):
             self.schedule_soon()
 
     def _remove_ids(self, ids: list[int]) -> None:
-        for i in ids:
-            it = self.pl.find(i)
-            if it:
-                self.pl.remove(it)
+        """Remove items from the lists and pull their tiles off the stage.
+
+        A playing item's tile is stopped and returned to the pool; an item
+        still waiting to start is dropped from the load queues so its video
+        is never opened.  Removing the focused video leaves focus first and
+        restores the other videos' pause state.
+        """
+        removed = [self.pl.find(i) for i in ids]
+        removed = [it for it in removed if it is not None]
+        if not removed:
+            return
+        id_set = {it.id for it in removed}
+        # If the focused video is among the removed ones, leave focus first
+        # so the other videos get their pause state back.
+        focused_item = self.focus_tile.item if self.focus_tile else None
+        if focused_item is not None and focused_item.id in id_set:
+            self.exit_focus(finished=False)
+        # Anything placed but not yet started: cancel its pending load.
+        self._to_load = [(t, it) for (t, it) in self._to_load if it.id not in id_set]
+        # Playing items (including ones mid-load): stop and reclaim the tile.
+        reclaimed: list[VideoTile] = []
+        for it in removed:
+            tile = self.tiles.pop(it.id, None)
+            if tile is not None:
+                reclaimed.append(tile)
+                self._release(tile)      # stop() detaches the item from the tile
+            self.pl.remove(it)
+        # Drop reclaimed tiles from the opening list as well; after stop()
+        # their item is already None, so this has to key off the tile itself.
+        if reclaimed:
+            reclaimed_set = set(map(id, reclaimed))
+            self._loading = [t for t in self._loading if id(t) not in reclaimed_set]
         self._update_message()
+        self.schedule_soon()
+
+    def _clear(self) -> None:
+        """Empty every list: stop the whole wall and return all its tiles."""
+        if self.focus_tile:
+            self.exit_focus(finished=False)
+        self._to_load.clear()
+        self._loading.clear()
+        for tile in list(self.tiles.values()):
+            self._release(tile)
+        self.tiles.clear()
+        self.pl.clear()
+        self.layout_ = None
+        self._apply_layout(animate=False)
+        self._update_message()
+        self.schedule_soon()
 
     def show_menu(self, global_pos, tile: VideoTile | None) -> None:
         m = QMenu(self)
@@ -648,12 +713,8 @@ class MainWindow(QMainWindow):
         m.addAction("Settings…", self.open_settings)
         m.addAction("Run benchmark", self.start_benchmark)
         m.addSeparator()
-        m.addAction("Clear played and queued", self._clear)
+        m.addAction("Clear all playlists", self._clear)
         m.exec(global_pos)
-
-    def _clear(self) -> None:
-        self.pl.clear()
-        self._update_message()
 
     def open_settings(self) -> None:
         if self.bench:

@@ -321,12 +321,15 @@ class VideoTile(QWidget):
         self.item = item
         self._active = False
         self._paused = False
+        # A reused tile starts with a clean slate: none of the previous
+        # item's sound choices carry over (the window sets them for this item).
+        self.user_muted = False
+        self.keep_sound = False
         if hwdec:
             self._set("hwdec", hwdec)
         self._set("start", f"{start:.3f}" if start > 0 else "none")
         self._set("loop-file", "inf" if loop else "no")
         self.set_volume(100)  # a reused tile starts at full volume again
-        self.keep_sound = False
         self._set("pause", False)
         self._file += 1
         self.polled_at = 0.0

@@ -157,6 +157,31 @@ def test_playlists_flow():
     assert calls
 
 
+def test_remove_works_on_every_list():
+    pl = Playlists()
+    a, b, c = pl.add(["/a.mp4", "/b.mp4", "/c.mp4"])
+    pl.start(a)                 # a is now playing
+    pl.remove(a)
+    assert a not in pl.playing and pl.find(a.id) is None
+    pl.remove(b)                # b was queued
+    assert b not in pl.queued and pl.find(b.id) is None
+    pl.start(c)
+    pl.finish(c)                # c is now in played
+    pl.remove(c)
+    assert c not in pl.played and pl.find(c.id) is None
+    assert len(pl) == 0
+
+
+def test_clear_empties_all_three_lists():
+    pl = Playlists()
+    a, b, c = pl.add(["/a.mp4", "/b.mp4", "/c.mp4"])
+    pl.start(a)
+    pl.finish(b)
+    pl.clear()
+    assert pl.playing == [] and pl.queued == [] and pl.played == []
+    assert len(pl) == 0
+
+
 def test_perf_monitor_levels():
     m = PerfMonitor(smoothing=1.0)
     assert m.update({}, 1.0) == IDLE

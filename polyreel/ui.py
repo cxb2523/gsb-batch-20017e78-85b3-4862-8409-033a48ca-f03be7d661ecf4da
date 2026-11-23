@@ -506,6 +506,8 @@ class Drawer(QFrame):
         elif i == 1:
             m.addAction("Focus (fill window)", lambda: self.focus.emit(ids[0]))
             m.addAction("Skip", lambda: [self.skip.emit(x) for x in ids])
+            m.addSeparator()
+            m.addAction("Remove from list", lambda: self.remove.emit(ids))
         else:
             m.addAction("Play next", lambda: [self.play_now.emit(x) for x in reversed(ids)])
             m.addAction("Move to end", lambda: [self.requeue.emit(x, False) for x in ids])
