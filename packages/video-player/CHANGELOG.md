@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Fixed seek thumbnails leaking across source switches: switching video sources now cancels the previous source's in-flight VTT request, so a late response can no longer mount the previous episode's container or hover listeners on the new video. Re-loading the same source reuses the existing thumbnail container instead of stacking another one, and a failed/empty VTT leaves no DOM behind
+
 ## [1.0.0-beta.7]
 
 - Analytics: when the page is driven by automation (`navigator.webdriver` is `true`, e.g. Playwright, Puppeteer, Selenium), the analytics context includes `webdriver: true` so automated views can be flagged as bots

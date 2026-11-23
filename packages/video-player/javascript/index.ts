@@ -42,7 +42,6 @@ class ImageKitVideoPlayerPlugin extends Plugin {
   private currentSource_: SourceOptions | null = null;
   private originalCurrentSource_: SourceOptions | null = null;
   private playlistManager_?: PlaylistManager;
-  private seekThumbnailsManager_?: SeekThumbnailsManager;
   private shoppableManager_?: ShoppableManager;
   private analyticsHandle_?: AnalyticsTrackerHandle;
   private cleanup_ = new CleanupRegistry();
@@ -82,11 +81,6 @@ class ImageKitVideoPlayerPlugin extends Plugin {
       }
 
       this.player.on('loadstart', async () => {
-        if (this.seekThumbnailsManager_) {
-          this.seekThumbnailsManager_.destroy(this.player);
-          this.seekThumbnailsManager_ = undefined;
-        }
-
         if (this.shoppableManager_) {
           this.shoppableManager_.destroy();
           this.shoppableManager_ = undefined;
@@ -95,17 +89,19 @@ class ImageKitVideoPlayerPlugin extends Plugin {
         const initPromises: Promise<void>[] = [];
 
         if (this.ikGlobalSettings_.seekThumbnails && this.currentSource_) {
+          // The manager owns its own lifecycle: a request for a superseded source resolves
+          // to null and never registers itself, and a repeated load of the same source
+          // reuses the existing manager instead of stacking another container/listener.
           initPromises.push(
             SeekThumbnailsManager.initSeekThumbnails(
               this.player,
               this.currentSource_,
               this.ikGlobalSettings_
-            ).then(mgr => {
-              if (mgr) {
-                this.seekThumbnailsManager_ = mgr;
-              }
-            })
+            ).then(() => undefined)
           );
+        } else {
+          // Thumbnails disabled (or no source): drop the previous source's request, DOM and listeners.
+          SeekThumbnailsManager.destroyForPlayer(this.player);
         }
 
         initPromises.push(
@@ -254,6 +250,7 @@ class ImageKitVideoPlayerPlugin extends Plugin {
    * Clean up all event listeners and resources when the plugin is disposed.
    */
   dispose(): void {
+    SeekThumbnailsManager.destroyForPlayer(this.player);
     this.cleanup_.dispose();
     super.dispose();
   }

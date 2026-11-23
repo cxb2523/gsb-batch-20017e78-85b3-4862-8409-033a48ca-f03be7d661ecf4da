@@ -35,6 +35,8 @@
   ],
   "scripts": {
     "build": "yarn run build:tsup && yarn run build:css && yarn run build:assets",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "build:tsup": "tsup --tsconfig tsconfig.tsup.json",
     "build:css": "sass --load-path=./node_modules javascript/styles/index.scss dist/styles.css",
     "build:assets": "cp -r javascript/assets dist/ && mkdir -p dist/astro && cp astro/IKVideoPlayer.astro dist/astro/IKVideoPlayer.astro",
@@ -68,6 +70,7 @@
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
     "astro": "^3.0.0",
+    "jsdom": "^31.0.1",
     "lodash": "^4.17.21",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
@@ -75,6 +78,8 @@
     "tsup": "^8.3.5",
     "typescript": "~5.8.0",
     "video.js": "8.23.3",
+    "vite": "^7",
+    "vitest": "^5.1.1",
     "vue": "^3.0.0"
   },
   "repository": {

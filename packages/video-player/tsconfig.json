@@ -30,6 +30,8 @@
   "exclude": [
     "dist/**/*", // Exclude the dist folder to prevent circular dependencies
     "react-wrapper/**/*",
-    "vue/**/*"
+    "vue/**/*",
+    "test/**/*", // Test + runner configs are type-checked by vitest, not the library build
+    "vitest.config.ts"
   ]
 }
