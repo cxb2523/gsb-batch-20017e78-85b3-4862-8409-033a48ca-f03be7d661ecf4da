@@ -50,6 +50,15 @@ export class AdaptiveController {
   private lastSwapAt:       number = 0
   private overshootStart:   number = 0    // first time fps < threshold; reset on recovery
   private headroomStart:    number = 0    // first time modelMs comfortable; reset on spike
+  // Swaps fetch weights and rebuild the preset asynchronously. Only one may
+  // be in flight at a time: a second concurrent fetch/swap would race and
+  // leave currentPresetIdx disagreeing with what the renderer actually runs.
+  private swapInFlight:     boolean = false
+  // stop() must be final for the in-flight swap it interrupts: its late
+  // result (or failure) must not be applied. `epoch` is bumped by stop()/
+  // start() so a swap captures an epoch and only applies if it's unchanged.
+  private stopped:          boolean = false
+  private epoch:            number  = 0
 
   constructor(private opts: AdaptiveOptions, now: number = performance.now()) {
     this.currentPresetIdx = PRESETS.findIndex(p => p.model === opts.initialModel)
@@ -59,6 +68,10 @@ export class AdaptiveController {
   get currentModel(): ModelName { return PRESETS[this.currentPresetIdx]?.model ?? this.opts.initialModel }
 
   start(): void {
+    if (this.timer) clearInterval(this.timer)
+    this.stopped      = false
+    this.swapInFlight = false
+    this.epoch++
     log(`started; backend=${this.opts.backendKind} initial=${this.opts.initialModel} idx=${this.currentPresetIdx}`)
     this.timer = setInterval(() => {
       this.tick().catch(err => log('tick failed:', err))
@@ -68,17 +81,34 @@ export class AdaptiveController {
   stop(): void {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    // No new swaps after this point; an in-flight one is abandoned when it
+    // settles (see swap()). Bumping the epoch invalidates any result that
+    // arrives later, including one from a previous start().
+    this.stopped      = true
+    this.swapInFlight = false
+    this.epoch++
   }
 
   // One poll. Public (with an injectable clock) so tests can drive it.
   async tick(now: number = performance.now()): Promise<void> {
+    if (this.stopped) return
     // Background tabs throttle setInterval/raf; modelMs/fps numbers are
     // unreliable. Skip the tick rather than risk a spurious downgrade.
     if (typeof document !== 'undefined' && document.hidden) return
+    // A swap is already fetching weights / rebuilding the preset. Polling
+    // again now would only race it; the controller re-evaluates after it
+    // settles (cooldown included).
+    if (this.swapInFlight) return
 
     if (now - this.lastSwapAt < COOLDOWN_MS) return
 
+    const epoch  = this.epoch
     const stats  = await this.opts.getStats()
+    // stop() (or a restart) while stats were in flight: don't start a swap.
+    // Another tick may also have started a swap in the meantime — re-check
+    // the gate and cooldown against the (possibly stale) captured clock.
+    if (this.stopped || this.swapInFlight || epoch !== this.epoch) return
+    if (now - this.lastSwapAt < COOLDOWN_MS) return
     const target = this.targetFps()
 
     // Downgrade — both backends, FPS-based, relative to the input rate.
@@ -88,6 +118,12 @@ export class AdaptiveController {
     } else {
       this.overshootStart = 0
     }
+
+    // A downgrade started a swap (or one is already in flight): don't also
+    // evaluate the upgrade path from the same stats — unlike the tier walk,
+    // a real downgrade is enough for this poll, and stacking a second swap
+    // would race it. The next poll re-evaluates after cooldown.
+    if (this.swapInFlight) return
 
     // Upgrade — WebGPU only, modelMs-based. WebGL stats don't have GPU
     // timing because per-frame fence sync is too heavy.
@@ -129,30 +165,58 @@ export class AdaptiveController {
   }
 
   private async swap(idx: number, now: number): Promise<void> {
+    // Single-flight gate. Everything below runs without interleaving up to
+    // the first await, so checking and setting here is atomic w.r.t. tick()
+    // and the other try*() call in the same tick.
+    if (this.swapInFlight || this.stopped) return
+    this.swapInFlight = true
+
+    const epoch = this.epoch
     const preset = PRESETS[idx]
     // Start cooldown immediately (before the async fetch) so the next
-    // poll can't trigger another swap while this one is in flight.
+    // poll can't trigger another swap while this one is in flight. If the
+    // swap fails the cooldown has still been consumed.
     this.lastSwapAt     = now
     this.overshootStart = 0
     this.headroomStart  = 0
     try {
       const weights = await this.opts.fetchWeights(preset.model)
+      // stop() (or restart) landed while weights were in flight: abandon.
+      if (this.stopped || epoch !== this.epoch) {
+        log(`swap to ${preset.model} abandoned (controller stopped)`)
+        return
+      }
       // Pass the full ManualPreset (resolution / skipFrames included).
       await this.opts.swapPreset(preset, weights)
+      if (this.stopped || epoch !== this.epoch) {
+        log(`swap to ${preset.model} finished after stop; not recording preset`)
+        return
+      }
       this.currentPresetIdx = idx
+      // Reset overshoot / headroom windows: the stats behind them describe
+      // the old tier, and acting on them right after the swap would flip
+      // straight back before the new tier has had a chance to settle.
+      this.overshootStart = 0
+      this.headroomStart  = 0
       log(`swap to ${preset.model} done`)
     } catch (err) {
-      log('swap failed:', err)
       // Leave currentPresetIdx unchanged; cooldown still applies so we
-      // don't immediately retry.
-      this.opts.onError?.({
-        type:        'adaptive',
-        fatal:       false,
-        message:     `adaptive preset swap failed: ${(err as Error).message ?? String(err)}`,
-        source:      'adaptive',
-        recoverable: true,
-        cause:       err,
-      })
+      // don't immediately retry. A swap interrupted by stop() is silent.
+      if (!this.stopped && epoch === this.epoch) {
+        log('swap failed:', err)
+        this.opts.onError?.({
+          type:        'adaptive',
+          fatal:       false,
+          message:     `adaptive preset swap failed: ${(err as Error).message ?? String(err)}`,
+          source:      'adaptive',
+          recoverable: true,
+          cause:       err,
+        })
+      }
+    } finally {
+      // Only the epoch that owns the flight clears it; a stop() already
+      // cleared it, and a restarted controller has its own gate.
+      if (epoch === this.epoch) this.swapInFlight = false
     }
   }
 }
