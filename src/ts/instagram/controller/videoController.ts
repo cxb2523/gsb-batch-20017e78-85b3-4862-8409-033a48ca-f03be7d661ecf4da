@@ -24,6 +24,10 @@ export abstract class VideoController {
     // The main control background element.
     protected videoControlElement: HTMLElement | undefined;
 
+    // Aborts the listeners registered on elements outside of the control bar (e.g. the video element).
+    // A controller can be recreated on control mode changes, so these listeners must not pile up.
+    private controlListeners = new AbortController();
+
     // Create the control background.
     protected createVideoControlBackground() {
         const videoRootElement = this.videoPlayer.videoRootElementRef?.deref();
@@ -38,11 +42,18 @@ export abstract class VideoController {
         }
         videoRootElement.appendChild(this.videoControlElement);
 
+        // Create a fresh abort controller, in case the controller is recreated after `remove` was called.
+        this.controlListeners = new AbortController();
+
         // Disable the video click event and not redirect to the post url on interaction.
         if (this.videoElement) {
-            this.videoElement.addEventListener('click', (ev) => {
-                ev.stopPropagation();
-            });
+            this.videoElement.addEventListener(
+                'click',
+                (ev) => {
+                    ev.stopPropagation();
+                },
+                { signal: this.controlListeners.signal }
+            );
         }
     }
 
@@ -101,6 +112,9 @@ export abstract class VideoController {
 
     // Removes the video controls
     public remove() {
+        // Remove all listeners registered outside of the control bar, even if the video element is gone.
+        this.controlListeners.abort();
+
         if (!this.videoElement) return;
 
         // Remove controls

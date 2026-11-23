@@ -28,6 +28,7 @@
         "lint": "eslint ./src/ts",
         "pack": "node ./pack.js",
         "compile": "webpack",
+        "demo": "webpack --config webpack.demo.config.js",
         "prettier": "prettier -c .",
         "prettier:fix": "prettier -w .",
         "test": "jest",

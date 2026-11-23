@@ -42,6 +42,31 @@ npm run build
 
 The built extensions are located in `./dist`.
 
+## Testing
+
+Run the unit tests:
+
+```
+npm test
+```
+
+The tests cover the control bar rebuild behavior (dragging a slider while a
+setting change rebuilds the controls) and the cross-video volume
+synchronization, including the ignore window that counteracts Instagram muting
+videos on playback start.
+
+There is also a runnable demo that shows the same behavior in a real browser:
+
+```
+npm run demo
+```
+
+Then open `samples/rebuild-demo/index.html` to try it manually, or
+`samples/rebuild-demo/selfcheck.html` to run the automated checks. Drag a bar
+and click "Rebuild controls" while still holding the mouse button. The demo
+reports whether the rebuilt bar matches the video state and whether the drag
+continues.
+
 ## Debugging
 
 Always make sure you have built the extension with the previous steps.

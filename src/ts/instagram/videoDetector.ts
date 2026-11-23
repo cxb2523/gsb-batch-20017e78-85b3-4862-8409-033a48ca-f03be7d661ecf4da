@@ -271,7 +271,16 @@ export class VideoDetector implements PlaybackManager {
     private lastPlaybackMuted: boolean = true;
 
     // Sometimes Instagram resets the volume on play. We want to ignore it, since it isn't a user event.
-    private ignoreNextVolumeChange = false;
+    // The window is bound to the player whose playback triggered it. Changes of any other player, and any change the
+    // user made, are always applied - the window must never swallow them.
+    private volumeIgnoreWindow?: {
+        videoPlayer: VideoPlayer;
+        expiresAt: number;
+        timerId: ReturnType<typeof setTimeout>;
+    };
+
+    // How long after a playback start volume changes are considered to be caused by Instagram.
+    private static readonly volumeIgnoreWindowDuration = 50;
 
     // Applies the stored volume to all registered videos.
     private updateVolumeForVideos() {
@@ -294,6 +303,44 @@ export class VideoDetector implements PlaybackManager {
 
         videoElement.volume = volume;
         videoElement.muted = this.lastPlaybackMuted;
+    }
+
+    // Opens the ignore window for the given player.
+    private openVolumeIgnoreWindow(videoPlayer: VideoPlayer) {
+        this.closeVolumeIgnoreWindow();
+
+        const ignoreWindow = {
+            videoPlayer,
+            expiresAt: Date.now() + VideoDetector.volumeIgnoreWindowDuration,
+            timerId: setTimeout(() => {
+                // Only close if this window was not replaced by a newer one.
+                if (this.volumeIgnoreWindow !== ignoreWindow) return;
+                this.volumeIgnoreWindow = undefined;
+            }, VideoDetector.volumeIgnoreWindowDuration),
+        };
+        this.volumeIgnoreWindow = ignoreWindow;
+    }
+
+    // Closes the current ignore window, if any.
+    private closeVolumeIgnoreWindow() {
+        if (!this.volumeIgnoreWindow) return;
+        clearTimeout(this.volumeIgnoreWindow.timerId);
+        this.volumeIgnoreWindow = undefined;
+    }
+
+    // Returns if changes of the given player should be reverted right now.
+    private isVolumeIgnored(videoPlayer: VideoPlayer): boolean {
+        const ignoreWindow = this.volumeIgnoreWindow;
+        if (!ignoreWindow) return false;
+
+        // A window that should have been closed already must not affect anything anymore.
+        if (Date.now() >= ignoreWindow.expiresAt) {
+            this.closeVolumeIgnoreWindow();
+            return false;
+        }
+
+        // The window only covers the playback that opened it.
+        return ignoreWindow.videoPlayer === videoPlayer;
     }
 
     //#endregion
@@ -380,19 +427,20 @@ export class VideoDetector implements PlaybackManager {
 
     // Must be called whenever a video playback was started.
     public notifyVideoPlay(videoPlayer: VideoPlayer) {
-        // Instagram will mute videos in Reels as soon as playback starts. To counter this we will ignore the next volume
-        // change event and undo the volume / mute change.
-        this.ignoreNextVolumeChange = true;
-        setTimeout(() => {
-            this.ignoreNextVolumeChange = false;
-        }, 50);
+        // Instagram will mute videos in Reels as soon as playback starts. To counter this we will ignore the volume
+        // changes of this specific playback and undo them. The window is bound to this player, so it cannot swallow
+        // changes of other videos or any user interaction.
+        this.openVolumeIgnoreWindow(videoPlayer);
 
         // Make sure we apply the last used volume settings.
         this.updateVolumeForVideo(videoPlayer);
     }
 
     // Must be called whenever a video volume was changed.
-    public notifyVideoVolumeChange(videoPlayer: VideoPlayer) {
+    public notifyVideoVolumeChange(
+        videoPlayer: VideoPlayer,
+        userInitiated: boolean = false
+    ) {
         const videoElement = videoPlayer.videoElementRef?.deref();
         if (!videoElement) return;
 
@@ -406,8 +454,9 @@ export class VideoDetector implements PlaybackManager {
         )
             return;
 
-        // To fix an issue with Reels, we sometimes have to ignore and undo volume events.
-        if (this.ignoreNextVolumeChange) {
+        // To fix an issue with Reels, we sometimes have to ignore and undo volume events. This only applies to the
+        // playback that opened the window and never to user-initiated changes.
+        if (!userInitiated && this.isVolumeIgnored(videoPlayer)) {
             this.updateVolumeForVideo(videoPlayer);
             return;
         }

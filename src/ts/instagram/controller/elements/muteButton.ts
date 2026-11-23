@@ -17,13 +17,19 @@ export class MuteButton extends VideoControllerButton {
     }
 
     override onClick() {
-        if (!this.videoElement) return;
-        this.videoElement.muted = !this.videoElement.muted;
+        const videoElement = this.videoElement;
+        if (!videoElement) return;
 
-        // Fallback when volume is still set to zero
-        if (!this.videoElement.muted && this.videoElement.volume === 0) {
-            this.videoElement.volume = 0.1;
-        }
+        // A user-triggered mute / unmute must not be swallowed by the ignore window that counteracts Instagram's
+        // volume reset on playback start.
+        this.videoPlayer?.applyUserVolume(() => {
+            videoElement.muted = !videoElement.muted;
+
+            // Fallback when volume is still set to zero
+            if (!videoElement.muted && videoElement.volume === 0) {
+                videoElement.volume = 0.1;
+            }
+        });
     }
 
     override onVolumeChange() {

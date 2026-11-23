@@ -12,6 +12,15 @@ export abstract class VideoControllerButton extends VideoControllerElementBase<H
         };
     }
 
+    override remove(): void {
+        // Remove the handler property, so it cannot keep the removed element reachable.
+        if (this.element) {
+            this.element.onclick = null;
+        }
+
+        super.remove();
+    }
+
     // The button was clicked
     protected abstract onClick(ev: MouseEvent): void;
 

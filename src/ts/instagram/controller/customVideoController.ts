@@ -48,11 +48,23 @@ export class CustomVideoController extends VideoController {
 
     /**
      * Recreates the control elements.
+     * State of interactive controls (sliders) is carried over, so a rebuild triggered by a setting change does not
+     * interrupt an ongoing drag.
      */
     private rebuildControlElements() {
         if (!this.controlElement) return;
 
-        // Remove previous controls
+        // Collect the state of the existing controls before they are replaced.
+        const states = new Map<unknown, unknown>();
+        for (const control of this.controls) {
+            // Only controls that can hold an interactive state implement `saveState`.
+            const state = control.saveState();
+            if (state !== undefined) {
+                states.set(control.constructor, state);
+            }
+        }
+
+        // Remove previous controls. This also removes all their event listeners.
         for (const control of this.controls) {
             control.remove();
         }
@@ -62,6 +74,16 @@ export class CustomVideoController extends VideoController {
         // Create the control elements
         for (const control of this.controls) {
             control.create(this.controlElement);
+
+            // Restore the state of the previous control of the same type.
+            const state = states.get(control.constructor);
+            if (state !== undefined) {
+                control.restoreState(state);
+            }
+
+            // Let the control pull the actual video element state. This runs after the restore, so only controls
+            // without an interactive state (or sliders that are not being dragged) are overwritten.
+            control.refresh();
         }
     }
 
@@ -108,6 +130,23 @@ export class CustomVideoController extends VideoController {
         }
 
         return controls;
+    }
+
+    public override remove() {
+        // Remove all control elements and their listeners before the container goes away. An ongoing drag is
+        // committed first, so the user's last input is not lost when the control bar disappears.
+        for (const control of this.controls) {
+            control.commitPendingChange();
+            control.remove();
+        }
+        this.controls = [];
+
+        if (this.controlElement) {
+            this.controlElement.remove();
+            this.controlElement = undefined;
+        }
+
+        super.remove();
     }
 
     //#endregion Control

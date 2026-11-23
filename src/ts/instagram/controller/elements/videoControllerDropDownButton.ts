@@ -73,6 +73,22 @@ export abstract class VideoControllerDropDownButton<
 
     private dropDownDelayTimeout: number = -1;
 
+    override remove(): void {
+        // Clear a pending hide timeout, so it cannot fire on the removed element.
+        clearTimeout(this.dropDownDelayTimeout);
+
+        // Drop the handler properties and the references to the removed DOM.
+        if (this.element) {
+            this.element.onpointerdown = null;
+            this.element.onmouseenter = null;
+            this.element.onmouseleave = null;
+        }
+        this.clearItems();
+        this.dropDownElement = undefined;
+
+        super.remove();
+    }
+
     // Sets the drop-down visibility.
     protected setDropDownVisibility(visibility: boolean) {
         if (!this.dropDownElement) return;

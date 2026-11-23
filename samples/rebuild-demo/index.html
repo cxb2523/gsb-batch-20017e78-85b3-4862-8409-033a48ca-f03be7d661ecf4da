@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Video Control for Instagram - Control bar rebuild demo</title>
+        <style>
+            body {
+                margin: 0;
+                font-family: system-ui, sans-serif;
+                background: #111;
+                color: #ddd;
+            }
+
+            .demo {
+                max-width: 720px;
+                margin: 0 auto;
+                padding: 16px;
+            }
+
+            /* This mirrors the positioning of the real Instagram player. */
+            .player {
+                position: relative;
+                width: 100%;
+                aspect-ratio: 16 / 9;
+                overflow: hidden;
+                background: #000;
+            }
+
+            .player video {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+                display: block;
+            }
+
+            .toolbar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px 16px;
+                align-items: center;
+                margin: 12px 0;
+            }
+
+            .toolbar button {
+                padding: 4px 10px;
+            }
+
+            .log {
+                height: 180px;
+                overflow: auto;
+                padding: 8px;
+                background: #000;
+                border: 1px solid #333;
+                font-family: ui-monospace, monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+            }
+
+            .hint {
+                font-size: 13px;
+                line-height: 1.5;
+                color: #aaa;
+            }
+        </style>
+        <link rel="stylesheet" href="../../src/static/styles/instagram.css" />
+    </head>
+    <body>
+        <div class="demo">
+            <h1>Control bar rebuild demo</h1>
+
+            <div class="player" id="player">
+                <video id="video" muted loop playsinline></video>
+            </div>
+
+            <div class="toolbar">
+                <button id="rebuild">Rebuild controls (settings change)</button>
+                <button id="play">Play / pause</button>
+                <button id="instagram-mute">
+                    Simulate Instagram mute on play
+                </button>
+            </div>
+
+            <p class="hint">
+                Drag the seek bar or the volume bar and click "Rebuild controls"
+                <b>while still holding the mouse button</b>. The rebuilt bar
+                keeps the position of the video element and the drag continues
+                on the new element. The log shows the internal state.
+            </p>
+
+            <div class="log" id="log"></div>
+        </div>
+
+        <script src="./demo.js"></script>
+    </body>
+</html>

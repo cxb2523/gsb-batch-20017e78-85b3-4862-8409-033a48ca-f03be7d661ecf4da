@@ -38,6 +38,9 @@ export class VideoPlayer {
         this.unregisterEvents();
 
         this.removeVideoControl();
+
+        // Do not leak a user interaction into a later reattach.
+        this.resetPendingUserVolume();
     }
 
     //#region Events
@@ -150,11 +153,91 @@ export class VideoPlayer {
     private onVolumeChange = () => {
         this.videoController?.onVolumeChange();
 
+        // A synchronous event during a user-initiated change is already reported by `applyUserVolume`.
+        if (this.applyingUserVolume) return;
+
+        // Browsers dispatch `volumechange` asynchronously. The pending user state tells whether this event belongs to
+        // the user's last interaction. Matching the actual state (and not just "the next event") keeps an interleaved
+        // reset by the page from being mistaken for a user action.
+        const pending = this.pendingUserVolumeEvent;
+        this.pendingUserVolumeEvent = undefined;
+
+        const videoElement = this.videoElementRef?.deref();
+        const userInitiated =
+            !!pending &&
+            !!videoElement &&
+            pending.volume === videoElement.volume &&
+            pending.muted === videoElement.muted;
+
         // We don't want to react to volume changes from the page itself.
         //if (!event.isTrusted) return;
 
-        this.playbackManager.notifyVideoVolumeChange(this);
+        this.playbackManager.notifyVideoVolumeChange(this, userInitiated);
     };
+
+    // Set while a user-initiated volume change is written to the video element.
+    private applyingUserVolume = false;
+
+    // The video state a user interaction produced. Used to classify the (possibly asynchronous) `volumechange` event.
+    private pendingUserVolumeEvent?: { volume: number; muted: boolean };
+
+    // Clears the pending user state, so an old interaction cannot classify a much later event as user-initiated.
+    private pendingUserVolumeTimeoutId?: ReturnType<typeof setTimeout>;
+
+    /**
+     * Applies a volume change made by the user through our controls.
+     * The change is reported to the playback manager as user-initiated, so it cannot be mistaken for a volume reset
+     * by the page and cannot be swallowed by the play ignore window.
+     */
+    public applyUserVolume(apply: () => void) {
+        const videoElement = this.videoElementRef?.deref();
+        if (!videoElement) return;
+
+        const previousVolume = videoElement.volume;
+        const previousMuted = videoElement.muted;
+
+        this.applyingUserVolume = true;
+        try {
+            apply();
+        } finally {
+            this.applyingUserVolume = false;
+        }
+
+        if (
+            videoElement.volume === previousVolume &&
+            videoElement.muted === previousMuted
+        ) {
+            return;
+        }
+
+        // Remember the user state for a later asynchronous `volumechange` and report the change right now.
+        // The playback manager ignores repeated reports of an unchanged state, so both paths are safe.
+        this.pendingUserVolumeEvent = {
+            volume: videoElement.volume,
+            muted: videoElement.muted,
+        };
+        this.clearPendingUserVolumeLater();
+        this.playbackManager.notifyVideoVolumeChange(this, true);
+    }
+
+    // The event is dispatched on the next task at the latest. Keep the pending state a bit longer to be safe.
+    private clearPendingUserVolumeLater() {
+        if (this.pendingUserVolumeTimeoutId !== undefined) {
+            clearTimeout(this.pendingUserVolumeTimeoutId);
+        }
+        this.pendingUserVolumeTimeoutId = setTimeout(() => {
+            this.pendingUserVolumeEvent = undefined;
+            this.pendingUserVolumeTimeoutId = undefined;
+        }, 1000);
+    }
+
+    private resetPendingUserVolume() {
+        if (this.pendingUserVolumeTimeoutId !== undefined) {
+            clearTimeout(this.pendingUserVolumeTimeoutId);
+            this.pendingUserVolumeTimeoutId = undefined;
+        }
+        this.pendingUserVolumeEvent = undefined;
+    }
 
     // Handles video playback speed changes.
     private onPlaybackSpeedChange = () => {
