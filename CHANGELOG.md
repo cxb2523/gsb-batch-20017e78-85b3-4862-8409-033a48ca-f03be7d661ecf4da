@@ -4,6 +4,10 @@ All notable changes to bind-manager are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mapping edits now re-sync every gamepad chain from one freshly compiled mapping.** `setProfileMappingEntry()`, `removeProfileMappingEntry()` and `resetProfileMapping()` are the single state-change entry point: after an edit, capture detection, the gameplay suppression/resume pressed sets and disconnect/reconnect all read the same recompiled mapping, so no stale raw button index or stale hat-grid decision survives. An input still physically held when its mapping is edited (or when the pad reconnects) stays silent until it is released and pressed again — an edit can no longer phantom-capture or phantom-press an already-held action, and a direction edited while the modal is open can no longer get stuck or retrigger on resume. A disconnect still emits exactly one `released` and final analog `0` for each action held before the edit; a reconnect while held no longer replays `pressed`. `resetProfileMapping()` returns both capture and suppression behaviour to the base mapping together. Thresholds, event types and public method signatures are unchanged.
+
 ## [0.2.4] - 2026-11-22
 
 ### Fixed

@@ -572,7 +572,7 @@ export class GamepadRuntime {
     } else {
       this._profileDefinitionOverrides.set(identityKey, editable);
     }
-    this._resolvedProfileByGamepadIndex.delete(gp.index);
+    this._reconcileAfterMappingChange(gp);
     this._emitProfileChange(gp);
     return true;
   }
@@ -601,7 +601,7 @@ export class GamepadRuntime {
     let deleted = false;
     for (const key of getGamepadIdentityKeys(gp.id)) deleted = this._profileDefinitionOverrides.delete(key) || deleted;
     if (!deleted) return false;
-    this._resolvedProfileByGamepadIndex.delete(gp.index);
+    this._reconcileAfterMappingChange(gp);
     this._emitProfileChange(gp);
     return true;
   }
@@ -647,6 +647,11 @@ export class GamepadRuntime {
     // edits keep applying after a reconnect.
     this._resolvedProfileByGamepadIndex.delete(e.gamepad.index);
     this._getResolvedProfileForGamepad(e.gamepad);
+    // A reconnect must not replay 'pressed' for inputs still physically held:
+    // seed the baseline from the current (latest compiled) mapping and latch
+    // every active code, so the first polled frame only compares edges and the
+    // held inputs stay silent until released and pressed anew.
+    this._seedConnectedBaseline(e.gamepad);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('bm-gamepad-connected', { detail: e.gamepad }));
     }
@@ -845,6 +850,101 @@ export class GamepadRuntime {
     if (!this._latched.has(gamepadIndex)) this._latched.set(gamepadIndex, new Set());
     const latched = this._latched.get(gamepadIndex);
     for (const code of codes) latched.add(code);
+  }
+
+  /**
+   * The single state-change reconciliation every mapping edit must pass
+   * through (setProfileMappingEntry / removeProfileMappingEntry /
+   * resetProfileMapping). The definition override has already been written or
+   * removed by the caller; this makes every other chain read the same freshly
+   * compiled mapping:
+   *
+   *  - the per-index profile cache is dropped, so the next resolve rebuilds
+   *    from the latest edit (and the WeakMap compile/hat caches key off the
+   *    new definition object, never the old one);
+   *  - the canonical logical snapshot is rebuilt from the live hardware state
+   *    via the new mapping and stored as the edge-detection baseline, so a
+   *    later capture or dispatch frame cannot see a phantom edge caused by the
+   *    edit itself ("edit must not fire an already-held action");
+   *  - every code active in that fresh snapshot is latched, so an input still
+   *    physically held stays silent until it is released and pressed again;
+   *  - codes that were dispatched as pressed but are no longer active under the
+   *    new mapping get their 'released' (and analog final 0) exactly once,
+   *    mirroring the suppression contract; the pressed/analog bookkeeping then
+   *    reflects only what the new mapping considers live.
+   *
+   * @param {Gamepad} gamepad
+   * @private
+   */
+  _reconcileAfterMappingChange(gamepad) {
+    this._resolvedProfileByGamepadIndex.delete(gamepad.index);
+
+    const fresh = this._snapshotLogicalState(gamepad);
+    const active = new Set(this._activeCodes(fresh));
+
+    // Release the bookkeeping of inputs the new mapping no longer considers
+    // active. Digital releases first, then the analog final zero, so a code
+    // switching between a button and an axis half is closed out on both paths.
+    const pressed = this._pressedCodes.get(gamepad.index);
+    if (pressed) {
+      for (const code of [...pressed]) {
+        if (!active.has(code)) this._dispatch(gamepad.index, code, 'released', 0);
+      }
+    }
+    const analog = this._analogActive.get(gamepad.index);
+    if (analog) {
+      for (const [axisIndex, last] of [...analog]) {
+        const curVal = fresh.axes[axisIndex] ?? 0;
+        if (Math.abs(curVal) <= this._deadband) this._dispatchAnalog(gamepad.index, axisIndex, 0, last);
+      }
+    }
+
+    // Replace the edge baseline outright: the previous frame was interpreted
+    // under the old mapping, so diffing against it would report phantom edges.
+    this._curState.set(gamepad.index, fresh);
+
+    // Anything active under the new mapping is held from the runtime's point
+    // of view (it never saw its 'pressed'): keep it silent until released.
+    if (active.size > 0) {
+      if (!this._latched.has(gamepad.index)) this._latched.set(gamepad.index, new Set());
+      const latched = this._latched.get(gamepad.index);
+      for (const code of active) latched.add(code);
+    }
+    // Latches for codes the new mapping sees as released would only block a
+    // genuine next press; drop them now (same rule as _clearReleasedLatches).
+    const latched = this._latched.get(gamepad.index);
+    if (latched) {
+      for (const code of [...latched]) {
+        if (!active.has(code)) latched.delete(code);
+      }
+    }
+  }
+
+  /**
+   * Seed runtime bookkeeping for a freshly connected pad so inputs already
+   * held at connect time cannot replay 'pressed'. Uses the latest compiled
+   * mapping (including in-memory edits), and mirrors the edit reconciliation
+   * without dispatching anything: the disconnect already sent the releases.
+   * @param {Gamepad} gamepad
+   * @private
+   */
+  _seedConnectedBaseline(gamepad) {
+    const fresh = this._snapshotLogicalState(gamepad);
+    this._curState.set(gamepad.index, fresh);
+    const active = this._activeCodes(fresh);
+    if (active.length > 0) {
+      if (!this._latched.has(gamepad.index)) this._latched.set(gamepad.index, new Set());
+      const latched = this._latched.get(gamepad.index);
+      for (const code of active) latched.add(code);
+    }
+    // Seed analog bookkeeping with the live values so a later release can send
+    // each analog action's single final 0, without a stale value lingering.
+    const analog = new Map();
+    for (let a = 0; a < fresh.axes.length; a++) {
+      const val = fresh.axes[a] ?? 0;
+      if (Math.abs(val) > this._deadband) analog.set(a, val);
+    }
+    if (analog.size > 0) this._analogActive.set(gamepad.index, analog);
   }
 
   /**
