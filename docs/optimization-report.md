@@ -61,6 +61,12 @@ flowchart TD
 | ③ | 原地压缩 | 数组分配次数 | 80,000 个 | 0 个 | **−100%** |
 | ④ | HUD 差量写入 | 3600 次刷新 DOM 写入 | 72,000 次 | 22 次 | **−100.0%** |
 
+② 的缓存键最初只含「塔对象 + level」，重开对局或新塔复用相同等级时会命中上一局的旧面板，
+导致伤害/射程/产金显示错值、索敌与开火节奏跟着漂。现在键扩展为「塔对象 + level + def 身份 + 对局世代」：
+建造、升级、拆除各自调用 `invalidateStats(tower)`，`createGame()` 调用 `resetStatsCache()` 推进世代号（O(1)，
+不遍历缓存）。缓存仍然保留，命中路径不变（单测与 `npm run benchmark` 均验证 B 仍快于 A），
+生命周期正确性由 `tests/rules.test.js` 中「同等级不同实例 / 换 def / 升级 / 拆除 / 重开」5 个用例守着。
+
 ### 被实验否决的候选（未进入交付代码）
 
 | 候选 | 指标 | A | B | 结论 |
@@ -75,7 +81,7 @@ flowchart TD
 ```sh
 node tools/verify-identity.mjs   # 先证明 A/B 玩法结果一致
 node tools/benchmark.mjs         # 再跑性能 A/B
-npm test                         # 44 个单测
+npm test                         # 50 个单测
 node scripts/sim.js              # 难度断言
 ```
 
@@ -89,7 +95,7 @@ PASS  greedy    lost 第13波 hp=0  kills=119  hash=23bb639d75b3 / 23bb639d75b3
 PASS  quality   won  第15波 hp=14 kills=149  hash=e8dbd9b0dcf6 / e8dbd9b0dcf6
 ```
 
-三种策略的结果哈希完全相同；`npm test` 44 项、`node scripts/sim.js` 三条难度断言全部通过。
+三种策略的结果哈希完全相同；`npm test` 50 项、`node scripts/sim.js` 三条难度断言全部通过。
 
 ## 5. 四条可复核的创新点表达
 

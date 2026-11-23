@@ -138,6 +138,112 @@ test("升级后面板按 1.65 / +18 / ×0.88 变化", () => {
   assert.ok(Math.abs(s2.interval - s1.interval * 0.88) < 1e-9);
 });
 
+// ---------------- 面板缓存的生命周期（建造 / 升级 / 拆除 / 重开） ----------------
+// 回归：缓存曾只按「塔对象 + level」命中。只要等级一样，另一座塔、或换了 def 的
+// 同一座塔就会拿到别人的旧面板，UI 显示、索敌与开火节奏跟着一起错。
+
+test("同等级、不同实例的塔面板互不串值", () => {
+  const s = createGame(1);
+  s.coins = 9999;
+  const a = placeTower(s, 5, 0, "cannon").tower;
+  const b = placeTower(s, 6, 0, "ice").tower;
+  assert.equal(a.level, b.level, "两座塔都是 1 级——旧的缓存键只比 level 就会撞车");
+
+  const sa = statsAt(a);
+  const sb = statsAt(b);
+  assert.equal(sa.damage, TOWERS.cannon.damage);
+  assert.equal(sa.range, TOWERS.cannon.range);
+  assert.equal(sb.damage, TOWERS.ice.damage);
+  assert.equal(sb.range, TOWERS.ice.range);
+  assert.notEqual(sa.damage, sb.damage);
+  assert.ok(Math.abs(sa.interval - TOWERS.cannon.interval) < 1e-12);
+  assert.ok(Math.abs(sb.interval - TOWERS.ice.interval) < 1e-12);
+
+  // 反序再读一次：任何一方都不得被对方后写入的缓存覆盖
+  assert.deepEqual(statsAt(b), sb);
+  assert.deepEqual(statsAt(a), sa);
+});
+
+test("同等级、同类型、不同实例：升级其中一座不影响另一座", () => {
+  const s = createGame(1);
+  s.coins = 9999;
+  const a = placeTower(s, 5, 0, "cannon").tower;
+  const b = placeTower(s, 6, 0, "cannon").tower;
+  const bBefore = statsAt(b);
+
+  assert.ok(upgradeTower(s, a.id).ok);   // 只升 a
+  assert.equal(a.level, 2);
+  assert.equal(b.level, 1);
+
+  assert.equal(statsAt(b).damage, bBefore.damage, "b 仍应是 1 级面板");
+  assert.equal(statsAt(b).range, TOWERS.cannon.range);
+  assert.equal(statsAt(a).range, TOWERS.cannon.range + 18, "a 应是 2 级面板");
+  assert.notDeepEqual(statsAt(a), statsAt(b));
+});
+
+test("同一塔对象换 def 前面板立即更新（不能只比 level）", () => {
+  const t = { level: 2, def: { ...TOWERS.cannon } };
+  const before = statsAt(t);
+  assert.ok(Math.abs(before.damage - TOWERS.cannon.damage * 1.65) < 1e-9);
+
+  t.def = { ...TOWERS.magic }; // 等级不变，面板来源变了
+  const after = statsAt(t);
+  assert.ok(Math.abs(after.damage - TOWERS.magic.damage * 1.65) < 1e-9);
+  assert.equal(after.range, TOWERS.magic.range + 18);
+  assert.notEqual(after.damage, before.damage);
+});
+
+test("升级后立刻读到当前等级面板", () => {
+  const s = createGame(1);
+  s.coins = 9999;
+  const t = placeTower(s, 5, 0, "cannon").tower;
+  const l1 = statsAt(t);
+  assert.ok(upgradeTower(s, t.id).ok);
+  const l2 = statsAt(t);
+  assert.ok(Math.abs(l2.damage - l1.damage * 1.65) < 1e-9);
+  assert.equal(l2.range, l1.range + 18);
+});
+
+test("拆除会作废该塔的面板缓存", () => {
+  const s = createGame(1);
+  s.coins = 9999;
+  const t = placeTower(s, 5, 0, "cannon").tower;
+  const before = statsAt(t);
+  assert.ok(sellTower(s, t.id).ok);
+
+  // 拆除后即使这个对象仍被别处引用，也不允许吐出缓存里的旧面板
+  t.def = { ...TOWERS.magic };
+  const after = statsAt(t);
+  assert.equal(after.damage, TOWERS.magic.damage);
+  assert.notEqual(after.damage, before.damage);
+});
+
+test("重开后新塔面板正确，且不会命中上一局的缓存", () => {
+  const s1 = createGame(1);
+  s1.coins = 9999;
+  const old = placeTower(s1, 5, 0, "cannon").tower;
+  assert.ok(upgradeTower(s1, old.id).ok);
+  assert.ok(upgradeTower(s1, old.id).ok);
+  assert.equal(old.level, 3);
+  const oldPanel = statsAt(old);
+  assert.equal(oldPanel.range, TOWERS.cannon.range + 36);
+
+  // 重开新对局：新塔同样是 1 级，绝不能复用上一局的面板
+  const s2 = createGame(1);
+  s2.coins = 9999;
+  const fresh = placeTower(s2, 5, 0, "cannon").tower;
+  assert.equal(fresh.level, 1);
+  const freshPanel = statsAt(fresh);
+  assert.equal(freshPanel.damage, TOWERS.cannon.damage);
+  assert.equal(freshPanel.range, TOWERS.cannon.range);
+  assert.equal(freshPanel.income, 0);
+  assert.notDeepEqual(freshPanel, oldPanel);
+
+  // 重开后的升级路径同样正确
+  assert.ok(upgradeTower(s2, fresh.id).ok);
+  assert.equal(statsAt(fresh).range, TOWERS.cannon.range + 18);
+});
+
 test("路径进度单调推进，速度被减速影响", () => {
   const a = pointAt(0);
   const b = pointAt(500);

@@ -45,21 +45,49 @@ export function pointAt(progress, lane = 0) {
 }
 
 // 面板缓存：statsAt 每帧被 game.js 与 render.js 各调用一次，每次都做两次 Math.pow。
-// 塔的面板只取决于 def 与 level，用 WeakMap 按对象缓存，升级（level 变化）时自动失效。
-// 用 WeakMap 而不是挂在 tower 上，避免污染状态对象、影响快照与测试的深比较。
+// 缓存键必须同时区分「塔实例 / 等级 / def 身份 / 对局世代」，只看 level 会让
+// 同等级的另一座塔、或重开后复用的塔命中旧面板：
+//   - tower（WeakMap 的键）  不同实例互不串值；
+//   - level                  升级后立即失效；
+//   - def                    同一对象被改配（换塔/换类型）时不能复用旧值；
+//   - epoch                  重开对局时一次性作废旧条目——即使旧塔对象被复用、
+//                            id 与等级与新塔完全相同，也不会命中。
+// 用 WeakMap 而不是挂在 tower 上，避免污染状态对象、影响快照与测试的深比较；
+// 拆除/出局后塔对象一旦不可达，条目随 GC 释放。
 const statsCache = new WeakMap();
+let statsEpoch = 0;
+
+/**
+ * 作废所有已缓存面板。重开新对局时调用。
+ * O(1)：只推进世代号，不遍历缓存；旧条目会因 epoch 不匹配而全部未命中。
+ */
+export function resetStatsCache() {
+  statsEpoch += 1;
+}
+
+/** 单座塔的缓存失效：建造 / 升级 / 拆除这类生命周期事件调用 */
+export function invalidateStats(tower) {
+  statsCache.delete(tower);
+}
 
 /** 塔在某一级下的实际面板 */
 export function statsAt(tower) {
   const cached = statsCache.get(tower);
-  if (cached && cached.level === tower.level) return cached.value;
+  if (
+    cached &&
+    cached.epoch === statsEpoch &&
+    cached.level === tower.level &&
+    cached.def === tower.def
+  ) {
+    return cached.value;
+  }
   const def = tower.def;
   const lv = tower.level - 1;
   const damage = def.damage ? def.damage * Math.pow(UPGRADE.damage, lv) : 0;
   const range = def.range ? def.range + UPGRADE.range * lv : 0;
   const interval = def.interval ? def.interval * Math.pow(UPGRADE.interval, lv) : 0;
   const value = { damage, range, interval, income: def.income ? def.income + 4 * lv : 0 };
-  statsCache.set(tower, { level: tower.level, value });
+  statsCache.set(tower, { epoch: statsEpoch, level: tower.level, def, value });
   return value;
 }
 

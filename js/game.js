@@ -9,7 +9,7 @@ import {
 } from "./data.js";
 import {
   statsAt, investedOf, pickTarget, applyDamage, applySlow, applyBurn,
-  tickDebuffs, moveEnemy, pointAt, dist,
+  tickDebuffs, moveEnemy, pointAt, dist, resetStatsCache, invalidateStats,
 } from "./rules.js";
 import { compactDead, compactBy } from "./fastpath.js";
 
@@ -30,6 +30,10 @@ export function allowedActions(state) {
 }
 
 export function createGame(seed = 1) {
+  // 新对局 = 新的面板缓存世代：上一局（或重开前）缓存的面板一律作废。
+  // 这是"重开后旧缓存不得被新对局命中"的兜底——即使新塔复用了相同等级、甚至
+  // 相同的塔对象/id，statsAt 也不会返回上一局的数值。
+  resetStatsCache();
   const state = {
     seed,
     phase: PHASE.BUILD,
@@ -92,6 +96,9 @@ export function placeTower(state, col, row, type) {
     kills: 0,
   };
   state.towers.push(tower);
+  // 建造：塔对象虽然全新（缓存本不该有它），仍显式建立缓存边界——
+  // 若上层复用了一个被回收/复用的对象，也不会读到别人的旧面板。
+  invalidateStats(tower);
   state.coins -= def.cost;
   state.stats.built += 1;
   state.stats.spent += def.cost;
@@ -117,6 +124,9 @@ export function upgradeTower(state, id) {
   state.coins -= cost;
   state.stats.spent += cost;
   tower.level += 1;
+  // 升级：面板随等级变化。statsAt 的缓存键里已有 level，但升级是明确的生命周期
+  // 事件，这里直接作废，避免依赖"下一次读取才发现 level 变了"的隐式约定。
+  invalidateStats(tower);
   emit(state, "upgrade", { tower });
   return { ok: true, tower };
 }
@@ -129,6 +139,9 @@ export function sellTower(state, id) {
   const tower = state.towers[idx];
   const refund = Math.floor(investedOf(tower) * ECONOMY.sellRefund);
   state.towers.splice(idx, 1);
+  // 拆除：立刻清掉这座塔的面板缓存。不指望 GC 兜底——若该对象在别处仍被引用
+  // （渲染层选中态、外部调试句柄），再来一次 statsAt 也必须是干净的。
+  invalidateStats(tower);
   state.coins += refund;
   emit(state, "sell", { refund, tower });
   return { ok: true, refund };
