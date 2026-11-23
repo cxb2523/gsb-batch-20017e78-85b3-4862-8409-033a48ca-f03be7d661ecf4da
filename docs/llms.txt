@@ -110,7 +110,7 @@ loop.start();
 | Render Mode | Description |
 |---|---|
 | `NormalRender` | Standard forward rendering |
-| `UnrealBloomRender` | Forward rendering with Unreal-style bloom: five Gaussian blur mips, an optional luminosity high pass, and per-mip tints. `new UnrealBloomRender(use_antialiasing, use_half_float, use_hight_luminosity_pass, use_rendering_size = false)`: the first three are required |
+| `UnrealBloomRender` | Forward rendering with Unreal-style bloom: five Gaussian blur mips, an optional luminosity high pass, and per-mip tints. `new UnrealBloomRender(use_antialiasing, use_half_float, use_hight_luminosity_pass, use_rendering_size = false)`: the first three are required. `on_enter()` builds `main_RT` and the blurrer, `on_exit()` frees them and the blurrer's resources; re-entering rebuilds and rebinds them |
 | `NormalAORender` | Forward rendering with SSAO. `new NormalAORender(use_ssaa = false, use_exact_depth = true)`: turning `use_exact_depth` off roughly halves the SSAO pass cost but bands flat surfaces |
 | `BloomRender` | Basic bloom rendering. `new BloomRender(true)` blurs with `DualFilteringBlurrer` instead of the box blur, for a much wider glow |
 | `DeferredRender` | Deferred point lights over the depth and normals buffer. Starts with a 2×2 grid of demo lights in `scene_lights` |
@@ -166,7 +166,7 @@ Key materials: `SSAOMaterial`, `SSAOComposeMaterial`, `GaussianBlurMaterial`, `D
 
 | Utility | Purpose |
 |---|---|
-| `GaussianBlurrer` | Multi-pass Gaussian blur on render targets. `blur(RT, use_luminosity_high_pass)` leaves `RT` unchanged and writes five mips, each at half the previous size, to `renderTargetsVertical`. Behind `UnrealBloomRender` |
+| `GaussianBlurrer` | Multi-pass Gaussian blur on render targets. `blur(RT, use_luminosity_high_pass)` leaves `RT` unchanged and writes five mips, each at half the previous size, to `renderTargetsVertical`. `dispose()` frees every target, blur material and the high pass. Behind `UnrealBloomRender` |
 | `DualFilteringBlurrer` | Kawase dual-filter blur (faster, lower quality). `blur(render_target)` blurs in place, down to a sixteenth of the input and back. Its taps rely on linear filtering, which render targets have by default. Runs on `WebGPURenderer` |
 | `Blurrer` | 9 tap separable blur at the input's size. `blur(render_target)` blurs in place |
 | `DepthAndNormalsRenderer` | Generates depth/normal textures for SSAO and effects |

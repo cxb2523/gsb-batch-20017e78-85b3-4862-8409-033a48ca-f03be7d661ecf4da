@@ -180,7 +180,7 @@ Available render modes:
 |-------|-------------|
 | `NormalRender` | Standard clear → render pipeline. Calls the scene's `on_pre_render()`, `render()` and `on_post_render()` |
 | `BloomRender` | Box blur bloom. `new BloomRender(use_dual_filtering = false)`: `true` blurs with `DualFilteringBlurrer` for a much wider glow. Builds its targets in `on_enter()` and frees them in `on_exit()` |
-| `UnrealBloomRender` | Unreal-style bloom: five Gaussian mips summed with per-mip tints, added over the scene. `new UnrealBloomRender(use_antialiasing, use_half_float, use_hight_luminosity_pass, use_rendering_size = false)`: the first three are required. Tune with `set_bloom_strength()`, `set_bloom_radius()`, `set_luminosity_threshold()` (only with the high pass) and `set_tint_color_0()`…`set_tint_color_4()` |
+| `UnrealBloomRender` | Unreal-style bloom: five Gaussian mips summed with per-mip tints, added over the scene. `new UnrealBloomRender(use_antialiasing, use_half_float, use_hight_luminosity_pass, use_rendering_size = false)`: the first three are required. Tune with `set_bloom_strength()`, `set_bloom_radius()`, `set_luminosity_threshold()` (only with the high pass) and `set_tint_color_0()`…`set_tint_color_4()`. Builds `main_RT` and the blurrer in `on_enter()` and frees them (with the blurrer's materials and targets) in `on_exit()`; radius and threshold are stored on the mode, so they survive an exit and reach a rebuilt blurrer |
 | `NormalAORender` | Normal + AO pass. `new NormalAORender(use_ssaa = false, use_exact_depth = true)`: `use_ssaa` renders the scene at 2×; turning `use_exact_depth` off roughly halves the SSAO pass cost but bands flat surfaces |
 | `DeferredRender` | Deferred point lights over `Graphics.depth_normals_RT`. The constructor fills `scene_lights` with a 2×2 grid of demo lights; edit it to place your own |
 | `VRRender` | For WebXR (`core_attributes.xr_enabled: true`). Three's XR manager renders the stereo views; the mode does not clear, and `render_spectator_camera()` mirrors the headset view to the canvas when `CameraManager.spectator` is set |
@@ -519,7 +519,7 @@ class AddTextureMaterial extends BlitNodeMaterial
 
 ## Render Utilities
 
-None of the blurrers is a singleton. `Blurrer` and `DualFilteringBlurrer` blur in place and have `dispose()`. `GaussianBlurrer` writes its five mips (each at half the previous size, kernel radii `[3, 5, 7, 9, 11]`) to `renderTargetsVertical`, tunes with `set_radius()` and `set_luminosity_threshold()` (default `0.23`), and frees with `dispose_RT()` and `dispose_materials()`. `Blurrer` and `DualFilteringBlurrer` use 8-bit `RenderTarget` defaults for their internal targets.
+None of the blurrers is a singleton. `Blurrer`, `DualFilteringBlurrer` and `GaussianBlurrer` blur in place and have `dispose()`. `GaussianBlurrer` writes its five mips (each at half the previous size, kernel radii `[3, 5, 7, 9, 11]`) to `renderTargetsVertical`, tunes with `set_radius()` and `set_luminosity_threshold()` (default `0.23`), and frees every target, blur material and its high pass with `dispose()` (`dispose_RT()` and `dispose_materials()` are the finer grained versions and leave `luminosity_high_pass_mat` alone). `Blurrer` and `DualFilteringBlurrer` use 8-bit `RenderTarget` defaults for their internal targets.
 
 ```ts
 // 9 tap separable blur at the input's size, in place
@@ -535,6 +535,8 @@ const gaussian = new GaussianBlurrer();
 gaussian.set_radius(1.5);
 gaussian.blur(render_target, true);
 const widest_mip = gaussian.renderTargetsVertical[4].texture;
+// Free every target, blur material and the high pass
+gaussian.dispose();
 
 // Depth + normals G-buffer
 Graphics.generate_depth_normal_texture = true;

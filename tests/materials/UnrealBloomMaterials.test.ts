@@ -163,4 +163,37 @@ describe('GaussianBlurrer', () =>
     expect(blurrer.separableBlurMaterials.every((material) => material.uniforms.radius.value === 3)).toBe(true);
     expect(blurrer.luminosity_high_pass_mat.uniforms.luminosityThreshold.value).toBe(0.7);
   });
+
+  // UnrealBloomRender frees the whole blurrer with dispose(), so it has to free the high
+  // pass too, which dispose_RT() and dispose_materials() leave alone.
+  it('disposes every target and material with dispose()', () =>
+  {
+    const blurrer = new GaussianBlurrer();
+
+    const disposed: string[] = [];
+
+    blurrer.renderTargetBright.addEventListener('dispose', () => disposed.push('bright'));
+    blurrer.renderTargetsHorizontal[0].addEventListener('dispose', () => disposed.push('horizontal'));
+    blurrer.renderTargetsVertical[blurrer.nMips - 1].addEventListener('dispose', () => disposed.push('vertical'));
+    blurrer.separableBlurMaterials[0].addEventListener('dispose', () => disposed.push('blur'));
+    blurrer.luminosity_high_pass_mat.addEventListener('dispose', () => disposed.push('high_pass'));
+
+    blurrer.dispose();
+
+    expect(disposed).toEqual(expect.arrayContaining(['bright', 'horizontal', 'vertical', 'blur', 'high_pass']));
+    expect(blurrer.renderTargetsHorizontal).toHaveLength(0);
+    expect(blurrer.renderTargetsVertical).toHaveLength(0);
+    expect(blurrer.separableBlurMaterials).toHaveLength(0);
+  });
+
+  it('dispose() can be called more than once', () =>
+  {
+    const blurrer = new GaussianBlurrer();
+
+    expect(() =>
+    {
+      blurrer.dispose();
+      blurrer.dispose();
+    }).not.toThrow();
+  });
 });

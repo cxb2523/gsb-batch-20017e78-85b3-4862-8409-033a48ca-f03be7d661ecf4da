@@ -3,7 +3,7 @@ import { UnrealBloomComposeMaterial } from '../materials/UnrealBloomComposeMater
 import { OScreen } from '../OScreen';
 import { BaseRender } from '../render_mode/BaseRender';
 
-import { HalfFloatType, LinearSRGBColorSpace, NearestFilter, RenderTarget, RGBAFormat, UnsignedByteType } from 'three';
+import { HalfFloatType, LinearSRGBColorSpace, NearestFilter, RenderTarget, RGBAFormat, Texture, UnsignedByteType } from 'three';
 
 import { CameraManager } from '../CameraManager';
 import { Graphics } from '../Graphics';
@@ -15,47 +15,80 @@ class UnrealBloomRender extends BaseRender
   add_mat: AddMaterial;
   bloom_compose_mat: UnrealBloomComposeMaterial;
   blurrer: GaussianBlurrer;
-  luminosity_threshold: any;
+  bloom_radius: number;
+  luminosity_threshold: number;
   main_RT: RenderTarget;
+  use_antialiasing: boolean;
+  use_half_float: boolean;
   use_hight_luminosity_pass: boolean;
   use_rendering_size: boolean;
-  
+
   constructor(use_antialiasing: boolean, use_half_float: boolean, use_hight_luminosity_pass: boolean, use_rendering_size = false)
   {
     super();
 
-    this.add_mat = new AddMaterial(use_half_float);
-
-    const rt_settings = {
-      // WebGPU only supports 1 or 4 samples. Higher counts render nothing on both backends.
-      samples: use_antialiasing ? 4 : 1,
-      type: use_half_float ? HalfFloatType : UnsignedByteType,
-      format: RGBAFormat,
-      colorSpace: LinearSRGBColorSpace,
-      minFilter: NearestFilter,
-      magFilter: NearestFilter
-    };
-    this.use_rendering_size = use_rendering_size;
-    this.main_RT = new RenderTarget(1, 1, rt_settings);
-    this.main_RT.texture.colorSpace = LinearSRGBColorSpace;
-    this.main_RT.texture.minFilter = NearestFilter;
-    this.main_RT.texture.magFilter = NearestFilter;
-
-    this.bloom_compose_mat = new UnrealBloomComposeMaterial(5, use_half_float);
-    this.blurrer = new GaussianBlurrer(use_half_float);
+    this.use_antialiasing = use_antialiasing;
+    this.use_half_float = use_half_float;
     this.use_hight_luminosity_pass = use_hight_luminosity_pass;
-    this.luminosity_threshold = 0.5;
+    this.use_rendering_size = use_rendering_size;
+
+    // The materials are cheap and hold the tuning (strength, radius, tints), so they
+    // live as long as the mode does. The targets and the blurrer are built in
+    // on_enter() and freed in on_exit(), so a mode switch never keeps GPU textures.
+    this.add_mat = new AddMaterial(use_half_float);
+    this.bloom_compose_mat = new UnrealBloomComposeMaterial(5, use_half_float);
+    this.main_RT = undefined;
+    this.blurrer = undefined;
+
+    // Settings reach the blurrer whenever it exists. Keeping the last value here lets
+    // the setters work before the first on_enter() and survive an exit and re-entry,
+    // so a reused mode comes back with the same look. These mirror GaussianBlurrer's
+    // own defaults (radius 1, threshold 0.23).
+    this.bloom_radius = 1;
+    this.luminosity_threshold = 0.23;
   }
 
   on_enter()
   {
+    // A second on_enter() without an on_exit() must not leak the first cycle.
+    this.on_exit();
+
+    this.main_RT = this.__create_main_RT();
+    this.blurrer = new GaussianBlurrer(this.use_half_float);
+
+    this.blurrer.set_radius(this.bloom_radius);
+    this.blurrer.set_luminosity_threshold(this.luminosity_threshold);
+
     this.bloom_compose_mat.set_blur_texture_0(this.blurrer.renderTargetsVertical[0].texture);
     this.bloom_compose_mat.set_blur_texture_1(this.blurrer.renderTargetsVertical[1].texture);
     this.bloom_compose_mat.set_blur_texture_2(this.blurrer.renderTargetsVertical[2].texture);
     this.bloom_compose_mat.set_blur_texture_3(this.blurrer.renderTargetsVertical[3].texture);
     this.bloom_compose_mat.set_blur_texture_4(this.blurrer.renderTargetsVertical[4].texture);
-    
+
     this.add_mat.set_add_texture(this.blurrer.renderTargetsHorizontal[0].texture);
+  }
+
+  // Frees what on_enter() built: the scene target, the blurrer and the blurrer's own
+  // materials and targets. Calling it again, or before on_enter(), does nothing.
+  on_exit()
+  {
+    if (this.main_RT === undefined && this.blurrer === undefined)
+    {
+      return;
+    }
+
+    if (this.blurrer !== undefined)
+    {
+      this.__unbind_textures();
+      this.blurrer.dispose();
+      this.blurrer = undefined;
+    }
+
+    if (this.main_RT !== undefined)
+    {
+      this.main_RT.dispose();
+      this.main_RT = undefined;
+    }
   }
 
   render()
@@ -85,12 +118,22 @@ class UnrealBloomRender extends BaseRender
   set_bloom_radius(val: number)
   {
     // this.bloom_compose_mat.set_bloom_radius(val);
-    this.blurrer.set_radius(val);
+    this.bloom_radius = val;
+
+    if (this.blurrer !== undefined)
+    {
+      this.blurrer.set_radius(val);
+    }
   }
 
   set_luminosity_threshold(value: number)
   {
-    this.blurrer.set_luminosity_threshold(value);
+    this.luminosity_threshold = value;
+
+    if (this.blurrer !== undefined)
+    {
+      this.blurrer.set_luminosity_threshold(value);
+    }
   }
 
   set_tint_color_0(col_string: string)
@@ -126,6 +169,41 @@ class UnrealBloomRender extends BaseRender
     {
       this.main_RT.setSize(width, height);
     }
+  }
+
+  __create_main_RT(): RenderTarget
+  {
+    const rt_settings = {
+      // WebGPU only supports 1 or 4 samples. Higher counts render nothing on both backends.
+      samples: this.use_antialiasing ? 4 : 1,
+      type: this.use_half_float ? HalfFloatType : UnsignedByteType,
+      format: RGBAFormat,
+      colorSpace: LinearSRGBColorSpace,
+      minFilter: NearestFilter,
+      magFilter: NearestFilter
+    };
+    const main_RT = new RenderTarget(1, 1, rt_settings);
+
+    main_RT.texture.colorSpace = LinearSRGBColorSpace;
+    main_RT.texture.minFilter = NearestFilter;
+    main_RT.texture.magFilter = NearestFilter;
+
+    return main_RT;
+  }
+
+  // Points the compose and add materials at an empty texture, so nothing keeps sampling
+  // the blurrer's targets once on_exit() disposes them. on_enter() rebinds the new ones.
+  __unbind_textures()
+  {
+    const empty_texture = new Texture();
+
+    this.bloom_compose_mat.set_blur_texture_0(empty_texture);
+    this.bloom_compose_mat.set_blur_texture_1(empty_texture);
+    this.bloom_compose_mat.set_blur_texture_2(empty_texture);
+    this.bloom_compose_mat.set_blur_texture_3(empty_texture);
+    this.bloom_compose_mat.set_blur_texture_4(empty_texture);
+
+    this.add_mat.set_add_texture(empty_texture);
   }
 }
 

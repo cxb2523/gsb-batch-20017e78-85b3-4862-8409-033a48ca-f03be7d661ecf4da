@@ -25,5 +25,6 @@ declare class GaussianBlurrer {
     set_luminosity_threshold(value: number): void;
     dispose_materials(): void;
     dispose_RT(): void;
+    dispose(): void;
 }
 export { GaussianBlurrer };

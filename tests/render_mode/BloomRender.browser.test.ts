@@ -96,10 +96,11 @@ for (const backend of BACKENDS)
       const box = new BloomRender();
       const dual = new BloomRender(true);
 
+      // The blurrer only exists while the mode is active: on_exit() frees it.
       render_with(box);
-      render_with(dual);
-
       expect(box.blurrer).toBeInstanceOf(Blurrer);
+
+      render_with(dual);
       expect(dual.blurrer).toBeInstanceOf(DualFilteringBlurrer);
       expect(harness.reported_errors).toEqual([]);
     });
@@ -134,6 +135,127 @@ for (const backend of BACKENDS)
 
       expect(pixels.luminance(QUAD_CENTER)).toBeGreaterThan(200);
       expect(pixels.luminance(HORIZONTAL_GLOW_PROBE)).toBeGreaterThan(20);
+      expect(harness.reported_errors).toEqual([]);
+    });
+
+    // A mode is often reused: leaving it frees its resources, and entering it again must
+    // rebuild them and look exactly like the first run, not like a freed texture.
+    for (const use_dual_filtering of [false, true])
+    {
+      it(`renders identically the second time it is entered (${use_dual_filtering ? 'dual filtering' : 'box'} blur)`, () =>
+      {
+        const bloom = new BloomRender(use_dual_filtering);
+
+        Graphics.set_state(bloom);
+        bloom.render();
+        bloom.render();
+        const first = harness.read_canvas();
+
+        Graphics.set_state(new NormalRender());
+
+        Graphics.set_state(bloom);
+        bloom.render();
+        bloom.render();
+        const second = harness.read_canvas();
+
+        expect(second.luminance(QUAD_CENTER)).toBe(first.luminance(QUAD_CENTER));
+        expect(second.luminance(HORIZONTAL_GLOW_PROBE)).toBe(first.luminance(HORIZONTAL_GLOW_PROBE));
+        expect(second.luminance(VERTICAL_GLOW_PROBE)).toBe(first.luminance(VERTICAL_GLOW_PROBE));
+        expect(first.luminance(HORIZONTAL_GLOW_PROBE)).toBeGreaterThan(20);
+        expect(harness.reported_errors).toEqual([]);
+      });
+    }
+
+    it('rebuilds its resources and rebinds the blur texture on re-entry', () =>
+    {
+      const bloom = new BloomRender();
+
+      Graphics.set_state(bloom);
+      const first_blurrer = bloom.blurrer;
+      const first_main_RT = bloom.main_RT;
+      const first_blur_RT = bloom.blur_RT;
+      const first_texture = bloom.bloom_compose_mat.uniforms._BlurredTex.value;
+
+      Graphics.set_state(new NormalRender());
+
+      // Leaving frees every resource, so nothing still points at a disposed target.
+      expect(bloom.blurrer).toBeUndefined();
+      expect(bloom.main_RT).toBeUndefined();
+      expect(bloom.blur_RT).toBeUndefined();
+      expect(bloom.bloom_compose_mat.uniforms._BlurredTex.value).not.toBe(first_texture);
+
+      Graphics.set_state(bloom);
+
+      expect(bloom.blurrer).not.toBe(first_blurrer);
+      expect(bloom.main_RT).not.toBe(first_main_RT);
+      expect(bloom.blur_RT).not.toBe(first_blur_RT);
+
+      // render() binds the rebuilt blur target, so the compose pass samples the new one.
+      bloom.render();
+      expect(bloom.bloom_compose_mat.uniforms._BlurredTex.value).toBe(bloom.blur_RT.texture);
+      expect(harness.reported_errors).toEqual([]);
+    });
+
+    it('disposes its targets and blurrer when left', () =>
+    {
+      const bloom = new BloomRender();
+
+      Graphics.set_state(bloom);
+
+      const disposals: string[] = [];
+      bloom.main_RT.addEventListener('dispose', () => disposals.push('main_RT'));
+      bloom.blur_RT.addEventListener('dispose', () => disposals.push('blur_RT'));
+      // Blurrer is not an EventDispatcher; its targets and material are.
+      (bloom.blurrer as Blurrer).RT1.addEventListener('dispose', () => disposals.push('blurrer_RT1'));
+      (bloom.blurrer as Blurrer).RT2.addEventListener('dispose', () => disposals.push('blurrer_RT2'));
+      (bloom.blurrer as Blurrer).box_blur_mat.addEventListener('dispose', () => disposals.push('blurrer_material'));
+
+      Graphics.set_state(new NormalRender());
+
+      expect(disposals).toEqual(expect.arrayContaining([
+        'main_RT', 'blur_RT', 'blurrer_RT1', 'blurrer_RT2', 'blurrer_material'
+      ]));
+      expect(harness.reported_errors).toEqual([]);
+    });
+
+    it('leaving twice in a row does not throw or dispose again', () =>
+    {
+      const bloom = new BloomRender();
+
+      Graphics.set_state(bloom);
+
+      let disposals = 0;
+      bloom.main_RT.addEventListener('dispose', () => disposals++);
+
+      bloom.on_exit();
+      expect(() => bloom.on_exit()).not.toThrow();
+      expect(disposals).toBe(1);
+      expect(harness.reported_errors).toEqual([]);
+    });
+
+    it('leaving before entering does not throw', () =>
+    {
+      expect(() => new BloomRender().on_exit()).not.toThrow();
+      expect(() => new BloomRender(true).on_exit()).not.toThrow();
+      expect(harness.reported_errors).toEqual([]);
+    });
+
+    // Core calls on_exit() on the outgoing mode from set_state(), even when the same
+    // instance is set again, and set_state() then calls on_enter() on it.
+    it('re-entering the active mode through set_state keeps it working', () =>
+    {
+      const bloom = new BloomRender();
+
+      Graphics.set_state(bloom);
+      bloom.render();
+      const first = harness.read_canvas();
+
+      Graphics.set_state(bloom);
+      bloom.render();
+      const second = harness.read_canvas();
+
+      expect(second.luminance(QUAD_CENTER)).toBe(first.luminance(QUAD_CENTER));
+      expect(bloom.blurrer).toBeDefined();
       expect(harness.reported_errors).toEqual([]);
     });
 

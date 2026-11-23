@@ -1,7 +1,7 @@
 import { BloomComposeMaterial } from '../materials/BloomComposeMaterial';
 import { BaseRender } from '../render_mode/BaseRender';
 
-import { RenderTarget } from 'three';
+import { RenderTarget, Texture } from 'three';
 
 import { CameraManager } from '../CameraManager';
 import { Graphics } from '../Graphics';
@@ -37,18 +37,44 @@ class BloomRender extends BaseRender
 
   on_enter()
   {
+    // A second on_enter() without an on_exit() must not leak the first cycle.
+    this.on_exit();
+
     this.blurrer = this.use_dual_filtering ? new DualFilteringBlurrer() : new Blurrer();
     this.main_RT = new RenderTarget(OScreen.width, OScreen.height);
     this.blur_RT = new RenderTarget(OScreen.width, OScreen.height);
   }
 
   // Frees what on_enter built. Render modes are often built once per switch and then
-  // dropped, so anything kept past on_exit stays on the GPU.
+  // dropped, so anything kept past on_exit stays on the GPU. Calling it before
+  // on_enter(), or more than once, is safe and does nothing.
   on_exit()
   {
-    this.blurrer.dispose();
-    this.main_RT.dispose();
-    this.blur_RT.dispose();
+    if (this.blurrer === undefined && this.main_RT === undefined && this.blur_RT === undefined)
+    {
+      return;
+    }
+
+    // Stop sampling the blur target before on_exit() disposes it.
+    this.bloom_compose_mat.uniforms._BlurredTex.value = new Texture();
+
+    if (this.blurrer !== undefined)
+    {
+      this.blurrer.dispose();
+      this.blurrer = undefined;
+    }
+
+    if (this.main_RT !== undefined)
+    {
+      this.main_RT.dispose();
+      this.main_RT = undefined;
+    }
+
+    if (this.blur_RT !== undefined)
+    {
+      this.blur_RT.dispose();
+      this.blur_RT = undefined;
+    }
   }
 
   render()

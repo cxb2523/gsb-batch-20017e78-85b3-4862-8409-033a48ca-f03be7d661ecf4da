@@ -115,10 +115,10 @@ Unreal-style bloom. It renders the scene to `main_RT`, then runs a five-mip Gaus
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `main_RT` | `RenderTarget` | The scene target. Linear color space, nearest filtering. |
-| `blurrer` | `GaussianBlurrer` | Owns the high pass and the horizontal and vertical mip targets. |
-| `bloom_compose_mat` | `UnrealBloomComposeMaterial` | Sums the five blurred mips. |
-| `add_mat` | `AddMaterial` | Adds the composed bloom over `main_RT` on the canvas. |
+| `main_RT` | `RenderTarget` | The scene target. Linear color space, nearest filtering. Built in `on_enter()`, `undefined` before that and after `on_exit()`. |
+| `blurrer` | `GaussianBlurrer` | Owns the high pass and the horizontal and vertical mip targets. Built in `on_enter()`, `undefined` before that and after `on_exit()`. |
+| `bloom_compose_mat` | `UnrealBloomComposeMaterial` | Sums the five blurred mips. Built in the constructor, so its tuning survives an exit. |
+| `add_mat` | `AddMaterial` | Adds the composed bloom over `main_RT` on the canvas. Built in the constructor. |
 | `use_hight_luminosity_pass` | `boolean` | Whether `render()` runs the high pass. Can be changed at runtime. |
 | `use_rendering_size` | `boolean` | Which `OScreen` size `main_RT` follows. Can be changed at runtime. |
 
@@ -128,15 +128,16 @@ Unreal-style bloom. It renders the scene to `main_RT`, then runs a five-mip Gaus
 
 | Method | Description |
 |--------|-------------|
-| `on_enter()` | Binds the blurrer's mip textures to the compose and add materials. |
+| `on_enter()` | Builds `main_RT` and the blurrer (re-applying the stored radius and threshold), then binds the blurrer's mip textures to the compose and add materials. Calling it again without an `on_exit()` first frees the previous cycle. |
+| `on_exit()` | Disposes `main_RT`, the blurrer, its materials and all of its targets, and points the materials at empty textures so nothing samples the freed targets. `main_RT` and `blurrer` become `undefined`. Calling it before `on_enter()`, or twice in a row, does nothing. A later `on_enter()` rebuilds everything and rebinds, so the mode looks the same as on its first run. |
 
 #### Bloom Controls
 
 | Method | Description |
 |--------|-------------|
 | `set_bloom_strength(val)` | Scales the composed bloom. Default `1`. |
-| `set_bloom_radius(val)` | Sets the radius of the blurrer's separable blur materials. |
-| `set_luminosity_threshold(value)` | Sets the high pass threshold (0–1). Default `0.23`. Only affects the frame when `use_hight_luminosity_pass` is `true`. |
+| `set_bloom_radius(val)` | Sets the radius of the blurrer's separable blur materials. Stored on the mode, so it also works before `on_enter()` and is re-applied to the rebuilt blurrer. |
+| `set_luminosity_threshold(value)` | Sets the high pass threshold (0–1). Default `0.23`. Only affects the frame when `use_hight_luminosity_pass` is `true`. Stored and re-applied like the radius. |
 | `set_tint_color_0(col_string)` … `set_tint_color_4(col_string)` | Tints one mip, from finest (`0`) to widest (`4`). Takes any string `Color.set()` accepts, such as `'#ff8800'`. Default white. |
 
 ---

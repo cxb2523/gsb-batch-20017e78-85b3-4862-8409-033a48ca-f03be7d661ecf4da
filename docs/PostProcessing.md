@@ -14,7 +14,7 @@ import { GaussianBlurrer } from './render_utilities/GaussianBlurrer';
 import { DualFilteringBlurrer } from './render_utilities/DualFilteringBlurrer';
 ```
 
-Not singletons. Instantiate them as needed, and call `dispose()` (or `dispose_RT()` and `dispose_materials()` on `GaussianBlurrer`) when you're done with one.
+Not singletons. Instantiate them as needed, and call `dispose()` (or `dispose()` on `GaussianBlurrer`, which also frees its high pass) when you're done with one.
 
 ## How a Pass Runs
 
@@ -180,7 +180,8 @@ blur(RT, use_luminosity_high_pass)
 |--------|-------------|
 | `resize_RT(width, height)` | Resizes every target and blur material for an input of that size. Called by `blur()`; it does nothing when the size matches the last one. |
 | `init_RT()` / `init_materials()` | Dispose and rebuild the mip targets or the blur materials. The constructor calls both. |
-| `dispose_RT()` / `dispose_materials()` | Dispose the targets or the blur materials. There is no `dispose()`, and neither of them frees `luminosity_high_pass_mat`. |
+| `dispose_RT()` / `dispose_materials()` | Dispose the targets or the blur materials. Neither frees `luminosity_high_pass_mat`. |
+| `dispose()` | Disposes every target, every blur material and the high pass. Its targets go on to the GPU's dispose event, so it also reports through the renderer's texture count. `UnrealBloomRender.on_exit()` calls it. Calling it twice is safe. |
 
 ---
 

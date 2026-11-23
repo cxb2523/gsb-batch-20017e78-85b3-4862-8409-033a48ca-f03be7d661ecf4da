@@ -176,6 +176,15 @@ class GaussianBlurrer
     this.renderTargetsHorizontal.length = 0;
     this.renderTargetsVertical.length = 0;
   }
+
+  // Frees the high pass, every blur pass and every target, like the other blurrers'
+  // dispose(). UnrealBloomRender calls this when the mode is left.
+  dispose()
+  {
+    this.dispose_materials();
+    this.luminosity_high_pass_mat.dispose();
+    this.dispose_RT();
+  }
 }
 
 export { GaussianBlurrer };
