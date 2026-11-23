@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Preview rebuild lifecycle verification</title>
+</head>
+<body data-status="running">
+    <pre id="result">Running preview lifecycle verification…</pre>
+    <script type="module">
+        import Renderer from '../js/engine/Renderer.js';
+        import { renderSeamlessLoopFrames } from '../js/engine/LoopFrames.js';
+        import { presets } from '../js/presets.js';
+        import { captureExportSnapshot, exportName } from '../js/exportSession.js';
+
+        // ---------------------------------------------------------------------
+        // Harness helpers
+        // ---------------------------------------------------------------------
+        const failures = [];
+        const checks = [];
+        const record = (name, passed, detail = {}) => {
+            checks.push({ name, passed, ...detail });
+            if (!passed) failures.push(`${name}: ${JSON.stringify(detail)}`);
+        };
+
+        const deferred = () => {
+            let resolve;
+            let reject;
+            const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+            return { promise, resolve, reject };
+        };
+
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        // Flush queued microtasks (the rebuild scheduler uses queueMicrotask)
+        // and short macrotask turns.
+        const settle = async (rounds = 6) => {
+            for (let index = 0; index < rounds; index += 1) await sleep(0);
+        };
+
+        const waitFor = async (predicate, { timeout = 8000, label = 'condition' } = {}) => {
+            const start = performance.now();
+            while (performance.now() - start < timeout) {
+                if (predicate()) return true;
+                await sleep(10);
+            }
+            failures.push(`${label}: timed out after ${timeout}ms`);
+            return false;
+        };
+
+        const makeCanvas = (width = 96, height = 96) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            document.body.append(canvas);
+            return canvas;
+        };
+
+        // A controlled frame renderer whose completions are resolved explicitly.
+        // Each request's resulting frames encode the request marker so a cached
+        // frame reveals which recipe snapshot produced it.
+        const createControlledRenderer = () => {
+            const calls = [];
+            const renderFrames = (request) => {
+                const entry = { request, ...deferred() };
+                calls.push(entry);
+                return entry.promise;
+            };
+            const makeFrames = (entry, marker) => {
+                const { width, height, frameCount } = entry.request;
+                return Array.from({ length: frameCount }, (_, index) => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const context = canvas.getContext('2d');
+                    context.fillStyle = `rgb(${marker & 0xff}, ${(marker >> 8) & 0xff}, ${(marker >> 16) & 0xff})`;
+                    context.fillRect(0, 0, width, height);
+                    return canvas;
+                });
+            };
+            return { calls, renderFrames, makeFrames };
+        };
+
+        const pixelAt = (canvas, x = 1, y = 1) => canvas.getContext('2d').getImageData(x, y, 1, 1).data;
+        const samePixel = (a, b) => a.length === b.length && a.every((value, index) => value === b[index]);
+
+        const makeEmitter = (config) => ({
+            config,
+            originX: 48,
+            originY: 48,
+            particles: []
+        });
+
+        const withMarker = (config, marker) => ({ ...structuredClone(config), __marker: marker });
+
+        const markerOf = (renderer) => renderer.previewMeta?.config?.__marker ?? null;
+
+        const createHarness = (controlled, overrides = {}) => {
+            const canvas = makeCanvas(96, 96);
+            const events = [];
+            const renderer = new Renderer(canvas, makeEmitter(withMarker(presets.fireball, 0x010101)), {
+                renderFrames: controlled.renderFrames,
+                showTarget: false,
+                showOriginDot: false,
+                onPreviewStateChange: (state) => events.push(state),
+                ...overrides
+            });
+            return { canvas, renderer, events };
+        };
+
+        // Drive one animation tick deterministically (no requestAnimationFrame).
+        const tick = (renderer, delta = 0.16) => renderer.renderTick(delta);
+
+        // ---------------------------------------------------------------------
+        // 1. Normal switch: a new recipe clears the old cache, shows the building
+        //    state, and only then plays the replacement frames.
+        // ---------------------------------------------------------------------
+        {
+            const controlled = createControlledRenderer();
+            const { canvas, renderer, events } = createHarness(controlled);
+
+            renderer.setFramePreviewMode(true, 4, 0.5);
+            await settle();
+            record('normal: initial build starts once', controlled.calls.length === 1,
+                { calls: controlled.calls.length });
+            record('normal: building while first build pending', renderer.previewStatus === 'building');
+
+            controlled.calls[0].resolve({ frames: controlled.makeFrames(controlled.calls[0], 0x111111) });
+            await settle();
+            record('normal: ready after first build', renderer.previewStatus === 'ready');
+            record('normal: cache holds recipe A', markerOf(renderer) === 0x010101,
+                { marker: markerOf(renderer) });
+
+            tick(renderer);
+            const frameABeforeSwitch = [...pixelAt(canvas)];
+
+            // Recipe edit, as the app performs on a control change.
+            renderer.emitter.config = withMarker(presets.frostNova, 0x020202);
+            renderer.markPreviewDirty();
+
+            record('normal: switch drops cached frames', renderer.previewFrames === null,
+                { frames: renderer.previewFrames?.length ?? null });
+            record('normal: switch enters building state', renderer.previewStatus === 'building');
+
+            // During rebuild the canvas must show the building state, not a frame
+            // cached from recipe A.
+            tick(renderer);
+            const duringRebuild = [...pixelAt(canvas)];
+            record('normal: rebuilding canvas no longer shows recipe A frame',
+                !samePixel(duringRebuild, frameABeforeSwitch),
+                { frameABeforeSwitch, duringRebuild });
+
+            await settle();
+            record('normal: switch starts exactly one rebuild', controlled.calls.length === 2,
+                { calls: controlled.calls.length });
+
+            controlled.calls[1].resolve({ frames: controlled.makeFrames(controlled.calls[1], 0x222222) });
+            await settle();
+            record('normal: ready after switch build', renderer.previewStatus === 'ready');
+            record('normal: cache holds recipe B', markerOf(renderer) === 0x020202,
+                { marker: markerOf(renderer) });
+
+            tick(renderer);
+            const frameB = [...pixelAt(canvas)];
+            record('normal: canvas plays the rebuilt frames', samePixel(frameB, [0x22, 0x22, 0x22, 255]),
+                { frameB });
+            record('normal: state events include building then ready',
+                events.some((event) => event.status === 'building') && events.at(-1)?.status === 'ready',
+                { statuses: events.map((event) => event.status) });
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. Rapid switches: invalidations coalesce into one latest request; the
+        //    aborted request never queues a backlog.
+        // ---------------------------------------------------------------------
+        {
+            const controlled = createControlledRenderer();
+            const { renderer } = createHarness(controlled);
+
+            renderer.setFramePreviewMode(true, 4, 0.5);
+            await settle();
+                record('rapid: first request started', controlled.calls.length === 1);
+
+            for (let index = 0; index < 5; index += 1) {
+                renderer.emitter.config = withMarker(presets.fireball, 0x030000 + index);
+                renderer.markPreviewDirty();
+            }
+            await settle();
+            // Five synchronous edits schedule a single follow-up build; the stale
+            // request is aborted and detached rather than queued.
+            record('rapid: burst coalesces into one follow-up request', controlled.calls.length === 2,
+                { calls: controlled.calls.length });
+            record('rapid: stale request signalled abort', controlled.calls[0].request.signal.aborted);
+            record('rapid: follow-up uses the newest recipe',
+                controlled.calls[1].request.config.__marker === 0x030004,
+                { marker: controlled.calls[1].request.config.__marker });
+            record('rapid: still building during burst', renderer.previewStatus === 'building');
+
+            // A stale renderer that finishes late (or rejects) must be discarded.
+            controlled.calls[0].resolve({ frames: controlled.makeFrames(controlled.calls[0], 0x333333) });
+            await settle();
+            record('rapid: stale completion ignored', renderer.previewStatus === 'building',
+                { status: renderer.previewStatus });
+            record('rapid: stale completion did not populate cache', renderer.previewFrames === null);
+            record('rapid: stale completion starts no extra request', controlled.calls.length === 2,
+                { calls: controlled.calls.length });
+
+            controlled.calls[1].resolve({ frames: controlled.makeFrames(controlled.calls[1], 0x343434) });
+            await settle();
+            record('rapid: ready with final recipe', renderer.previewStatus === 'ready');
+            record('rapid: final cache is newest recipe', markerOf(renderer) === 0x030004,
+                { marker: markerOf(renderer) });
+
+            await settle();
+            record('rapid: no third request queued', controlled.calls.length === 2,
+                { calls: controlled.calls.length });
+            record('rapid: status stable after settling', renderer.previewStatus === 'ready');
+        }
+
+        // ---------------------------------------------------------------------
+        // 3. Rebuild failure: clear the building state, expose the error, and
+        //    permit a retry that succeeds.
+        // ---------------------------------------------------------------------
+        {
+            const controlled = createControlledRenderer();
+            const { renderer, events } = createHarness(controlled);
+
+            renderer.setFramePreviewMode(true, 4, 0.5);
+            await settle();
+            controlled.calls[0].reject(new Error('encoder exploded'));
+            await settle();
+
+            record('failure: status becomes error', renderer.previewStatus === 'error',
+                { status: renderer.previewStatus });
+            record('failure: error message retained',
+                /encoder exploded/.test(renderer.previewError?.message ?? ''),
+                { message: renderer.previewError?.message });
+            record('failure: no stale cache kept', renderer.previewFrames === null);
+            record('failure: building flag cleared', renderer._rebuilding === false);
+            record('failure: no pending request', renderer._previewActive === null);
+
+            // A failed build must not wedge the loop into a permanent spinner.
+            tick(renderer);
+            record('failure: loop still reports error state', renderer.previewStatus === 'error');
+
+            const retried = renderer.retryPreview();
+            record('failure: retry accepted', retried === true);
+            record('failure: retry re-enters building', renderer.previewStatus === 'building');
+            await settle();
+            record('failure: retry starts a request', controlled.calls.length === 2,
+                { calls: controlled.calls.length });
+
+            controlled.calls[1].resolve({ frames: controlled.makeFrames(controlled.calls[1], 0x444444) });
+            await settle();
+            record('failure: retry reaches ready', renderer.previewStatus === 'ready');
+            record('failure: retry clears error', renderer.previewError === null);
+            record('failure: status trail ends ready', events.at(-1)?.status === 'ready',
+                { statuses: events.map((event) => event.status) });
+        }
+
+        // ---------------------------------------------------------------------
+        // 4. Export during recipe edits: one snapshot drives the whole export,
+        //    and export never writes back into the preview cache.
+        // ---------------------------------------------------------------------
+        {
+            const controlled = createControlledRenderer();
+            const { renderer } = createHarness(controlled);
+            renderer.setFramePreviewMode(true, 4, 0.5);
+            await settle();
+            controlled.calls[0].resolve({ frames: controlled.makeFrames(controlled.calls[0], 0x555555) });
+            await settle();
+            record('export: preview ready before export', renderer.previewStatus === 'ready');
+            const cacheBefore = renderer.previewFrames;
+
+            // Snapshot recipe + settings exactly as main.js does on click.
+            const recipeAtClick = { ...withMarker(presets.fireball, 0x040404), name: 'Frozen Burst', motif: 'mandala' };
+            const snapshot = captureExportSnapshot(recipeAtClick, { size: '128', frameCount: '24', fps: '12' });
+            record('export: recipe snapshot frozen', snapshot.recipe.__marker === 0x040404);
+            record('export: frame count snapshot frozen', snapshot.frameCount === 24,
+                { frameCount: snapshot.frameCount });
+            record('export: size snapshot frozen', snapshot.size === 128, { size: snapshot.size });
+            record('export: fps snapshot frozen', snapshot.fps === 12, { fps: snapshot.fps });
+            record('export: name derived from snapshot',
+                exportName(snapshot.recipe) === 'frozen-burst-mandala',
+                { name: exportName(snapshot.recipe) });
+
+            // The live recipe changes *after* the snapshot was taken.
+            recipeAtClick.name = 'Mutated Later';
+            record('export: snapshot is insulated from later object mutation',
+                snapshot.recipe.name === 'Frozen Burst', { name: snapshot.recipe.name });
+
+            const exportPromise = renderer.exportFrames({
+                width: snapshot.size,
+                height: snapshot.size,
+                frameCount: snapshot.frameCount
+            });
+            await settle();
+            const exportCall = controlled.calls.at(-1);
+            record('export: export uses snapshot frame count', exportCall.request.frameCount === 24,
+                { frameCount: exportCall.request.frameCount });
+            record('export: export uses snapshot dimensions',
+                exportCall.request.width === 128 && exportCall.request.height === 128);
+            const exportMarker = exportCall.request.config.__marker;
+
+            // User keeps editing controls mid-export.
+            renderer.emitter.config = withMarker(presets.voidImplosion, 0x090909);
+            renderer.markPreviewDirty();
+            await settle();
+
+            record('export: in-flight export config unchanged',
+                exportCall.request.config.__marker === exportMarker,
+                { before: exportMarker, after: exportCall.request.config.__marker });
+
+            exportCall.resolve({ frames: controlled.makeFrames(exportCall, 0x666666) });
+            const result = await exportPromise;
+            record('export: result has snapshot frame count', result.frames.length === 24);
+            record('export: result reports snapshot width', result.width === 128);
+            record('export: result config is the frozen snapshot',
+                result.config.__marker === exportMarker);
+
+            // The export result must never populate or overwrite the preview cache.
+            record('export: export left preview cache empty while rebuilding',
+                renderer.previewFrames === null,
+                { frames: renderer.previewFrames?.length ?? null });
+            record('export: export left preview meta empty', renderer.previewMeta === null);
+
+            // The concurrent preview rebuild uses the edited recipe.
+            const previewCall = controlled.calls.at(-1);
+            record('export: preview rebuild uses edited recipe',
+                previewCall.request.config.__marker === 0x090909,
+                { marker: previewCall.request.config.__marker });
+            previewCall.resolve({ frames: controlled.makeFrames(previewCall, 0x777777) });
+            await settle();
+            record('export: preview ready after export', renderer.previewStatus === 'ready');
+            record('export: preview cache is edited recipe', markerOf(renderer) === 0x090909,
+                { marker: markerOf(renderer) });
+            record('export: preview cache replaced, not export data', cacheBefore !== renderer.previewFrames);
+        }
+
+        // ---------------------------------------------------------------------
+        // 5. Real renderer smoke test: genuine LoopFrames output is accepted and
+        //    a canvas resize rebuilds at the new dimensions.
+        // ---------------------------------------------------------------------
+        {
+            const canvas = makeCanvas(64, 64);
+            const renderer = new Renderer(canvas, makeEmitter(presets.frostNova), {
+                showTarget: false,
+                showOriginDot: false
+            });
+            renderer.setFramePreviewMode(true, 4, 0.5);
+            const ready = await waitFor(() => renderer.previewStatus === 'ready', { label: 'real: initial ready' });
+            if (ready) {
+                record('real: frames cached at canvas size',
+                    renderer.previewFrames?.length === 4
+                    && renderer.previewMeta?.width === 64
+                    && renderer.previewMeta?.height === 64);
+                record('real: cached ImageData dimensions correct',
+                    renderer.previewFrames[0].width === 64 && renderer.previewFrames[0].height === 64);
+            }
+
+            canvas.width = 96;
+            canvas.height = 96;
+            renderer.syncPreviewTarget();
+            record('real: resize enters building', renderer.previewStatus === 'building');
+            const resized = await waitFor(() => renderer.previewStatus === 'ready', { label: 'real: resize ready' });
+            if (resized) {
+                record('real: rebuilt at new size', renderer.previewMeta?.width === 96,
+                    { width: renderer.previewMeta?.width });
+            }
+
+            const cacheRef = renderer.previewFrames;
+            const exported = await renderer.exportFrames({ width: 48, height: 48, frameCount: 3 });
+            record('real: export returns snapshot frame count', exported.frames.length === 3);
+            record('real: export config is a distinct clone', exported.config !== renderer.emitter.config);
+            record('real: export kept preview cache intact', renderer.previewFrames === cacheRef);
+        }
+
+        // ---------------------------------------------------------------------
+        // 6. Abort plumbing: the real frame renderer stops early when its signal
+        //    fires, and a pre-aborted signal rejects without rendering at all.
+        // ---------------------------------------------------------------------
+        {
+            const controller = new AbortController();
+            const pending = renderSeamlessLoopFrames({
+                config: presets.fireball,
+                width: 64,
+                height: 64,
+                frameCount: 48,
+                signal: controller.signal
+            });
+            controller.abort();
+            let aborted = false;
+            try {
+                await pending;
+            } catch (error) {
+                aborted = error?.name === 'AbortError';
+            }
+            record('abort: in-flight render rejects with AbortError', aborted);
+
+            const preAborted = new AbortController();
+            preAborted.abort();
+            let rejectedBeforeStart = false;
+            try {
+                await renderSeamlessLoopFrames({
+                    config: presets.fireball,
+                    width: 32,
+                    height: 32,
+                    frameCount: 4,
+                    signal: preAborted.signal
+                });
+            } catch (error) {
+                rejectedBeforeStart = error?.name === 'AbortError';
+            }
+            record('abort: pre-aborted render rejects immediately', rejectedBeforeStart);
+
+            // Anti-regression: an unaborted render still completes normally.
+            const complete = await renderSeamlessLoopFrames({
+                config: presets.fireball,
+                width: 32,
+                height: 32,
+                frameCount: 4
+            });
+            record('abort: render without signal still completes', complete.frames.length === 4);
+        }
+
+        // ---------------------------------------------------------------------
+        // Report
+        // ---------------------------------------------------------------------
+        const passed = failures.length === 0;
+        const result = {
+            passed,
+            totalChecks: checks.length,
+            failedChecks: checks.filter((check) => !check.passed),
+            checks
+        };
+        document.body.dataset.status = passed ? 'passed' : 'failed';
+        document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+    </script>
+</body>
+</html>

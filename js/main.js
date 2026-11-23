@@ -13,6 +13,10 @@ import {
     renderEffectFrames
 } from './AbilityEffect.js?v=13';
 import { LOOP_MOTIFS, LOOP_MOTIF_GROUPS } from './engine/LoopArt.js?v=3';
+import {
+    captureExportSnapshot as buildExportSnapshot,
+    exportName as recipeExportName
+} from './exportSession.js?v=1';
 
 const GIF_WORKER_URL = new URL('./gif.worker.js', import.meta.url).href;
 const GIF_TRANSPARENT_COLOR = 0x010203;
@@ -264,13 +268,7 @@ const setNotice = (message, tone = 'default') => {
     noticeTimer = window.setTimeout(() => notice.classList.remove('visible'), 2800);
 };
 
-const sanitizeFilename = (value) => String(value ?? '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'ability-fx';
-
-const exportName = () => `${sanitizeFilename(baseRecipe.name)}-${sanitizeFilename(baseRecipe.motif)}`;
-
+const exportName = (recipe = baseRecipe) => recipeExportName(recipe);
 const timestamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 
 const downloadUrl = (url, filename) => {
@@ -295,18 +293,18 @@ const releaseAtlasPreview = () => {
     atlasPreviewUrl = null;
 };
 
-// Export dimensions are select values, but they still bound the amount of canvas
-// memory a single export can allocate. Reject non-finite or out-of-range values.
-const boundedSetting = (value, fallback, minimum, maximum) => {
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? Math.min(maximum, Math.max(minimum, numeric)) : fallback;
-};
-
+// Export dimensions are select values, but the snapshot normalizes them anyway
+// so a malformed or out-of-range option can never allocate a huge canvas.
 const currentExportOptions = () => ({
-    size: Math.round(boundedSetting(canvasSizeSelect.value, 160, 128, 256)),
-    frameCount: Math.round(boundedSetting(frameCountSelect.value, 32, 24, 48)),
-    fps: Math.round(boundedSetting(fpsSelect.value, 16, 12, 24))
+    size: canvasSizeSelect.value,
+    frameCount: frameCountSelect.value,
+    fps: fpsSelect.value
 });
+
+// Everything a single export depends on is captured here, before the first
+// await. Controls the user keeps editing while frames render can no longer
+// change the export payload, its metadata or its download name.
+const captureExportSnapshot = () => buildExportSnapshot(baseRecipe, currentExportOptions());
 
 const beginExport = () => {
     if (exportInProgress) {
@@ -459,15 +457,14 @@ const prepareGifFrame = (frame) => {
     return prepared;
 };
 
-const captureFrames = async () => {
-    const settings = currentExportOptions();
+const captureFrames = async (snapshot) => {
     setNotice('Rendering seamless loop…');
     const result = await renderEffectFrames({
-        recipe: baseRecipe,
-        size: settings.size,
-        frameCount: settings.frameCount
+        recipe: snapshot.recipe,
+        size: snapshot.size,
+        frameCount: snapshot.frameCount
     });
-    return { ...result, ...settings };
+    return { ...result, snapshot };
 };
 
 // A download must keep its object URL alive until the browser has consumed it;
@@ -479,8 +476,11 @@ const releaseAfterDownload = (url) => {
 const exportAtlas = async () => {
     if (!beginExport()) return;
     try {
-        const { frames, size } = await captureFrames();
-        const atlas = createAtlas(frames, size);
+        // Lock the recipe and frame settings before the first await; later
+        // control edits apply to the next export only.
+        const snapshot = captureExportSnapshot();
+        const { frames } = await captureFrames(snapshot);
+        const atlas = createAtlas(frames, snapshot.size);
         const blob = await canvasToBlob(atlas);
         releaseAtlasPreview();
         // Separate URLs prevent a recipe change (which releases the preview) from
@@ -490,10 +490,10 @@ const exportAtlas = async () => {
         atlasPreviewUrl = previewUrl;
         const image = new Image();
         image.src = previewUrl;
-        image.alt = `${baseRecipe.name} sprite atlas`;
+        image.alt = `${snapshot.recipe.name} sprite atlas`;
         atlasPreview.replaceChildren(image);
         atlasPreviewShell.hidden = false;
-        downloadUrl(downloadBlobUrl, `atlas-${exportName()}-${timestamp()}.png`);
+        downloadUrl(downloadBlobUrl, `atlas-${exportName(snapshot.recipe)}-${timestamp()}.png`);
         releaseAfterDownload(downloadBlobUrl);
         setNotice('Sprite atlas exported', 'success');
     } catch (error) {
@@ -511,16 +511,18 @@ const exportFramesZip = async () => {
     }
     if (!beginExport()) return;
     try {
-        const { frames } = await captureFrames();
+        // Snapshot before awaiting so a slow ZIP encode cannot capture edits.
+        const snapshot = captureExportSnapshot();
+        const { frames } = await captureFrames(snapshot);
         const zip = new JSZip();
         const blobs = await Promise.all(frames.map((frame) => canvasToBlob(frame)));
         blobs.forEach((blob, index) => {
             zip.file(`frame-${String(index).padStart(3, '0')}.png`, blob);
         });
-        zip.file('recipe.json', JSON.stringify(baseRecipe, null, 2));
+        zip.file('recipe.json', JSON.stringify(snapshot.recipe, null, 2));
         const blob = await zip.generateAsync({ type: 'blob' });
         const url = URL.createObjectURL(blob);
-        downloadUrl(url, `frames-${exportName()}-${timestamp()}.zip`);
+        downloadUrl(url, `frames-${exportName(snapshot.recipe)}-${timestamp()}.zip`);
         releaseAfterDownload(url);
         setNotice('PNG sequence exported', 'success');
     } catch (error) {
@@ -546,7 +548,9 @@ const exportGif = async () => {
     };
 
     try {
-        const { frames, fps } = await captureFrames();
+        // Snapshot before awaiting so the encode cannot observe later edits.
+        const snapshot = captureExportSnapshot();
+        const { frames } = await captureFrames(snapshot);
         setNotice('Encoding transparent GIF…');
         gif = new GIF({
             workers: 2,
@@ -558,13 +562,13 @@ const exportGif = async () => {
         frames.forEach((frame) => {
             gif.addFrame(prepareGifFrame(frame), {
                 copy: true,
-                delay: Math.round(1000 / fps)
+                delay: Math.round(1000 / snapshot.fps)
             });
         });
         gif.on('finished', (blob) => {
             try {
                 const url = URL.createObjectURL(blob);
-                downloadUrl(url, `loop-${exportName()}-${timestamp()}.gif`);
+                downloadUrl(url, `loop-${exportName(snapshot.recipe)}-${timestamp()}.gif`);
                 releaseAfterDownload(url);
                 setNotice('Transparent GIF exported', 'success');
             } finally {

@@ -219,7 +219,19 @@ const bounded = (value, fallback, minimum, maximum) => {
     return Number.isFinite(numeric) ? Math.min(maximum, Math.max(minimum, numeric)) : fallback;
 };
 
-export const renderSeamlessLoopFrames = async ({ config, width, height, frameCount }) => {
+const abortError = () => {
+    const error = new Error('Loop frame rendering was aborted.');
+    error.name = 'AbortError';
+    return error;
+};
+
+export const renderSeamlessLoopFrames = async ({ config, width, height, frameCount, signal }) => {
+    const throwIfAborted = () => {
+        if (signal?.aborted) throw abortError();
+    };
+
+    throwIfAborted();
+
     const bounds = {
         width: Math.trunc(bounded(width, 160, 16, 512)),
         height: Math.trunc(bounded(height, 160, 16, 512))
@@ -229,6 +241,7 @@ export const renderSeamlessLoopFrames = async ({ config, width, height, frameCou
     const frames = [];
 
     for (let index = 0; index < totalFrames; index += 1) {
+        throwIfAborted();
         const frameCanvas = document.createElement('canvas');
         frameCanvas.width = bounds.width;
         frameCanvas.height = bounds.height;
@@ -238,6 +251,8 @@ export const renderSeamlessLoopFrames = async ({ config, width, height, frameCou
 
         if (index % 2 === 1) await new Promise((resolve) => setTimeout(resolve, 0));
     }
+
+    throwIfAborted();
 
     return { frames, model };
 };

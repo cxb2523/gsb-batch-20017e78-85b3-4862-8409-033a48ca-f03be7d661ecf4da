@@ -41,6 +41,8 @@ Everything is rendered locally with the Canvas 2D API. There is no account, back
 - **10 elemental palettes** — Fire, Frost, Nature, Earth, Storm, Arcane, Shadow, Radiance, Blood, and Tide.
 - **Fine-grained direction** — combine formations, geometries, traces, particle shapes, flow, and temporal style.
 - **Live pixel preview** — restart or pause a complete cycle.
+- **Consistent preview rebuilds** — an edit invalidates the in-flight rebuild, coalesces rapid changes into one request, and shows a building state (never the previous recipe's frames) until the new sequence is ready.
+- **Snapshot exports** — each export locks its recipe and frame settings at start, so editing controls mid-export cannot change the downloaded content.
 - **Resolution-aware rendering** — export square frames at 128, 160, 192, or 256 pixels without smoothing.
 - **Three export workflows** — download a sprite atlas, a zipped PNG sequence with recipe metadata, or a looping transparent GIF.
 - **No build tooling** — plain HTML, CSS, and JavaScript modules are enough to run and deploy the app.
@@ -214,6 +216,14 @@ The harness prints a JSON report and sets `"passed": true` when all checks succe
 Because these tests use Canvas APIs, they run in a browser rather than a Node.js test runner.
 
 Open `tests/loop-art-harness.html` for dedicated seam checks across all 50 motifs and three seeds each. It checks exact periodicity, the visible transition from the last exported frame to the first, non-empty frames, transparent frame edges, distinct rendered frames, and export dimensions. `tests/motif-gallery.html` shows all 50 motifs together for visual review.
+
+Open `tests/preview-lifecycle-harness.html` for the preview rebuild lifecycle. It drives the frame-preview renderer with a controllable fake encoder and a real render pass, and verifies:
+
+- a recipe or canvas-size change drops the cached frames and shows the building state instead of playing the previous recipe;
+- rapid consecutive changes abort the in-flight rebuild and coalesce into exactly one latest request, with stale completions discarded;
+- a failed rebuild clears the building state, keeps a retryable error path, and leaves no stale cache;
+- an export locks its recipe and frame settings at start (later control edits cannot change its frames, metadata, or filename) and never writes back into the preview cache;
+- the real loop renderer honours abort signals while an un-aborted render still completes.
 
 ## Deploying to GitHub Pages
 
