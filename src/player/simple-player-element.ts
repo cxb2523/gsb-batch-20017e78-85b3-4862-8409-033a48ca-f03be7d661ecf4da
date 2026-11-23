@@ -1723,6 +1723,31 @@ export class SimplePlayer extends HTMLElement {
     this.#volumePopover.setAttribute('inert', '');
   }
 
+  // Tear down every in-flight pointer gesture (progress scrub, volume drag,
+  // speed drag) so an old source's interaction state cannot leak into a newly
+  // assigned one. Pointer capture is released explicitly for each active track.
+  #cancelActiveInteractions() {
+    this.#clearScrubLongPressTimer();
+    this.#isTrackingScrub = false;
+    this.#isScrubbing = false;
+    this.#isCommittedScrubPending = false;
+    this.#committedScrubWasPlaying = false;
+    this.#isProgressHoverPreviewing = false;
+    this.#player.classList.remove('is-scrubbing', 'is-progress-hovering');
+    this.#player.style.setProperty('--sp-hover-fill-inset', '100%');
+    this.#releaseScrubPointer(this.#activeScrubPointerId);
+    this.#activeScrubPointerId = null;
+    this.#clearControlsCollision();
+
+    this.#clearVolumeInteractionState();
+
+    this.#closeSpeedPopover();
+    this.#releaseSpeedPointer(this.#activeSpeedPointerId);
+    this.#activeSpeedPointerId = null;
+    this.#isSpeedScrubbing = false;
+    this.#isSpeedHovering = false;
+  }
+
   #handleAudioTrackAdded = () => {
     this.#hasCheckedAudioTrack = true;
     this.#hasAudioTrack = true;
@@ -2864,6 +2889,9 @@ export class SimplePlayer extends HTMLElement {
     this.#observer = null;
     this.#clearVideoRetryTimer();
     this.#clearInitialProgressSettleTimer();
+    // Cancel any in-flight scrub/volume/speed gesture and release pointer
+    // capture before the old source is torn down.
+    this.#cancelActiveInteractions();
     this.#videoSourceLoaded = false;
     this.#videoLoadAttempt = 0;
     this.#hasDecodedFirstFrame = false;
@@ -2874,12 +2902,15 @@ export class SimplePlayer extends HTMLElement {
     this.#hasInitialProgressSettled = false;
     this.#lastRenderedProgressTime = 0;
     this.#clearPausedVisualProgress();
+    // Invalidate the previous source's audio verdict: the volume control
+    // returns to the undetermined middle state and is re-probed once the new
+    // source reaches metadata/first frame.
     this.#hasAudioTrack = false;
     this.#hasCheckedAudioTrack = false;
+    this.#volumeIconState = null;
+    this.#clearVolumeIconAnimationTimer();
+    this.#player.classList.remove('is-volume-icon-animating');
     this.#syncOptionalControls();
-    this.#clearVolumeInteractionState();
-    this.#isCommittedScrubPending = false;
-    this.#committedScrubWasPlaying = false;
     this.#optimisticPlaybackState = null;
     this.#player.classList.remove('has-loaded-once', 'has-visible-frame', 'is-progress-settling');
     this.#video.dataset.src = this.src;
