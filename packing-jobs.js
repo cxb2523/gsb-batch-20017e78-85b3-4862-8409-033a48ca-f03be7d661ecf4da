@@ -1,8 +1,100 @@
 'use strict';
 
+// Tracks the single active packing request. Tokens capture the input revision at
+// start; input changes invalidate every in-flight token so late results cannot
+// be written to the workspace.
+class PackingSession {
+    constructor({ Packer: packer } = {}) {
+        this.Packer = packer || (typeof Packer !== 'undefined' ? Packer : null);
+        this.revision = 0;
+        this.latestId = 0;
+        this.current = null;
+        this.currentLayout = null;
+        this.best = null;
+        this.excludeSignature = null;
+    }
+
+    begin({ explore = false, excludeSignature = this.excludeSignature, controller = null,
+        bin = null, checkStability = true, supportRatio = 0.5 } = {}) {
+        this.latestId += 1;
+        this.current = { id: this.latestId, revision: this.revision, explore, excludeSignature, controller,
+            bin, checkStability, supportRatio, cancelled: false };
+        return this.current;
+    }
+
+    // True while a newer request has not been started.
+    isLatest(token) {
+        return Boolean(token) && token.id === this.latestId;
+    }
+
+    // True only for the active request whose input revision is still current.
+    isCurrent(token) {
+        return Boolean(token) && token === this.current && this.isLatest(token) &&
+            token.revision === this.revision && !token.cancelled &&
+            !(token.controller && token.controller.signal.aborted);
+    }
+
+    cancel(token = this.current) {
+        if (token) token.cancelled = true;
+    }
+
+    finish(token) {
+        if (token === this.current) this.current = null;
+    }
+
+    // Input changed: stop any running search, drop the best solution, the visible
+    // plan and the exclusion signature derived from the previous (now stale) layout.
+    invalidate() {
+        this.cancel();
+        this.current?.controller?.abort?.();
+        this.current = null;
+        this.revision += 1;
+        this.currentLayout = null;
+        this.best = null;
+        this.excludeSignature = null;
+    }
+
+    noteLayout(items) {
+        this.excludeSignature = this.Packer && Array.isArray(items) ? this.Packer.layoutSignature(items) : null;
+    }
+
+    // Only a still-current, valid, genuinely different result may replace the
+    // workspace and become the best solution. Everything else leaves state as-is
+    // and reports why, so the caller can explain it to the user.
+    apply(token, result) {
+        const cancelled = Boolean(token && (token.cancelled || token.controller?.signal.aborted));
+        if (!this.isCurrent(token)) return { accepted: false, reason: cancelled ? 'cancelled' : 'stale' };
+        if (!result || !Array.isArray(result.items) || result.invalidLayout) return { accepted: false, reason: 'invalid' };
+        // The token's bin and options are the ones the request was started with;
+        // validating here keeps legality checks independent of the caller.
+        if (token.bin && this.Packer && !this.Packer.validatePackingResult(
+            result.items, ...token.bin, token.checkStability, token.supportRatio).valid) {
+            return { accepted: false, reason: 'invalid' };
+        }
+        if (token.explore && token.excludeSignature && this.Packer &&
+            this.Packer.layoutSignature(result.items) === token.excludeSignature) {
+            return { accepted: false, reason: 'same' };
+        }
+        const improved = !this.best || !this.Packer ||
+            this.Packer.comparePackings(result.items, this.best.items) > 0;
+        // Best follows count, then volume, then height; the visible plan always
+        // follows the accepted request.
+        if (improved) this.best = result;
+        this.currentLayout = result.items;
+        this.noteLayout(result.items);
+        this.current = null;
+        return { accepted: true, improved, best: this.best };
+    }
+}
+
 // Each job owns its workers, timers, and abort listeners, including losing searches.
 const PackingJobs = {
     blobURL: null,
+    activeExplore: null,
+    Session: PackingSession,
+    createSession(options = {}) {
+        return new PackingSession(options);
+    },
     createWorker() {
         if (!this.blobURL) {
             const source = `
@@ -25,7 +117,34 @@ const PackingJobs = {
         }
         return new Worker(this.blobURL);
     },
-    async run(items, bin, options = {}, { signal, onProgress = () => {} } = {}) {
+    // Alternative searches are single-flight: a new one always cancels and
+    // waits for the previous one before its own workers start.
+    async run(items, bin, options = {}, context = {}) {
+        if (!options.explore) return this.runCore(items, bin, options, context);
+        // Re-check after every wait: a third caller that raced in may have
+        // claimed the slot while we were waiting for an older search to settle.
+        while (this.activeExplore) {
+            const previous = this.activeExplore;
+            previous.controller.abort();
+            await previous.settled;
+            if (this.activeExplore === previous) break;
+        }
+        const signal = context.signal;
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        if (signal?.aborted) controller.abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+        const promise = this.runCore(items, bin, options, { ...context, signal: controller.signal });
+        const entry = { controller, promise, settled: null };
+        entry.settled = promise.catch(() => {});
+        this.activeExplore = entry;
+        try { return await promise; }
+        finally {
+            signal?.removeEventListener('abort', abort);
+            if (this.activeExplore === entry) this.activeExplore = null;
+        }
+    },
+    async runCore(items, bin, options = {}, { signal, onProgress = () => {} } = {}) {
         const abortError = () => new DOMException('计算已取消', 'AbortError');
         const checkAbort = () => { if (signal?.aborted) throw abortError(); };
         checkAbort();
@@ -33,7 +152,7 @@ const PackingJobs = {
         new Packer(...bin);
         const originals = items;
         const ids = new Map(originals.map(item => [item.id, item]));
-        const normalized = { checkStability: true, supportRatio: 0.5, biggerFirst: true, seed: 20260617, timeBudgetMs: 8000, ...options };
+        const normalized = { checkStability: true, supportRatio: 0.5, biggerFirst: true, seed: 20260617, timeBudgetMs: 8000, workerTimeoutMs: 15000, ...options };
         const finishResult = (packed, extra = {}) => {
             const packedIds = new Set(packed.map(item => item.id));
             return { items: packed, unpacked: originals.filter(item => !packedIds.has(item.id)), ...extra };
@@ -43,6 +162,8 @@ const PackingJobs = {
         if (!items.length) return finishResult([]);
         const stoppers = new Set();
         let workerFailure = false;
+        let invalidResults = 0;
+        let validResults = 0;
         const accept = data => {
             if (!Array.isArray(data)) throw new TypeError('Invalid worker result');
             const seen = new Set();
@@ -68,7 +189,14 @@ const PackingJobs = {
                 clearTimeout(timer);
                 signal?.removeEventListener('abort', abort);
                 stoppers.delete(abort);
-                worker?.terminate();
+                if (worker) {
+                    // Swap in no-op handlers first so a late reply or error
+                    // arriving after termination is silently discarded.
+                    worker.onmessage = () => {};
+                    worker.onerror = () => {};
+                    worker.onmessageerror = () => {};
+                    worker.terminate();
+                }
                 error ? reject(error) : resolve(result);
             };
             const abort = () => finish(abortError());
@@ -77,10 +205,11 @@ const PackingJobs = {
                 checkAbort();
                 worker = this.createWorker();
                 signal?.addEventListener('abort', abort, { once: true });
-                timer = setTimeout(() => finish(new Error('后台计算超时，请减少数量后重试')), 15000);
+                timer = setTimeout(() => finish(new Error('后台计算超时，请减少数量后重试')), normalized.workerTimeoutMs);
                 worker.onerror = () => finish(new Error('后台计算失败，请重试'));
                 worker.onmessageerror = () => finish(new Error('后台计算结果无法读取'));
                 worker.onmessage = ({ data: reply }) => {
+                    if (done) return;
                     if (!reply || typeof reply !== 'object') return finish(new Error('Invalid worker response'));
                     finish(reply.error ? new Error(reply.error) : null, reply.result);
                 };
@@ -102,10 +231,11 @@ const PackingJobs = {
                 else if (raw) {
                     try {
                         const packed = accept(layer ? raw : raw.items);
+                        validResults++;
                         const eligible = different(packed) && (!normalized.explore || packed.length > 0) &&
                             (layer ? packed.length === items.length : Number.isFinite(raw.score));
                         if (eligible && (!best || Packer.comparePackings(packed, best) > 0)) best = packed;
-                    } catch { workerFailure = true; }
+                    } catch { workerFailure = true; invalidResults++; }
                 }
                 pending--;
                 if (!signal?.aborted && !layer) onProgress(25 + Math.round((jobs.length - pending) / jobs.length * 70), '正在比较装箱策略');
@@ -131,6 +261,11 @@ const PackingJobs = {
                 const packed = await phase(Array.from({ length: cores }, (_, i) => ({ start: offset + i * perWorker, end: offset + (i + 1) * perWorker })), false);
                 checkAbort();
                 if (packed) { onProgress(100, '布局校验完成'); return finishResult(packed, { degraded: workerFailure }); }
+                // Every worker reply that arrived was an illegal layout, and no
+                // valid candidate exists: never substitute a different layout.
+                if (normalized.explore && invalidResults > 0 && validResults === 0) {
+                    return finishResult([], { noAlternative: true, invalidLayout: true, degraded: true });
+                }
                 if (normalized.explore && !workerFailure) return finishResult([], { noAlternative: true });
             }
             // shortcut: workerless browsers run two bounded trials; enable Workers for deeper search.
@@ -150,6 +285,8 @@ const PackingJobs = {
         } finally { stoppers.forEach(stop => stop()); }
     },
     dispose() {
+        this.activeExplore?.controller.abort();
+        this.activeExplore = null;
         if (this.blobURL) URL.revokeObjectURL(this.blobURL);
         this.blobURL = null;
     }

@@ -19,16 +19,23 @@ let packingSeed = 20260617;
 
 const MAX_INVENTORY_QTY = 1000;
 const MAX_ITEM_NAME_LENGTH = 80;
+// Owns the in-flight request identity, the best solution and the excluded
+// signature so a stale or cancelled search can never rewrite the workspace.
+const packingSession = PackingJobs.createSession();
 function setWorkspaceStatus(message) {
     document.getElementById('workspace-status').textContent = message;
 }
 
 function cancelPacking() {
     packingController?.abort();
+    packingSession.cancel();
 }
 
 function invalidateAutoLayout() {
     cancelPacking();
+    // Input changed: drop the old best result and its exclusion signature so an
+    // alternative search never compares against stale data.
+    packingSession.invalidate();
     stopAnimation();
     autoPackedItems = [];
     autoUnpackedItems = [];
@@ -642,6 +649,7 @@ async function performParallelPacking(items, binW, binH, binL, options, signal) 
         { perm: [0, 2, 1], bin: [binW, binL, binH] }
     ];
     let best = null;
+    let invalidLayout = false;
     const seen = new Set();
     for (let index = 0; index < configs.length; index++) {
         const config = configs[index];
@@ -656,6 +664,7 @@ async function performParallelPacking(items, binW, binH, binL, options, signal) 
             document.getElementById('loading-description').textContent = label + '，姿态 ' + (index + 1) + ' / ' + configs.length;
         } });
         if (signal.aborted) throw new DOMException('计算已取消', 'AbortError');
+        if (result.invalidLayout) invalidLayout = true;
         if (result.noAlternative) continue;
         const packed = result.items.map(item => {
             const pos = [], size = [];
@@ -665,15 +674,22 @@ async function performParallelPacking(items, binW, binH, binL, options, signal) 
             mapped.x = pos[0]; mapped.y = pos[1]; mapped.z = pos[2];
             const rotation = Packer.getUniqueOrientations(mapped).find(r =>
                 Math.abs(r.rw - size[0]) < 0.001 && Math.abs(r.rh - size[1]) < 0.001 && Math.abs(r.rd - size[2]) < 0.001);
+            if (!rotation) { invalidLayout = true; return null; }
             mapped.setRotation(rotation.rotationType);
             return mapped;
         });
-        if (!Packer.validatePackingResult(packed, binW, binH, binL, options.checkStability, options.supportRatio).valid) continue;
+        // Any malformed or geometrically illegal candidate is rejected as a
+        // whole; it must never partially replace the current plan.
+        if (packed.some(item => !item)) { invalidLayout = true; continue; }
+        if (!Packer.validatePackingResult(packed, binW, binH, binL, options.checkStability, options.supportRatio).valid) {
+            invalidLayout = true;
+            continue;
+        }
         if (options.excludeSignature && Packer.layoutSignature(packed) === options.excludeSignature) continue;
         if (!best || Packer.comparePackings(packed, best.items) > 0) best = { ...result, items: packed };
         if (packed.length === items.length) break;
     }
-    if (!best && options.explore) return { noAlternative: true };
+    if (!best && options.explore) return { noAlternative: true, invalidLayout };
     if (!best) throw new Error('未找到有效布局，请检查配置并重试');
     return best;
 }
@@ -704,12 +720,22 @@ document.getElementById('run-pack-btn').addEventListener('click', () => calculat
 document.getElementById('alternative-pack-btn').addEventListener('click', () => calculatePacking(true));
 document.getElementById('restore-best-btn').addEventListener('click', () => {
     if (packingController || !bestAutoResult) return;
+    if (!packingSession.best) {
+        // Input changed since the best was found: refuse to restore stale data.
+        document.getElementById('restore-best-btn').hidden = true;
+        setWorkspaceStatus('输入已变更，请重新计算最佳方案');
+        return;
+    }
     displayAutoResult(bestAutoResult);
+    // The restored plan becomes the visible layout, so a later alternative
+    // search excludes it rather than the plan it replaced.
+    packingSession.currentLayout = bestAutoResult.items;
+    packingSession.noteLayout(bestAutoResult.items);
     setWorkspaceStatus('已恢复当前数据下找到的最佳方案');
 });
 async function calculatePacking(explore = false) {
     if (activeMode !== 'auto' || packingController) return;
-    
+
     stopAnimation();
 
     let binL, binW, binH;
@@ -746,7 +772,6 @@ async function calculatePacking(explore = false) {
         return;
     }
 
-    const previousSignature = Packer.layoutSignature(autoPackedItems);
     const started = performance.now();
     solutionAttempt++;
     packingSeed = explore ? (packingSeed + 0x9e3779b9) >>> 0 : 20260617;
@@ -754,6 +779,12 @@ async function calculatePacking(explore = false) {
     // 3. 异步并发执行装箱
     const controller = new AbortController();
     packingController = controller;
+    // The request token pins the input revision and the exclusion signature; a
+    // result is only written while this token is still current.
+    const token = packingSession.begin({
+        explore, excludeSignature: explore ? packingSession.excludeSignature : null, controller,
+        bin: [binW, binH, binL], checkStability, supportRatio: 0.5
+    });
     const button = document.getElementById('run-pack-btn');
     const alternativeButton = document.getElementById('alternative-pack-btn');
     button.disabled = true;
@@ -768,18 +799,36 @@ async function calculatePacking(explore = false) {
     try {
         const result = await performParallelPacking(itemsToPack, binW, binH, binL, {
             checkStability, supportRatio: 0.5, biggerFirst, seed: packingSeed, explore,
-            excludeSignature: explore ? previousSignature : undefined
+            excludeSignature: token.excludeSignature
         }, controller.signal);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !packingSession.isCurrent(token)) return;
         closeOverlay('loading-modal');
         if (result.noAlternative) {
-            setWorkspaceStatus('本次搜索未找到不同的有效方案，现有布局已保留');
+            setWorkspaceStatus(result.invalidLayout
+                ? '后台返回的布局未通过校验，已保留原方案'
+                : '本次搜索未找到不同的有效方案，现有布局已保留');
+            if (result.invalidLayout) {
+                showWarningModal('warning', '布局校验未通过', '后台返回的布局不满足边界、碰撞或支撑要求，因此已被丢弃。',
+                    '现有方案保持不变，您可以重试或调整配置。');
+            }
             return;
         }
+        // Final gate: never write an illegal layout, even at the UI boundary.
+        const applied = packingSession.apply(token, result);
+        if (!applied.accepted) {
+            if (applied.reason === 'invalid') {
+                setWorkspaceStatus('后台返回的布局未通过校验，已保留原方案');
+                showWarningModal('warning', '布局校验未通过', '后台返回的布局不满足边界、碰撞或支撑要求，因此已被丢弃。',
+                    '现有方案保持不变，您可以重试或调整配置。');
+            } else if (applied.reason === 'same') {
+                setWorkspaceStatus('本次搜索未找到不同的有效方案，现有布局已保留');
+            }
+            return;
+        }
+        bestAutoResult = applied.best;
         result.attempt = solutionAttempt;
         result.seed = packingSeed;
-        const improved = bestAutoResult && Packer.comparePackings(result.items, bestAutoResult.items) > 0;
-        if (!bestAutoResult || improved) bestAutoResult = result;
+        const improved = applied.improved;
         displayAutoResult(result);
         const elapsed = ((performance.now() - started) / 1000).toFixed(2);
         setWorkspaceStatus((improved ? '找到更优方案' : explore ? '已生成不同方案' : '装箱完成') +
@@ -813,6 +862,7 @@ async function calculatePacking(explore = false) {
         } else setWorkspaceStatus('计算已取消，可以调整参数后重试');
     } finally {
         clearTimeout(loadingTimer);
+        packingSession.finish(token);
         if (packingController === controller) packingController = null;
         closeOverlay('loading-modal');
         button.disabled = false;

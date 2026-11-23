@@ -7,7 +7,7 @@ const { Worker: Thread } = require('node:worker_threads');
 // Execute the actual generated browser worker source on Node threads, without WebGL or mocks.
 module.exports = function workerRuntime(root = path.resolve(__dirname, '../..')) {
     const context = vm.createContext({ module: { exports: {} }, performance, DOMException, setTimeout, clearTimeout,
-        navigator: { hardwareConcurrency: 5 },
+        AbortController, navigator: { hardwareConcurrency: 5 },
         Blob: class { constructor(parts) { this.source = parts.join(''); } },
         URL: { createObjectURL: blob => blob.source, revokeObjectURL() {} },
         Worker: class {
