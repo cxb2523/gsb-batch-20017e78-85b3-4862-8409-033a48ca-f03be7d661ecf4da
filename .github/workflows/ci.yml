@@ -30,6 +30,9 @@ jobs:
       - name: Trail window math
         run: node tools/check-trail-window.mjs
 
+      - name: Worker heap progress + units chunking
+        run: node tools/check-worker-heap.mjs
+
       - name: Demo data parses
         run: |
           python - <<'PY'

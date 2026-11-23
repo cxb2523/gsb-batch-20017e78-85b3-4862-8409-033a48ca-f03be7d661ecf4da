@@ -16,35 +16,108 @@
 
 importScripts('vendor/fzstd.min.js', 'ecs-comps.js', 'ecs-names.js', 'wrpl-parse.js');
 
-var peakHeap = 0;
+/* 堆占用采样：**只在进度回调时采样**，峰值随进度一起上报。
+ * 取不到 performance.memory 时返回 null（不是 0）——0 会被读成"堆占用 0 MB"这一事实陈述。 */
+var peakHeapBytes = null;          // 仅由进度回调更新
+var peakReportedMB = null;         // 最后一次进度上报过的峰值，done 原样回传
+var progressClosed = false;        // 解析结束（progress phase='done'）后冻结峰值
+
 function heapNow() {
-  // Chromium 的 Worker 里同样有 performance.memory（拿不到就返回 0）
   try {
-    return (self.performance && self.performance.memory) ? self.performance.memory.usedJSHeapSize : 0;
-  } catch (e) { return 0; }
+    var mem = self.performance && self.performance.memory;
+    var v = mem ? mem.usedJSHeapSize : null;
+    return (typeof v === 'number' && isFinite(v) && v > 0) ? v : null;
+  } catch (e) { return null; }
+}
+
+/** 字节 → MB，保留 1 位；null 保持 null。进度与 done 用同一套取整，保证两边数值可比。 */
+function mbOf(bytes) { return bytes === null ? null : Math.round(bytes / 1048576 * 10) / 10; }
+
+function sampleHeap() {
+  var h = heapNow();
+  if (h !== null && (peakHeapBytes === null || h > peakHeapBytes)) peakHeapBytes = h;
+  return h;
 }
 
 WRPLParse.progress(function (p) {
-  var h = heapNow();
-  if (h > peakHeap) peakHeap = h;
+  // 解析收尾后不再采样：后续分片 postMessage 引起的堆增长不能改写已经上报过的峰值，
+  // 否则 done 的峰值可能比中途报过的小（或大），两个数对不上。
+  var h = progressClosed ? null : sampleHeap();
+  peakReportedMB = mbOf(peakHeapBytes);
   self.postMessage({ type: 'progress', phase: p.phase, pct: p.pct, note: p.note || '',
-                     workerHeapMB: h ? +(h / 1048576).toFixed(0) : null });
+                     workerHeapMB: mbOf(h), workerHeapPeakMB: peakReportedMB });
+  if (p.phase === 'done') progressClosed = true;
 });
 
-/** 按「数值个数」估算体积，切成若干条消息，避免单条 structured clone 太长。 */
+/** 单条 units 消息的数值上限（一个单位里所有数值列的元素总数）。 */
+var UNITS_CHUNK_MAX_VALS = 120000;
+var sliceSeq = 0;                 // 跨解析递增的切片组号：主线程按它把切片拼回单位
+
+/** 一个 units 条目里**真实数值通道**：所有数组型字段（x/y/z/hdg，以及 playerCandidates
+ *  之类的附加数组），各按自己的长度算。
+ *  不用「长度 × 固定列数」粗估：不同单位的通道集合并不一样（静态点只有 1 个采样，
+ *  空中航迹有 x/y/z/hdg 四列），粗估会让单条消息超出上限或切得过碎。 */
+function unitChannels(u) {
+  var keys = [];
+  if (!u) return keys;
+  Object.keys(u).forEach(function (k) {
+    if (k !== '__slice' && Array.isArray(u[k])) keys.push(k);
+  });
+  return keys;
+}
+function unitValueCount(u) {
+  return unitChannels(u).reduce(function (n, k) { return n + u[k].length; }, 0);
+}
+
+/** 单个单位自身就超过上限时：把它的数值列**按顺序切片**，每片 ≤ maxVals。
+ *  切片带 __slice = { gid, i, n, key }；主线程按 gid 拼回原单位（数组顺序不变）。
+ *  没有这条路径的话，一个超大单位会独占一条超限消息。 */
+function splitUnit(u, maxVals) {
+  var keys = unitChannels(u), pos = {}, slices = [];
+  keys.forEach(function (k) { pos[k] = 0; });
+  while (true) {
+    var remain = keys.reduce(function (n, k) { return n + (u[k].length - pos[k]); }, 0);
+    if (!remain) break;
+    var budget = maxVals, piece = {};
+    for (var i = 0; i < keys.length && budget > 0; i++) {
+      var k = keys[i], avail = u[k].length - pos[k];
+      if (avail <= 0) continue;
+      var take = Math.min(avail, budget);
+      piece[k] = u[k].slice(pos[k], pos[k] + take);
+      pos[k] += take; budget -= take;
+    }
+    slices.push(piece);
+  }
+  var gid = ++sliceSeq;
+  return slices.map(function (piece, idx) {
+    var o = {};
+    Object.keys(u).forEach(function (k) {
+      if (keys.indexOf(k) < 0 && k !== '__slice') o[k] = u[k];   // 元信息（key/uid/…）每片都带
+    });
+    keys.forEach(function (k) { o[k] = piece[k] || []; });
+    o.__slice = { gid: gid, i: idx, n: slices.length, key: String(u.key) };
+    return o;
+  });
+}
+
+/** 按真实数值个数把 units 切成若干条消息，单条不超过 maxVals。
+ *  单位是**原子**的：按原顺序整条放进某一分片，不拆、不重排、不丢；
+ *  单位自身超限时才切片（每片仍 ≤ maxVals），由主线程拼回。 */
 function chunkUnits(units, maxVals) {
   var out = [], cur = [], curVals = 0;
-  function vals(u) {
-    var n = 0;
-    for (var i = 0; i < u.x.length; i++) n++;               // 每个数组 n 个元素
-    return n * 5;                                           // x/y/z/hdg + 元信息，粗略按 5 列算
-  }
+  function flush() { if (cur.length) { out.push(cur); cur = []; curVals = 0; } }
   units.forEach(function (u) {
-    var v = vals(u);
-    if (cur.length && curVals + v > maxVals) { out.push(cur); cur = []; curVals = 0; }
+    var v = unitValueCount(u);
+    if (v > maxVals) {
+      flush();
+      splitUnit(u, maxVals).forEach(function (s) { out.push([s]); });
+      return;
+    }
+    if (cur.length && curVals + v > maxVals) flush();
     cur.push(u); curVals += v;
+    if (curVals >= maxVals) flush();
   });
-  if (cur.length) out.push(cur);
+  flush();
   return out;
 }
 
@@ -63,7 +136,7 @@ function sendMission(mission, wantDebug, dbg, timings) {
   var parts = 0, i;
   self.postMessage({ type: 'part', key: 'meta', data: mission.meta }); parts++;
   sendOwn(mission.own); parts += 4;
-  var chunks = chunkUnits(mission.units || [], 120000);
+  var chunks = chunkUnits(mission.units || [], UNITS_CHUNK_MAX_VALS);
   for (i = 0; i < chunks.length; i++) {
     self.postMessage({ type: 'part', key: 'units', data: chunks[i] });
     parts++;
@@ -95,9 +168,11 @@ function sendMission(mission, wantDebug, dbg, timings) {
   self.postMessage({ type: 'done', parts: parts,
                      timing: { parseMs: timings ? timings.parseMs : null,
                                sendMs: timings && timings.tParsed ? (Date.now() - timings.tParsed) : null },
-                     /* worker 里 performance.memory 常常取不到：拿不到就给 null，
-                        不要给 0（0 读起来像"堆占用 0 MB"这样的事实陈述） */
-                     workerHeapPeakMB: peakHeap ? +(peakHeap / 1048576).toFixed(1) : null });
+                     /* 峰值原样回传**过程中最后一次上报过的值**（progress 里已经冻结）；
+                        不在这里重新采样：分片 postMessage 之后堆还会涨，重新采会让 done
+                        的峰值大于中途上报的峰值，两边对不上。
+                        worker 里 performance.memory 往往取不到：取不到就是 null，不是 0。 */
+                     workerHeapPeakMB: peakReportedMB });
 }
 
 self.onmessage = function (ev) {
@@ -107,6 +182,10 @@ self.onmessage = function (ev) {
     return;
   }
   if (msg.cmd !== 'parse') return;
+  /* 每条 parse 指令都从空开始：峰值与"已冻结"标记不能跨解析残留 */
+  peakHeapBytes = null;
+  peakReportedMB = null;
+  progressClosed = false;
   var dbg = msg.wantDebug ? {} : null;
   var opts = { fileName: msg.fileName, yieldEvery: msg.yieldEvery };
   if (dbg) opts.debug = dbg;

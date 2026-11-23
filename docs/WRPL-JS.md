@@ -221,6 +221,52 @@ unitsWithIdentity 236, unitsVehicleFromPackets 0, killsWithWeapon 30, killsWithW
 
 ---
 
+## Worker 分片协议：堆占用随进度、units 按真实通道数分片（2026-11-24）
+
+**问题（修改前）**
+1. `progress` 消息只带 `phase/pct/note`，堆占用峰值只在 `done` 时回传 —— 解析过程中看不出内存是否吃紧；
+2. `done` 的峰值在**分片发送之后**重新采样，可能大于中途上报过的任何值（两个数对不上）；
+3. `units` 分片按 `x.length × 5` 粗估体积：真实通道集合是 `x/y/z/hdg`（静态点更少），
+   粗估使单条消息要么超限、要么切得过碎；
+4. 单个单位自身超过上限时，被整条塞进一条超限消息。
+
+**现在的协议**
+
+| 消息 | 字段 | 语义 |
+|---|---|---|
+| `progress` | `workerHeapMB` / `workerHeapPeakMB` | 当前堆占用 / **过程中峰值**（MB，1 位小数）。`performance.memory` 取不到时两者都是 `null`（不是 `0`）。 |
+| `done` | `workerHeapPeakMB` | **原样回传过程中最后一次上报的峰值**；`done` 之后不再采样，分片发送引起的堆增长不会改写它。 |
+| `part`（`key:'units'`） | 数组 | 按每个单位 `x/y/z/hdg` 四个数组的**真实元素总数**装箱，单条 ≤ `UNITS_CHUNK_MAX_VALS = 120000`。 |
+| `part`（单个超限单位） | `__slice: {gid,i,n,key}` | 单位自身超限时按数值切片发送（每片仍 ≤ 上限）；主线程 `mergeUnitSlices()` 按 `gid` 拼回、`i` 定序、放回**第一片原来的位置**。 |
+
+**保证**
+* `progress` 峰值单调不减；`done` 峰值 `==` 过程中最后上报的峰值（主线程还取两者较大值兜底）。
+* 分片后所有单位**完整送达、顺序与原始 `units` 一致、不丢不重**；超限单位拼回后 `x/y/z/hdg`
+  逐数值相等。
+* 主线程 `parseInWorker` 的 `_heapNow/_heapPeak` 是**每次解析的局部变量**：上一次的值不会残留，
+  解析失败时随 Promise 一起丢弃。
+* 页面（`web/index.html`）在解析状态区显示「内存 当前 / 峰值」，`done` 后保留最终峰值；
+  解析失败 / 重新选择文件时清空成「不可用」。
+
+**Chromium 现实**：`performance.memory` 在 Worker 里通常不存在（主线程有、worker 没有），
+本机实测无论 `--enable-precise-memory-info` 与否都是 `undefined` —— 所以真实页面上这两个字段
+多为 `null`，UI 显示「不可用」。协议本身由 `tools/check-worker-heap.mjs` 用注入的假堆序列验证
+（含"发送阶段堆涨到 500 MB 也不抬高 `done` 峰值"这一条）。
+
+**自检**
+* `node tools/check-worker-heap.mjs`（CI 必跑，无需浏览器）：分片边界（恰好等于上限 / 差 1 / 跨上限）、
+  单单位超限切片与拼回、峰值单调性、`done` 峰值与中途一致、取不到内存时为 `null`、
+  失败不回 `done`、下一次解析不累计上一次峰值。
+* `python tools/check-worker-heap-browser.py`（可选，需 Playwright）：真浏览器、真页面、真 worker 脚本，
+  只在脚本尾部注入假堆序列与假 mission。覆盖正常解析 / 恰好装满与超限切片 / 解析失败三条路径，
+  外加主线程回退（没有 worker 读数时 UI 显示"不可用"、`meta.__workerHeapPeakMB` 仍为 `null`）与
+  "失败后下一次不残留"。
+
+**主线程回退路径**：`parse()` 在 worker 建不起来时回退 `parseMain()`，同样写
+`meta.__workerHeapPeakMB = null`（此前回退分支漏了这个键，两条路径的 meta 键集合不一致，已修）。
+
+---
+
 ## ACE_ATTITUDE（飘带坡度）与地面单位 hdg（2026-10-22 增补）
 
 three3d 渲染器画"飘带"要每架飞机的滚转角；地面单位不画朝向，但**判阵营要用航向**。

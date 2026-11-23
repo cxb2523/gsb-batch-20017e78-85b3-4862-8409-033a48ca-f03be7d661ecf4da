@@ -264,8 +264,12 @@
 
   var _progressCb = null;
   function progress(cb) { _progressCb = (typeof cb === 'function') ? cb : null; }
-  function emit(phase, pct, note) {
-    if (_progressCb) { try { _progressCb({ phase: phase, pct: pct, note: note || '' }); } catch (e) {} }
+  /** extra：附加在进度事件上的诊断字段（如 worker 堆占用）；不改动 phase/pct/note 的既有语义。 */
+  function emit(phase, pct, note, extra) {
+    if (!_progressCb) return;
+    var ev = { phase: phase, pct: pct, note: note || '' };
+    if (extra) Object.keys(extra).forEach(function (k) { ev[k] = extra[k]; });
+    try { _progressCb(ev); } catch (e) {}
   }
 
   /* ------------------------------------------------------------ 位读器
@@ -2995,11 +2999,47 @@
   /** 把解析好的 ACE_MISSION 收成主线程对象：分片消息按 key 合并。 */
   function recvPartStore() {
     return { meta: null, own: null, units: [], events: null, shots: null, runways: null,
-             airfields: null, missiles: [], terrain: undefined, names: undefined, __attitude: undefined };
+             airfields: null, missiles: [], terrain: undefined, names: undefined,
+             __attitude: undefined, __unitSlices: null };
+  }
+
+  /** 单个单位超过单条上限时，worker 会把它切成几片（带 __slice.gid/i/n）。
+   *  这里按 gid 拼回一个单位：元信息取第一片，数值列（所有数组字段）按 i 顺序首尾相接。
+   *  拼回后仍放在**第一片原来的位置**，所以单位顺序与原始 units 完全一致。 */
+  function mergeUnitSlices(units) {
+    var groups = {}, order = [];
+    units.forEach(function (u) {
+      if (u && u.__slice) {
+        var g = u.__slice.gid;
+        if (!groups[g]) { groups[g] = { parts: [] }; order.push({ gid: g }); }
+        groups[g].parts.push(u);
+      } else order.push({ unit: u });
+    });
+    return order.map(function (o) {
+      if (!o.gid) return o.unit;
+      var parts = groups[o.gid].parts.slice();
+      parts.sort(function (a, b) { return a.__slice.i - b.__slice.i; });
+      var merged = {};
+      Object.keys(parts[0]).forEach(function (k) {
+        if (k !== '__slice') merged[k] = parts[0][k];
+      });
+      Object.keys(merged).forEach(function (k) {
+        if (!Array.isArray(merged[k])) return;
+        if (!parts.some(function (p) { return Array.isArray(p[k]); })) return;
+        var arr = [];
+        parts.forEach(function (p) {
+          if (Array.isArray(p[k])) { for (var i = 0; i < p[k].length; i++) arr.push(p[k][i]); }
+        });
+        merged[k] = arr;
+      });
+      return merged;
+    });
   }
 
   function assembleMission(store) {
-    return { meta: store.meta, own: store.own, units: store.units, events: store.events,
+    var units = store.units || [];
+    if (store.__unitSlices) units = mergeUnitSlices(units);
+    return { meta: store.meta, own: store.own, units: units, events: store.events,
              shots: store.shots, runways: store.runways, airfields: store.airfields,
              missiles: store.missiles || [],
              terrain: store.terrain === undefined ? null : store.terrain,
@@ -3011,6 +3051,9 @@
     return new Promise(function (resolve, reject) {
       var worker = null, done = false, store = recvPartStore();
       var debugObj = (opts.debug && typeof opts.debug === 'object') ? opts.debug : null;
+      /* 本次解析的堆占用（MB，取不到为 null）。都是**局部**的：上一次解析的值不会残留，
+       * 解析失败时随 Promise 一起丢弃。 */
+      var _heapNow = null, _heapPeak = null;
 
       function cleanup() {
         if (worker) {
@@ -3074,15 +3117,29 @@
           return;
         }
         if (m.type === 'progress') {
-          emit(m.phase, m.pct, m.note);
-          if (typeof m.workerHeapMB === 'number') _workerHeapPeakMB = m.workerHeapMB;
+          /* 堆占用随进度透传：当前值 + 过程中峰值（MB；取不到是 null，不是 0）。
+           * 峰值在**进度阶段**累积并冻结，done 只回传这里已经报过的那一个值。 */
+          if (typeof m.workerHeapMB === 'number') _heapNow = m.workerHeapMB;
+          else _heapNow = null;
+          if (typeof m.workerHeapPeakMB === 'number') {
+            _heapPeak = (typeof _heapPeak === 'number')
+              ? Math.max(_heapPeak, m.workerHeapPeakMB) : m.workerHeapPeakMB;
+          }
+          emit(m.phase, m.pct, m.note,
+               { workerHeapMB: _heapNow, workerHeapPeakMB: _heapPeak });
           return;
         }
         if (m.type === 'part') {
           /* own 是分 4 片发的（t0/hz/n、x/y/z、ias/tas/mach/hdg、其余通道），
            * 必须**合并**而不是覆盖 —— 覆盖会只剩最后一片，本机静默消失。 */
           if (m.key === 'own') store.own = Object.assign(store.own || {}, m.data);
-          else if (m.key === 'units') store.units = store.units.concat(m.data);
+          else if (m.key === 'units') {
+            /* 单个单位超过单条上限时 worker 会切片（带 __slice）：记下，done 时拼回 */
+            for (var ui = 0; ui < m.data.length; ui++) {
+              if (m.data[ui] && m.data[ui].__slice) { store.__unitSlices = true; break; }
+            }
+            store.units = store.units.concat(m.data);
+          }
           else if (m.key === '__attitude') {
             /* 横滚序列按 uid 分片发（可能上百 KB/片），这里按 uid 合并 */
             var att = store.__attitude || (store.__attitude = { units: {} });
@@ -3103,14 +3160,17 @@
         if (m.type === 'done') {
           if (done) return;
           done = true;
-          if (typeof m.workerHeapPeakMB === 'number') _workerHeapPeakMB = m.workerHeapPeakMB;
+          /* done 的峰值**只能等于过程中报过的峰值**：取两者较大值兜底，
+           * 即使 worker 侧实现漂移也不会出现 done 峰值比中途峰值小。 */
+          var donePeak = (typeof m.workerHeapPeakMB === 'number') ? m.workerHeapPeakMB : null;
+          if (donePeak !== null && (typeof _heapPeak !== 'number' || donePeak > _heapPeak)) {
+            _heapPeak = donePeak;
+          }
           var mission = assembleMission(store);
           cleanup();                     // terminate()：worker isolate 连同其中间数组一起回收
           mission.meta.limits.push(pathNote);
           mission.meta.provenance.push('解析路径：Web Worker（wrpl-worker.js，主线程只收分片结果）');
-          if (_workerHeapPeakMB !== null) {
-            mission.meta.__workerHeapPeakMB = _workerHeapPeakMB;
-          }
+          mission.meta.__workerHeapPeakMB = (typeof _heapPeak === 'number') ? _heapPeak : null;
           var _tNow = Date.now();
           var _wParse = (m.timing && m.timing.parseMs != null) ? m.timing.parseMs : null;
           var _wSend = (m.timing && m.timing.sendMs != null) ? m.timing.sendMs : null;
@@ -3134,8 +3194,6 @@
       };
     });
   }
-
-  var _workerHeapPeakMB = null;
 
   /**
    * 主线程解析（回退路径）。
@@ -3931,6 +3989,8 @@
           var m2 = await parseMain(arrayBuffer, opts);
           m2.meta.limits.push('解析路径：主线程回退（Worker 不可用：' + (e && e.message || e) + '）');
           m2.meta.provenance.push('解析路径：主线程回退（Worker 不可用）');
+          /* 与正常主线程路径一致：没有 worker 堆读数，显式给 null（键集合相同） */
+          if (!('__workerHeapPeakMB' in m2.meta)) m2.meta.__workerHeapPeakMB = null;
           publishAttitude(m2);
           return m2;
         }
@@ -4094,6 +4154,7 @@
                  buildGroundUnits: buildGroundUnits, groundTrackArrays: groundTrackArrays,
                  groundIdentity: groundIdentity, EcsParser: EcsParser, parseSlotPlayers: parseSlotPlayers, parseWeaponSync: parseWeaponSync,
                  groundRle0ki: groundRle0ki,
+                 mergeUnitSlices: mergeUnitSlices,   /* 自检用：验证超限单位切片能拼回 */
                  emit: emit,   /* 只给开发期自验用：把进度状态定在某一帧，便于截图/取证 */
                  parseReplayHeader: parseReplayHeader, locatePacketStream: locatePacketStream,
                  parseFatBlk: parseFatBlk, DISPLAY_NAMES: DISPLAY_NAMES }

@@ -34,6 +34,13 @@
   #upload-bar{height:6px;background:#12202e;overflow:hidden}
   #upload-bar > i{display:block;height:100%;width:0;background:#4DA6FF;transition:width .15s linear}
   #upload-note{color:#8ea6bb;min-height:1.7em;margin-top:8px;word-break:break-all}
+  /* 解析期内存读数：当前堆占用 + 过程中峰值（取不到时显示"不可用"，不显示 0） */
+  #upload-heap{margin-top:6px;color:#6B7C8C;letter-spacing:.04em}
+  #upload-heap .k{color:#5d7286}
+  #upload-heap .now{color:#9fb6cb}
+  #upload-heap .peak{color:#4DA6FF}
+  #upload-heap.unavailable .now,#upload-heap.unavailable .peak{color:#5d7286}
+  #upload.is-done #upload-heap .peak{color:#5BFF8A}
   /* 完成态 */
   #upload.is-done #upload-bar > i{background:#5BFF8A}
   #upload.is-done #upload-stage{color:#5BFF8A}
@@ -87,6 +94,8 @@
         <span id="upload-pct">0%</span>
       </div>
       <div id="upload-bar"><i></i></div>
+      <div id="upload-heap"><span class="k">内存</span>
+        <span class="now">--</span><span class="k"> / 峰值 </span><span class="peak">--</span></div>
       <div id="upload-note">等待回放文件…</div>
     </div>
 
@@ -138,6 +147,9 @@
   var stageEl = document.getElementById('upload-stage');
   var pctEl = document.getElementById('upload-pct');
   var note = document.getElementById('upload-note');
+  var heapEl = document.getElementById('upload-heap');
+  var heapNowEl = heapEl.querySelector('.now');
+  var heapPeakEl = heapEl.querySelector('.peak');
   var errTitle = document.getElementById('err-title');
   var errDetail = document.getElementById('err-detail');
   var errHint = document.getElementById('err-hint');
@@ -155,6 +167,28 @@
   function setState(s) { box.className = s; }
   function setIcon(t) { icon.textContent = t; }
   function setBar(pct) { bar.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%'; }
+
+  /** 内存读数：当前堆占用 / 过程中峰值（MB）。取不到（null）时显示"不可用"，
+   *  不显示 0 —— 0 会被读成"堆占用 0 MB"这一事实陈述，而实际是测不到。 */
+  function heapText(mb) { return (typeof mb === 'number') ? mb.toFixed(1) + ' MB' : '不可用'; }
+  var heapNowMB = null;              /* 最后一次进度时的当前值（done 后不改写） */
+  function applyHeapClass(nowMB, peakMB) {
+    var unavailable = (typeof nowMB !== 'number' && typeof peakMB !== 'number');
+    heapEl.className = unavailable ? 'unavailable' : '';
+  }
+  function setHeap(nowMB, peakMB) {
+    heapNowMB = (typeof nowMB === 'number') ? nowMB : null;
+    heapNowEl.textContent = heapText(heapNowMB);
+    heapPeakEl.textContent = heapText(peakMB);
+    applyHeapClass(heapNowMB, peakMB);
+  }
+  /** done 之后只更新峰值：当前值保持最后一次进度时的真实读数，不拿峰值冒充。 */
+  function setHeapPeak(peakMB) {
+    heapPeakEl.textContent = heapText(peakMB);
+    applyHeapClass(heapNowMB, peakMB);
+  }
+  function resetHeap() { heapNowMB = null; setHeap(null, null); heapEl.className = 'unavailable'; }
+  setHeap(null, null);   /* 初始态：还没有数据，按"不可用"显示而不是 0 */
   function setStage(name, pct) {
     stageEl.textContent = name;
     pctEl.textContent = Math.round(pct) + '%';
@@ -168,6 +202,8 @@
     errDetail.textContent = detail;
     errHint.textContent = hint || '';
     setBar(0);
+    /* 失败时清掉进行中的内存读数：不让上一次解析的当前值/峰值残留到错误态 */
+    resetHeap();
     busy = false;
   }
 
@@ -183,6 +219,11 @@
     setStage(name, p.pct);
     setBar(p.pct);
     if (p.note) note.textContent = p.note;
+    /* 堆占用随进度显示：当前值 / 过程中峰值。两个都是 MB；取不到是 null → "不可用"。
+     * 主线程回退路径不经过 Worker，没有 worker 堆读数（字段不存在）→ 保持"不可用"。 */
+    if ('workerHeapMB' in p || 'workerHeapPeakMB' in p) {
+      setHeap(p.workerHeapMB, p.workerHeapPeakMB);
+    }
   });
 
   function summarize(m) {
@@ -511,6 +552,7 @@
     setIcon('\u2026');
     setStage('读取文件', 0);
     setBar(0);
+    resetHeap();               /* 新一次解析从"不可用"开始，不残留上一次的当前值/峰值 */
     note.textContent = '读取文件…';
     var t0 = performance.now();
     var fr = new FileReader();
@@ -540,6 +582,12 @@
         setIcon('\u2713');
         setStage('完成', 100);
         setBar(100);
+        /* done 后保留最终峰值：以 mission.meta.__workerHeapPeakMB 为准（与过程中上报过的峰值
+         * 相同，不因分片发送后的堆增长变大）；主线程回退路径没有读数 → 显示"不可用"。 */
+        if (mission.meta && '__workerHeapPeakMB' in mission.meta) {
+          setHeapPeak((typeof mission.meta.__workerHeapPeakMB === 'number')
+            ? mission.meta.__workerHeapPeakMB : null);
+        }
         note.textContent = '完成：' + summarize(mission) + '（' + dt + ' s）';
         again.className = 'on';
         window.__WRPL_LAST = mission;      // 便于自验/排查
@@ -584,6 +632,7 @@
     setIcon('\u25c6');
     setStage('等待文件', 0);
     setBar(0);
+    resetHeap();
     note.textContent = '等待回放文件…';
     errTitle.textContent = '解析失败';
     errDetail.textContent = '';
