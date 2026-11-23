@@ -16,7 +16,7 @@ export function idleState(delay = DEFAULT_DELAY) {
   return {
     phase: "idle", active: false, mode: "audio", delay, tabId: null, tabTitle: "",
     sessionId: null, error: "", notice: "", contextState: "closed",
-    bufferRemaining: 0, transitionRemaining: 0, pauseRemaining: 0,
+    bufferRemaining: 0, transitionRemaining: 0, pauseRemaining: 0, gapRemaining: 0,
   };
 }
 

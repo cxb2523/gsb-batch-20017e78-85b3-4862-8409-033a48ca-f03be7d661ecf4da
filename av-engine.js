@@ -56,9 +56,9 @@ export class AVEngine {
       if (data.type === "READY") { session.lastHeartbeat = performance.now(); ready(); }
       if (data.type === "STATUS") {
         session.lastHeartbeat = session.reportedAt = performance.now();
-        const { phase, bufferRemaining, pauseRemaining, actualDelay, bufferedSeconds, notice, blocked, outputFps, outputWidth, outputHeight } = data;
+        const { phase, bufferRemaining, pauseRemaining, actualDelay, bufferedSeconds, gapRemaining, notice, blocked, outputFps, outputWidth, outputHeight } = data;
         const changed = phase !== this.state.phase || blocked !== this.state.blocked;
-        Object.assign(this.state, { phase, bufferRemaining, pauseRemaining, actualDelay, bufferedSeconds, notice, blocked, outputFps, outputWidth, outputHeight });
+        Object.assign(this.state, { phase, bufferRemaining, pauseRemaining, actualDelay, bufferedSeconds, gapRemaining, notice, blocked, outputFps, outputWidth, outputHeight });
         if (changed) this.emit(); // Status transitions only; no worker heartbeat.
       }
       if (data.type === "ERROR") void this.fail(session, "error", data.error);

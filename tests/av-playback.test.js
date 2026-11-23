@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AVPlayback, RETAIN_SECONDS, SAFETY_BUFFER } from '../av-playback.js';
+import { AVPlayback, RETAIN_SECONDS, SAFETY_BUFFER, GAP_TOLERANCE } from '../av-playback.js';
 
 function fixture() {
   let head = 40, start = 0, removed;
@@ -90,15 +90,157 @@ test('a tenth-second increase resumes from the deadline between playback ticks',
   f.player.close();
 });
 
-test('old buffered data is trimmed; sequence gaps fail closed and silence output', () => {
+test('old buffered data is trimmed as playback advances', () => {
   const f = fixture();
   f.head(160); f.video.currentTime = 129.25;
   f.player.pump();
   assert.deepEqual(f.removed(), [0, 160 - (30 + SAFETY_BUFFER + 6)]);
-  f.player.append(new ArrayBuffer(1), 2);
-  assert.match(f.error(), /不连续/);
+  f.player.close();
+});
+
+test('a sequence gap within tolerance waits, recovers on resync, and never re-appends stale data', () => {
+  const f = fixture();
+  f.head(35); // Keep the trim branch out of the append path.
+  const appended = [];
+  f.player.buffer.appendBuffer = bytes => appended.push(bytes[0]);
+  f.player.append(Uint8Array.of(1), 0);
+  assert.deepEqual(appended, [1]);
+  // Fragments 1-2 went missing: hold fragment 3 and wait instead of failing.
+  f.player.append(Uint8Array.of(4), 3);
+  assert.equal(f.player.closed, false);
+  assert.equal(f.error(), undefined);
+  assert.ok(f.player.gap);
+  assert.deepEqual(appended, [1]); // The jumped-ahead fragment is held, not appended.
+  assert.equal(f.status().phase, 'interrupted');
+  assert.ok(f.status().gapRemaining > GAP_TOLERANCE - 1 && f.status().gapRemaining <= GAP_TOLERANCE);
+  assert.match(f.status().notice, /不会操作原网页播放器/);
+  // The capture side resumes past the gap: held fresh fragments append exactly once.
+  f.player.append(Uint8Array.of(5), 4);
+  assert.equal(f.player.gap, null);
+  assert.deepEqual(appended, [1, 4, 5]);
+  assert.equal(f.player.sequence, 5);
+  // Stale replays of old fragments are ignored, never appended a second time.
+  f.player.append(Uint8Array.of(3), 2);
+  f.player.append(Uint8Array.of(5), 4);
+  assert.deepEqual(appended, [1, 4, 5]);
+  assert.equal(f.player.sequence, 5);
+  // Continuous flow resumes normally.
+  f.player.append(Uint8Array.of(6), 5);
+  assert.deepEqual(appended, [1, 4, 5, 6]);
+  f.player.close();
+});
+
+test('the missing fragment itself heals a gap without resync or duplicate appends', () => {
+  const f = fixture();
+  f.head(35);
+  const appended = [];
+  f.player.buffer.appendBuffer = bytes => appended.push(bytes[0]);
+  f.player.append(Uint8Array.of(1), 0);
+  f.player.append(Uint8Array.of(4), 3);
+  assert.ok(f.player.gap);
+  f.player.append(Uint8Array.of(2), 1); // Late but still useful: fills the hole.
+  assert.ok(f.player.gap); // Fragment 2 is still missing.
+  f.player.append(Uint8Array.of(3), 2);
+  assert.equal(f.player.gap, null);
+  assert.deepEqual(appended, [1, 2, 3, 4]);
+  assert.equal(f.player.sequence, 4);
+  f.player.close();
+});
+
+test('a sequence gap outlasting the tolerance stops safely and releases', () => {
+  const f = fixture();
+  f.head(35);
+  const appended = [];
+  f.player.buffer.appendBuffer = bytes => appended.push(bytes[0]);
+  f.player.append(Uint8Array.of(1), 0);
+  f.player.append(Uint8Array.of(6), 5);
+  assert.equal(f.player.closed, false);
+  assert.ok(f.player.gap);
+  // Inside the tolerance the player keeps waiting with its buffer intact.
+  f.player.gap.since = performance.now() - (GAP_TOLERANCE - 1) * 1000;
+  f.player.tick();
+  assert.equal(f.player.closed, false);
+  assert.equal(f.status().phase, 'interrupted');
+  assert.ok(f.status().gapRemaining > 0);
+  assert.equal(f.status().bufferedSeconds, 35);
+  // Past the tolerance: safe stop, queues and timers released.
+  f.player.gap.since = performance.now() - (GAP_TOLERANCE + 1) * 1000;
+  f.player.tick();
   assert.equal(f.player.closed, true);
+  assert.match(f.error(), /安全停止/);
   assert.equal(f.video.paused, true);
+  assert.equal(f.player.queue.length, 0);
+  assert.equal(f.player.queuedBytes, 0);
+  assert.equal(f.player.gap, null);
+  // Late fragments after the stop are dropped, not appended.
+  f.player.append(Uint8Array.of(7), 6);
+  assert.deepEqual(appended, [1]);
+});
+
+test('increasing delay during a stream outage counts down on the live clock and never rolls back after resume', () => {
+  const f = fixture();
+  let time = 100;
+  f.player.origin = 0;
+  f.player.liveTime = () => time;
+  f.video.currentTime = 69.25; // Exactly delay 30 + SAFETY_BUFFER behind live.
+  f.head(75); f.start(40); // Buffer froze mid-outage behind the live clock.
+  f.player.buffer.updating = true; // Fragments queue while the outage lasts.
+  f.player.append(new ArrayBuffer(1), 0);
+  f.player.append(new ArrayBuffer(1), 3); // Outage: fragments 1-2 missing.
+  assert.ok(f.player.gap);
+  // Increasing the delay mid-outage pauses and counts down on the live clock.
+  f.player.setDelay(40);
+  assert.equal(f.video.paused, true);
+  assert.equal(f.player.adjusting, true);
+  assert.equal(f.status().phase, 'interrupted');
+  assert.equal(f.status().pauseRemaining, 10);
+  assert.equal(f.status().actualDelay, 30.75);
+  assert.equal(f.status().bufferedSeconds, 35); // Buffered content is kept.
+  time += 4; f.player.tick();
+  assert.equal(f.status().pauseRemaining, 6);
+  assert.equal(f.video.currentTime, 69.25); // Still holding the paused position.
+  // The capture side resumes past the gap; new data extends the buffer.
+  f.player.append(new ArrayBuffer(1), 4);
+  assert.equal(f.player.gap, null);
+  f.player.buffer.updating = false;
+  f.head(110);
+  time += 5; f.player.tick();
+  assert.equal(f.status().pauseRemaining, 1);
+  assert.equal(f.video.currentTime, 69.25); // No rollback into played content.
+  time += 1; f.player.tick();
+  assert.equal(f.player.adjusting, false);
+  assert.equal(f.video.paused, false);
+  assert.equal(f.video.currentTime, 69.25);
+  assert.equal(f.status().actualDelay, 40.75); // Live clock and delay agree again.
+  f.player.close();
+});
+
+test('decreasing delay during a stream outage jumps to the new target; resume continues forward', () => {
+  const f = fixture();
+  let time = 100;
+  f.player.origin = 0;
+  f.player.liveTime = () => time;
+  f.video.currentTime = 69.25;
+  f.head(75); f.start(40);
+  f.player.buffer.updating = true;
+  f.player.append(new ArrayBuffer(1), 0);
+  f.player.append(new ArrayBuffer(1), 3);
+  assert.ok(f.player.gap);
+  f.player.setDelay(10);
+  // Jumps to the new target on the live clock, clamped to the frozen buffer.
+  assert.equal(f.video.currentTime, 75 - 0.15);
+  assert.equal(f.player.adjusting, false);
+  // The capture side resumes; the buffer extends and the position moves
+  // forward to the delay target, never backward.
+  f.player.append(new ArrayBuffer(1), 4);
+  assert.equal(f.player.gap, null);
+  f.player.buffer.updating = false;
+  f.head(110);
+  f.player.tick();
+  assert.equal(f.video.currentTime, 100 - 10 - SAFETY_BUFFER);
+  assert.equal(f.video.paused, false);
+  assert.equal(f.status().actualDelay, 10 + SAFETY_BUFFER);
+  f.player.close();
 });
 
 test('a new MIME is applied in append order while buffered video keeps playing', () => {

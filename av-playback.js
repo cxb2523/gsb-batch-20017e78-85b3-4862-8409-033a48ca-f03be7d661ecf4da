@@ -2,6 +2,9 @@ import { normalizeDelay } from "./shared.js";
 
 export const SAFETY_BUFFER = 0.75;
 export const RETAIN_SECONDS = 75;
+// A sequence gap is survivable: the capture side may stall briefly and resume.
+// Only a gap that outlasts this many seconds stops playback (see tick).
+export const GAP_TOLERANCE = 10;
 
 // Every src/currentTime operation here belongs to OUR extension video element.
 // Source website elements are never accessed by the extension.
@@ -21,6 +24,8 @@ export class AVPlayback {
     this.closed = false;
     this.removedThrough = 0;
     this.wantPlay = false;
+    this.gap = null;
+    this.reseek = false;
     this.errorHandler = () => this.fail(`延迟视频解码失败（${video.error?.code || "未知"}），请重新启动。`);
     video.addEventListener("error", this.errorHandler);
   }
@@ -50,11 +55,59 @@ export class AVPlayback {
   }
   append(bytes, sequence, mime) {
     if (this.closed) return;
-    if (sequence !== this.sequence++) { this.fail("音画数据不连续，已停止播放，请重新启动。"); return; }
+    // Fragments older than the next expected one are stale replays from before
+    // a recovery. Never append old data a second time.
+    if (sequence < this.sequence) return;
+    if (this.gap || sequence > this.sequence) { this.bridge(bytes, sequence, mime); return; }
+    this.sequence++;
+    this.enqueue(bytes, mime);
+  }
+  enqueue(bytes, mime) {
     this.queue.push({ bytes, mime });
     this.queuedBytes += bytes.byteLength;
     if (this.queuedBytes > this.maxQueuedBytes) { this.fail("播放缓冲积压过多，请重新启动或选择较低画质。"); return; }
     this.pump();
+  }
+  // A jumped-ahead fragment means fragments went missing in transit. Hold it
+  // and wait on the shared live clock instead of tearing down: everything
+  // already buffered keeps playing, and only a gap outlasting GAP_TOLERANCE
+  // stops playback (see tick). Recovery and delay changes share that clock.
+  bridge(bytes, sequence, mime) {
+    const chunk = { bytes, mime, sequence };
+    if (!this.gap) {
+      if (this.queuedBytes + bytes.byteLength > this.maxQueuedBytes) {
+        this.fail("播放缓冲积压过多，请重新启动或选择较低画质。");
+        return;
+      }
+      this.gap = { expected: this.sequence, since: performance.now(), held: [chunk] };
+      this.tick();
+      return;
+    }
+    this.gap.held.push(chunk);
+    const fresh = this.gap.held.filter(held => held.sequence >= this.sequence)
+      .sort((a, b) => a.sequence - b.sequence);
+    if (fresh[0]?.sequence !== this.sequence) {
+      // The capture side resumed past the missing fragments. Resync onto its
+      // position; the held fragments are fresh data, appended exactly once.
+      this.gap = null;
+      this.reseek = true;
+      for (const held of fresh) {
+        this.sequence = held.sequence + 1;
+        this.enqueue(held.bytes, held.mime);
+        if (this.closed) return;
+      }
+      return;
+    }
+    // The missing fragment itself arrived. Append the consecutive run and
+    // keep waiting only if a later hole remains.
+    while (fresh.length && fresh[0].sequence === this.sequence) {
+      const held = fresh.shift();
+      this.sequence++;
+      this.enqueue(held.bytes, held.mime);
+      if (this.closed) return;
+    }
+    if (fresh.length) this.gap = { expected: this.sequence, since: this.gap.since, held: fresh };
+    else this.gap = null;
   }
   range() {
     const ranges = this.buffer?.buffered;
@@ -132,6 +185,11 @@ export class AVPlayback {
   }
   tick() {
     if (this.closed) return;
+    // A gap that outlasts the tolerance is a dead capture side: stop safely.
+    if (this.gap && performance.now() - this.gap.since > GAP_TOLERANCE * 1000) {
+      this.fail("音画数据中断时间过长，已安全停止。请重新启动。");
+      return;
+    }
     const { start, end } = this.range();
     const desired = this.delay + SAFETY_BUFFER;
     let remaining = Math.max(0, desired - (this.liveTime() - this.video.currentTime));
@@ -149,9 +207,22 @@ export class AVPlayback {
         }, Math.ceil(remaining * 1000));
       }
       if (!this.adjusting) {
+        // Resumed past a sequence gap: jump forward to the delay target on the
+        // shared live clock, never backward into already-played content.
+        if (this.reseek) {
+          this.reseek = false;
+          const target = this.seekTarget(start, end);
+          if (target > this.video.currentTime) {
+            this.video.pause();
+            this.video.currentTime = target;
+          }
+        }
         // No speed changes. Recover from stalls/background suspension by one
         // bounded seek in our player, keeping audio and video on the same clock.
-        if (this.liveTime() - this.video.currentTime > desired + 1.5 || this.video.currentTime < start) {
+        // While waiting out a sequence gap the live clock keeps running but no
+        // fresh data can fill the buffer, so hold position instead of chasing
+        // the clock to the stale buffer edge.
+        if (!this.gap && (this.liveTime() - this.video.currentTime > desired + 1.5 || this.video.currentTime < start)) {
           this.video.pause();
           this.video.currentTime = this.seekTarget(start, end);
         }
@@ -160,11 +231,13 @@ export class AVPlayback {
     }
     remaining = Math.max(0, desired - (this.liveTime() - this.video.currentTime));
     if (!this.started) remaining = Math.max(remaining, desired - (end - start));
-    this.onStatus({ phase: !this.started ? "capturing" : this.video.readyState < 3 ? "interrupted" : "running",
+    const gapRemaining = this.gap ? Math.max(0, GAP_TOLERANCE - (performance.now() - this.gap.since) / 1000) : 0;
+    this.onStatus({ phase: !this.started ? "capturing" : this.gap || this.video.readyState < 3 ? "interrupted" : "running",
       bufferRemaining: !this.started ? remaining : 0, pauseRemaining: this.adjusting ? remaining : 0,
-      actualDelay: this.started ? Math.max(0, end - this.video.currentTime) : null,
-      bufferedSeconds: end - start, blocked: this.blocked,
+      actualDelay: this.started ? Math.max(0, this.liveTime() - this.video.currentTime) : null,
+      bufferedSeconds: end - start, gapRemaining, blocked: this.blocked,
       notice: this.blocked ? "请在延迟播放页点击「播放声音与画面」，允许 Chrome 输出。"
+        : this.gap ? `采集数据中断，正在等待恢复（约 ${Math.ceil(gapRemaining)} 秒后安全停止）；不会操作原网页播放器。`
         : this.started && this.video.readyState < 3 ? "采集数据暂时不足，正在等待恢复；不会操作原网页播放器。" : "" });
     this.pump();
   }
@@ -174,6 +247,8 @@ export class AVPlayback {
     this.closed = true;
     clearInterval(this.timer);
     clearTimeout(this.resumeTimer);
+    this.gap = null;
+    this.reseek = false;
     this.video.removeEventListener("error", this.errorHandler);
     this.video.pause();
     this.video.removeAttribute("src");
