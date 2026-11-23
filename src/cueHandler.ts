@@ -12,6 +12,8 @@ export class CueHandler {
   private callback?: CueCallback;
   private triggered: Set<number> = new Set();
   private videoElement: HTMLVideoElement;
+  private listening = false;
+  private destroyed = false;
 
   /**
    * Creates an instance of CueHandler.
@@ -33,7 +35,7 @@ export class CueHandler {
 
   public loadCues(cues: Cue[]) {
     this.registerCues(cues);
-    this.videoElement.addEventListener('timeupdate', this.handleTimeUpdate);
+    this.start();
   }
 
   /**
@@ -45,17 +47,21 @@ export class CueHandler {
   }
 
   /**
-   * Starts listening for cue points.
+   * Starts listening for cue points. Calling this while already listening is a
+   * no-op so that the `timeupdate` listener is never registered twice.
    */
   public start() {
+    if (this.destroyed || this.listening) return;
     this.videoElement.addEventListener('timeupdate', this.handleTimeUpdate);
+    this.listening = true;
   }
 
   /**
-   * Stops listening for cue points.
+   * Stops listening for cue points. Safe to call multiple times.
    */
   public stop() {
     this.videoElement.removeEventListener('timeupdate', this.handleTimeUpdate);
+    this.listening = false;
   }
 
   /**
@@ -63,6 +69,8 @@ export class CueHandler {
    *  Checks if the current time matches any registered cue points and triggers the callback.
    */
   private handleTimeUpdate() {
+    if (this.destroyed) return;
+
     const currentTime = this.videoElement.currentTime;
 
     for (const cue of this.cues) {
@@ -74,9 +82,14 @@ export class CueHandler {
   }
 
   /**
-   * Destroys the CueHandler instance.
+   * Destroys the CueHandler instance. Removes the `timeupdate` listener and
+   * drops the callback and triggered state so no cue can fire afterwards.
    */
   public destroy() {
+    this.destroyed = true;
+    this.stop();
     this.triggered.clear();
+    this.cues = [];
+    this.callback = undefined;
   }
 }

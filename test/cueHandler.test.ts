@@ -123,4 +123,31 @@ describe('CueHandler', () => {
     expect(registerCuesSpy).toHaveBeenCalledWith(cues);
     expect(videoElement.addEventListener).toHaveBeenCalledWith('timeupdate', expect.any(Function));
   });
+
+  it('should not register the timeupdate listener twice on repeated start', () => {
+    cueHandler.start();
+    cueHandler.start();
+    expect(videoElement.addEventListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('should remove the listener and drop the callback on destroy', () => {
+    cueHandler.registerCues([{ id: 'cue1', time: 5 }]);
+    cueHandler.start();
+    const listener = (videoElement.addEventListener as vi.Mock).mock.calls[0][1];
+
+    cueHandler.destroy();
+
+    expect(videoElement.removeEventListener).toHaveBeenCalledWith('timeupdate', listener);
+
+    // Even a direct invocation of the (already bound) handler must be inert.
+    Object.defineProperty(videoElement, 'currentTime', { value: 5 });
+    // @ts-ignore
+    cueHandler.handleTimeUpdate();
+    expect(mockCallback).not.toHaveBeenCalled();
+
+    // Restarting after destroy must not re-register anything.
+    const addCalls = (videoElement.addEventListener as vi.Mock).mock.calls.length;
+    cueHandler.start();
+    expect((videoElement.addEventListener as vi.Mock).mock.calls.length).toBe(addCalls);
+  });
 });

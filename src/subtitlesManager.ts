@@ -14,6 +14,33 @@ interface ExtendedTextTrackCue extends TextTrackCue {
 export class SubtitlesManager {
   private subtitlesElement: HTMLTrackElement;
   private cuePoints: CuePoint[] = [];
+  private destroyed = false;
+
+  private readonly _handleLoad = (): void => {
+    if (this.destroyed) return;
+    const track = this.subtitlesElement.track;
+    if (!track) {
+      console.warn('Subtitle track not available');
+      this.callback?.(this.cuePoints);
+      return;
+    }
+    const trackCues = Array.from(track.cues || []);
+    const cues = this.cuePoints.map((cueConfig) => ({
+      ...cueConfig,
+      time:
+        trackCues.find((cue) => (cue as ExtendedTextTrackCue)?.text === cueConfig.subtitleText)
+          ?.startTime || 0,
+    }));
+    this.callback?.(cues);
+  };
+
+  private readonly _handleError = (error: Event): void => {
+    if (this.destroyed) return;
+    console.error('Failed to load subtitles:', error);
+    this.callback?.(this.cuePoints);
+  };
+
+  private callback?: (cues?: CuePoint[]) => void;
 
   /**
    * Creates an instance of SubtitlesManager.
@@ -30,25 +57,21 @@ export class SubtitlesManager {
    * @param callback - A function to be called with the loaded cues or the initial cues if an error occurs.
    */
   public onLoad(callback: (cues?: CuePoint[]) => void): void {
-    this.subtitlesElement.addEventListener('load', () => {
-      const track = this.subtitlesElement.track;
-      if (!track) {
-        console.warn('Subtitle track not available');
-        callback(this.cuePoints);
-        return;
-      }
-      const trackCues = Array.from(track.cues || []);
-      const cues = this.cuePoints.map((cueConfig) => ({
-        ...cueConfig,
-        time:
-          trackCues.find((cue) => (cue as ExtendedTextTrackCue)?.text === cueConfig.subtitleText)
-            ?.startTime || 0,
-      }));
-      callback(cues);
-    });
-    this.subtitlesElement.addEventListener('error', (error) => {
-      console.error('Failed to load subtitles:', error);
-      callback(this.cuePoints);
-    });
+    if (this.destroyed) return;
+    this.callback = callback;
+    this.subtitlesElement.addEventListener('load', this._handleLoad);
+    this.subtitlesElement.addEventListener('error', this._handleError);
+  }
+
+  /**
+   * Removes the registered listeners and drops the callback so no subtitle
+   * event can reach the player after it has been destroyed.
+   */
+  public destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.subtitlesElement.removeEventListener('load', this._handleLoad);
+    this.subtitlesElement.removeEventListener('error', this._handleError);
+    this.callback = undefined;
   }
 }

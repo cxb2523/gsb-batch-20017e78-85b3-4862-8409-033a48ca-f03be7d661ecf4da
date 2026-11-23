@@ -22,7 +22,8 @@ export type PlayerConfig = {
 export type PlayerEvent =
   'play' | 'pause' | 'ended' | 'cue' | 'interaction' | 'branch' | 'error' | 'segmentchange';
 
-export type PlayerState = 'idle' | 'playing' | 'waitingForInteraction' | 'ended' | 'error';
+export type PlayerState =
+  'idle' | 'playing' | 'waitingForInteraction' | 'playingSegment' | 'ended' | 'error';
 
 export interface HTMLVideoElementWithControlsList extends HTMLVideoElement {
   controlsList: string;
