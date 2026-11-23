@@ -16,6 +16,29 @@ export interface PhysicsWorkerOptions {
   onPositions?: (positions: Float64Array) => void;
 }
 
+/**
+ * The subset of {@link PhysicsWorkerBridge} that the simulation relies on.
+ *
+ * Exposed so tests (or custom transports) can inject a bridge that records
+ * commands without spinning up a real Web Worker.
+ */
+export interface WorkerBridgeLike {
+  waitReady(): Promise<void>;
+  addNode(id: string, x: number, y: number, z: number, nodeType: number, radius: number): void;
+  tick(): void;
+  batch(commands: PhysicsCommand[]): void;
+  setAlpha(alpha: number): void;
+  setMouseRepulsion(x: number, y: number, z: number, strength: number, radius: number): void;
+  dispose(): void;
+  /**
+   * Optional. When present, the simulation registers its position handler
+   * here; injected bridges use this to deliver tick results. The real
+   * {@link PhysicsWorkerBridge} receives the handler via its constructor
+   * options instead.
+   */
+  setPositionsHandler?(handler: (positions: Float64Array) => void): void;
+}
+
 export class PhysicsWorkerBridge {
   private worker: Worker | null = null;
   private ready = false;

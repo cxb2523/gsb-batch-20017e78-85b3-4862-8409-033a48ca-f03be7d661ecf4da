@@ -118,6 +118,7 @@ Notable changes to swarming. Entries are grouped by theme rather than strictly b
 - **@swarming/react-native** — React Native + Expo
 - **swarming** — CDN/UMD bundle
 - **swarming-physics** — Rust/WASM Barnes-Hut (3-5x faster)
+- **Physics topology sync** — `WasmPhysicsSimulation.update()` now evicts hubs and agents that drop out of the feed (`remove_node` via the worker batch or a direct call), prunes their edges, and keeps insertion order aligned with backend position frames
 
 ## Content Pages
 

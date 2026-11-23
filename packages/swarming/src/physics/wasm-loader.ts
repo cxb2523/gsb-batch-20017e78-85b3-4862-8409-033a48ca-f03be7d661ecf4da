@@ -34,6 +34,25 @@ export interface WasmSimulation {
   get_node_ids(): string;
 }
 
+/**
+ * The subset of {@link WasmSimulation} used by WasmPhysicsSimulation.
+ *
+ * Kept as a separate structural type so tests (or alternative engines) can
+ * provide a lightweight mock without implementing the whole wasm-bindgen
+ * surface.
+ */
+export type WasmSimulationLike = Pick<
+  WasmSimulation,
+  | 'add_node'
+  | 'remove_node'
+  | 'add_edge'
+  | 'remove_edge'
+  | 'tick'
+  | 'get_positions'
+  | 'set_alpha'
+  | 'set_mouse_repulsion'
+>;
+
 let wasmModule: WasmPhysicsModule | null = null;
 let loadingPromise: Promise<WasmPhysicsModule> | null = null;
 

@@ -15,8 +15,9 @@
 
 import type { PhysicsBackend, PhysicsMode } from './auto-detect';
 import { resolvePhysicsMode } from './auto-detect';
-import { PhysicsWorkerBridge } from './worker';
-import type { WasmSimulation } from './wasm-loader';
+import type { PhysicsCommand } from './physics-worker';
+import { PhysicsWorkerBridge, type WorkerBridgeLike } from './worker';
+import type { WasmSimulationLike } from './wasm-loader';
 
 // Re-export types that match @web3viz/core
 export interface GraphNode {
@@ -93,6 +94,16 @@ export interface WasmPhysicsConfig {
   theta?: number;
   /** URL to WASM file (optional) */
   wasmUrl?: string;
+  /**
+   * Pre-built worker bridge. When provided, initialization is skipped and the
+   * bridge is used directly. Intended for tests and custom worker transports.
+   */
+  workerBridge?: WorkerBridgeLike;
+  /**
+   * Pre-built main-thread WASM simulation. When provided, initialization is
+   * skipped and the simulation is used directly. Intended for tests.
+   */
+  wasmSimulation?: WasmSimulationLike;
 }
 
 const DEFAULT_CONFIG = {
@@ -116,6 +127,9 @@ const DEFAULT_CONFIG = {
   theta: 0.9,
 };
 
+type ResolvedConfig = typeof DEFAULT_CONFIG &
+  Pick<WasmPhysicsConfig, 'physics' | 'wasmUrl' | 'workerBridge' | 'wasmSimulation'>;
+
 interface InternalNode {
   id: string;
   type: 'hub' | 'agent';
@@ -138,29 +152,61 @@ interface InternalEdge {
  *
  * Internally manages a WASM simulation (via Worker or main-thread) and keeps
  * a mirror of the node/edge state for querying.
+ *
+ * The mirror's `insertionOrder` always matches the order in which the backend
+ * enumerates nodes (WASM's `get_positions` / the worker's tick response), so
+ * positions can be written back by index without ambiguity.
  */
 export class WasmPhysicsSimulation {
   // Public state (mirrors ForceGraphSimulation)
   nodes: InternalNode[] = [];
   edges: InternalEdge[] = [];
 
-  private config: typeof DEFAULT_CONFIG & { physics?: PhysicsMode; wasmUrl?: string };
+  private config: ResolvedConfig;
   private nodeMap = new Map<string, InternalNode>();
-  private nodeIndexMap = new Map<string, number>(); // id -> insertion order index
+  private nodeIndexMap = new Map<string, number>(); // id -> index in insertionOrder
   private insertionOrder: string[] = [];
 
   // WASM backend
   private backend: PhysicsBackend;
-  private worker: PhysicsWorkerBridge | null = null;
-  private wasmSim: WasmSimulation | null = null;
+  private worker: WorkerBridgeLike | null = null;
+  private wasmSim: WasmSimulationLike | null = null;
   private initialized = false;
   private initPromise: Promise<void> | null = null;
 
   // Latest positions from WASM
   private latestPositions: Float64Array | null = null;
+  /**
+   * Bumped whenever the node set/order changes. Worker tick responses are
+   * asynchronous, so a frame requested before an update can arrive after it;
+   * tagging each tick request with the topology version lets us drop such
+   * stale frames instead of writing positions to the wrong nodes.
+   */
+  private topologyVersion = 0;
+  private pendingTickVersions: number[] = [];
 
   constructor(config: WasmPhysicsConfig = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+
+    // Injected backends skip async initialization entirely (tests, custom
+    // transports). This must happen before any update()/tick() call.
+    if (config.workerBridge) {
+      this.backend = 'wasm-worker';
+      this.worker = config.workerBridge;
+      this.worker.setPositionsHandler?.((positions) => this.handleWorkerPositions(positions));
+      this.initialized = true;
+      this.initPromise = config.workerBridge.waitReady();
+      return;
+    }
+
+    if (config.wasmSimulation) {
+      this.backend = 'wasm';
+      this.wasmSim = config.wasmSimulation;
+      this.initialized = true;
+      this.initPromise = Promise.resolve();
+      return;
+    }
+
     this.backend = resolvePhysicsMode(config.physics ?? 'auto');
     this.initPromise = this.initialize();
   }
@@ -187,8 +233,7 @@ export class WasmPhysicsSimulation {
           config: wasmConfig,
           wasmUrl: this.config.wasmUrl,
           onPositions: (positions) => {
-            this.latestPositions = positions;
-            this.syncPositionsFromWasm(positions);
+            this.handleWorkerPositions(positions);
           },
         });
         await this.worker.waitReady();
@@ -237,53 +282,110 @@ export class WasmPhysicsSimulation {
     const c = this.config;
     let changed = false;
 
-    // Hub nodes from top tokens
+    // ---------------------------------------------------------------------
+    // 1. Determine what the new input implies
+    // ---------------------------------------------------------------------
+
     const hubAddresses = new Set<string>();
     for (let i = 0; i < topTokens.length; i++) {
+      hubAddresses.add(topTokens[i].tokenAddress);
+    }
+
+    // Every agent that the current input mentions on a live hub.
+    const desiredAgentIds = new Set<string>();
+    for (const edge of traderEdges) {
+      if (!hubAddresses.has(edge.tokenAddress)) continue;
+      desiredAgentIds.add(agentIdFor(edge.trader, edge.tokenAddress));
+    }
+
+    // ---------------------------------------------------------------------
+    // 2. Remove hubs/agents that the input no longer contains
+    // ---------------------------------------------------------------------
+
+    const removedIds: string[] = [];
+    for (const node of this.nodes) {
+      if (node.type === 'hub') {
+        if (!hubAddresses.has(node.id)) removedIds.push(node.id);
+      } else if (!desiredAgentIds.has(node.id)) {
+        removedIds.push(node.id);
+      }
+    }
+
+    if (removedIds.length > 0) {
+      const removedSet = new Set(removedIds);
+
+      // Edges touching a removed node are dead in the backend too. Removing
+      // them explicitly (before removing the nodes) keeps the backend free of
+      // dangling endpoints even for engines whose remove_node leaves edges.
+      const deadEdges = this.edges.filter(
+        (e) => removedSet.has(e.sourceId) || removedSet.has(e.targetId),
+      );
+      this.wasmRemoveTopology(deadEdges, removedIds);
+
+      // Mirror cleanup: nodeMap, nodes[], insertionOrder and nodeIndexMap.
+      for (const id of removedIds) this.nodeMap.delete(id);
+      for (let i = this.nodes.length - 1; i >= 0; i--) {
+        if (removedSet.has(this.nodes[i].id)) this.nodes.splice(i, 1);
+      }
+      this.insertionOrder = this.insertionOrder.filter((id) => !removedSet.has(id));
+      this.reindexInsertionOrder();
+
+      // Positions produced before the topology change no longer line up.
+      this.latestPositions = null;
+      changed = true;
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. Add hubs from top tokens
+    // ---------------------------------------------------------------------
+
+    const maxVol = topTokens[0]?.volume || 1;
+    for (let i = 0; i < topTokens.length; i++) {
       const t = topTokens[i];
-      hubAddresses.add(t.tokenAddress);
       const existing = this.nodeMap.get(t.tokenAddress);
-      const maxVol = topTokens[0]?.volume || 1;
       const scaledRadius =
         c.hubBaseRadius + (t.volume / maxVol) * (c.hubMaxRadius - c.hubBaseRadius);
 
       if (existing) {
         existing.radius = scaledRadius;
         existing.label = t.symbol || t.name;
-      } else {
-        // Spherical distribution using golden angle
-        const phi = Math.acos(1 - 2 * (i + 0.5) / Math.max(topTokens.length, 1));
-        const theta = Math.PI * (1 + Math.sqrt(5)) * i;
-        const dist = 15 + Math.random() * 5;
-        const node: InternalNode = {
-          id: t.tokenAddress,
-          type: 'hub',
-          label: t.symbol || t.name,
-          radius: scaledRadius,
-          color: c.hubColors[i % c.hubColors.length],
-          x: Math.sin(phi) * Math.cos(theta) * dist,
-          y: Math.sin(phi) * Math.sin(theta) * dist,
-          z: Math.cos(phi) * dist,
-        };
-        this.nodeMap.set(t.tokenAddress, node);
-        this.nodes.push(node);
-        this.nodeIndexMap.set(node.id, this.insertionOrder.length);
-        this.insertionOrder.push(node.id);
-        changed = true;
-
-        // Send to WASM
-        this.wasmAddNode(node.id, node.x, node.y, node.z, 0, node.radius);
+        continue;
       }
+
+      // Spherical distribution using golden angle
+      const phi = Math.acos(1 - 2 * (i + 0.5) / Math.max(topTokens.length, 1));
+      const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+      const dist = 15 + Math.random() * 5;
+      const node: InternalNode = {
+        id: t.tokenAddress,
+        type: 'hub',
+        label: t.symbol || t.name,
+        radius: scaledRadius,
+        color: c.hubColors[i % c.hubColors.length],
+        x: Math.sin(phi) * Math.cos(theta) * dist,
+        y: Math.sin(phi) * Math.sin(theta) * dist,
+        z: Math.cos(phi) * dist,
+      };
+      this.registerNode(node);
+      changed = true;
+
+      this.wasmAddNode(node.id, node.x, node.y, node.z, 0, node.radius);
     }
 
-    // Agent nodes
-    const agentCount = this.nodes.filter((n) => n.type === 'agent').length;
+    // ---------------------------------------------------------------------
+    // 4. Add agent nodes from trader edges (respecting the node budget)
+    // ---------------------------------------------------------------------
+
+    const agentCount = this.nodes.reduce(
+      (count, n) => (n.type === 'agent' ? count + 1 : count),
+      0,
+    );
     const budget = c.maxAgentNodes - agentCount;
     let added = 0;
 
     for (const edge of traderEdges) {
       if (!hubAddresses.has(edge.tokenAddress)) continue;
-      const agentId = `agent:${edge.trader}:${edge.tokenAddress}`;
+      const agentId = agentIdFor(edge.trader, edge.tokenAddress);
       if (this.nodeMap.has(agentId)) continue;
       if (added >= budget) break;
 
@@ -302,47 +404,39 @@ export class WasmPhysicsSimulation {
         y: (hub?.y ?? 0) + Math.sin(aPhi) * Math.sin(aTheta) * dist,
         z: (hub?.z ?? 0) + Math.cos(aPhi) * dist,
       };
-      this.nodeMap.set(agentId, node);
-      this.nodes.push(node);
-      this.nodeIndexMap.set(node.id, this.insertionOrder.length);
-      this.insertionOrder.push(node.id);
+      this.registerNode(node);
       added++;
       changed = true;
 
       this.wasmAddNode(node.id, node.x, node.y, node.z, 1, node.radius);
     }
 
-    // Rebuild edges
+    // ---------------------------------------------------------------------
+    // 5. Rebuild edges from the surviving nodes only
+    // ---------------------------------------------------------------------
+
     if (changed) {
-      // Clear edges in WASM (we'll rebuild)
-      const newEdges: InternalEdge[] = [];
-      const hubNodes = this.nodes.filter((n) => n.type === 'hub');
+      const previousEdges = this.edges;
+      const nextEdges = this.buildEdges();
+      this.edges = nextEdges;
 
-      // Hub-to-hub (fully connected)
-      for (let i = 0; i < hubNodes.length; i++) {
-        for (let j = i + 1; j < hubNodes.length; j++) {
-          newEdges.push({ sourceId: hubNodes[i].id, targetId: hubNodes[j].id });
-        }
-      }
+      // Only newly created edges need to be sent — anything that disappeared
+      // was already removed alongside its endpoint in step 2.
+      const previousKeys = new Set(previousEdges.map(edgeKey));
+      const added = nextEdges.filter((e) => !previousKeys.has(edgeKey(e)));
 
-      // Agent-to-hub
-      for (const node of this.nodes) {
-        if (node.type === 'agent' && node.hubTokenAddress && this.nodeMap.has(node.hubTokenAddress)) {
-          newEdges.push({ sourceId: node.id, targetId: node.hubTokenAddress });
-        }
-      }
-
-      this.edges = newEdges;
-
-      // Sync edges to WASM
-      this.wasmSyncEdges(newEdges);
+      this.wasmSyncEdges(added);
       this.wasmSetAlpha(0.3);
+      // Anything queued from before the topology change is stale.
+      this.topologyVersion++;
+      this.latestPositions = null;
     }
   }
 
   /** Advance the simulation by one tick. */
   tick(): void {
     if (this.backend === 'wasm-worker' && this.worker) {
+      this.pendingTickVersions.push(this.topologyVersion);
       this.worker.tick();
       // Positions will arrive async via onPositions callback
       // For synchronous access, use the latest cached positions
@@ -437,6 +531,8 @@ export class WasmPhysicsSimulation {
       this.worker = null;
     }
     this.wasmSim = null;
+    this.latestPositions = null;
+    this.pendingTickVersions = [];
     this.nodes = [];
     this.edges = [];
     this.nodeMap.clear();
@@ -448,19 +544,95 @@ export class WasmPhysicsSimulation {
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Apply a flat [x0,y0,z0, x1,y1,z1, ...] frame to the mirror.
+   *
+   * The backend enumerates nodes in `insertionOrder`; reject frames whose
+   * length does not match the current topology rather than writing positions
+   * to the wrong nodes.
+   */
   private syncPositionsFromWasm(positions: Float64Array | number[]): void {
+    const expected = this.insertionOrder.length * 3;
+    if (positions.length !== expected) return;
+
     for (let i = 0; i < this.insertionOrder.length; i++) {
-      const id = this.insertionOrder[i];
-      const node = this.nodeMap.get(id);
-      if (node && i * 3 + 2 < positions.length) {
-        node.x = positions[i * 3];
-        node.y = positions[i * 3 + 1];
-        node.z = positions[i * 3 + 2];
-      }
+      const node = this.nodeMap.get(this.insertionOrder[i]);
+      if (!node) continue;
+      node.x = positions[i * 3];
+      node.y = positions[i * 3 + 1];
+      node.z = positions[i * 3 + 2];
     }
   }
 
-  private wasmAddNode(id: string, x: number, y: number, z: number, nodeType: number, radius: number): void {
+  /**
+   * Handle an async frame from the worker.
+   *
+   * Frames are delivered in the order ticks were requested. Pop the version
+   * that was current when the corresponding tick was sent; if it predates the
+   * latest topology change the frame's indices refer to a different node set,
+   * so drop it rather than mis-assigning positions.
+   */
+  private handleWorkerPositions(positions: Float64Array | number[]): void {
+    const version = this.pendingTickVersions.shift();
+    if (version !== undefined && version !== this.topologyVersion) return;
+
+    // A fallback getPositions() frame or a frame whose length no longer fits.
+    if (positions.length !== this.insertionOrder.length * 3) return;
+
+    this.latestPositions = positions instanceof Float64Array ? positions : Float64Array.from(positions);
+    this.syncPositionsFromWasm(positions);
+  }
+
+  /** Register a new node in every mirror index. */
+  private registerNode(node: InternalNode): void {
+    this.nodeMap.set(node.id, node);
+    this.nodes.push(node);
+    this.nodeIndexMap.set(node.id, this.insertionOrder.length);
+    this.insertionOrder.push(node.id);
+  }
+
+  /** Rebuild id -> index after a removal. */
+  private reindexInsertionOrder(): void {
+    this.nodeIndexMap.clear();
+    for (let i = 0; i < this.insertionOrder.length; i++) {
+      this.nodeIndexMap.set(this.insertionOrder[i], i);
+    }
+  }
+
+  /** Build the edge set implied by the current mirror nodes. */
+  private buildEdges(): InternalEdge[] {
+    const newEdges: InternalEdge[] = [];
+    const hubNodes = this.nodes.filter((n) => n.type === 'hub');
+
+    // Hub-to-hub (fully connected)
+    for (let i = 0; i < hubNodes.length; i++) {
+      for (let j = i + 1; j < hubNodes.length; j++) {
+        newEdges.push({ sourceId: hubNodes[i].id, targetId: hubNodes[j].id });
+      }
+    }
+
+    // Agent-to-hub
+    for (const node of this.nodes) {
+      if (
+        node.type === 'agent' &&
+        node.hubTokenAddress &&
+        this.nodeMap.has(node.hubTokenAddress)
+      ) {
+        newEdges.push({ sourceId: node.id, targetId: node.hubTokenAddress });
+      }
+    }
+
+    return newEdges;
+  }
+
+  private wasmAddNode(
+    id: string,
+    x: number,
+    y: number,
+    z: number,
+    nodeType: number,
+    radius: number,
+  ): void {
     if (this.worker) {
       this.worker.addNode(id, x, y, z, nodeType, radius);
     } else if (this.wasmSim) {
@@ -468,7 +640,34 @@ export class WasmPhysicsSimulation {
     }
   }
 
+  /**
+   * Remove nodes and the edges that referenced them from the backend.
+   * Edges are removed first so engines that ignore remove_edge for missing
+   * nodes still end up clean.
+   */
+  private wasmRemoveTopology(deadEdges: InternalEdge[], nodeIds: string[]): void {
+    if (this.worker) {
+      const commands: PhysicsCommand[] = [];
+      for (const e of deadEdges) {
+        commands.push({ type: 'removeEdge', source: e.sourceId, target: e.targetId });
+      }
+      for (const id of nodeIds) {
+        commands.push({ type: 'removeNode', id });
+      }
+      this.worker.batch(commands);
+    } else if (this.wasmSim) {
+      for (const e of deadEdges) {
+        this.wasmSim.remove_edge(e.sourceId, e.targetId);
+      }
+      for (const id of nodeIds) {
+        this.wasmSim.remove_node(id);
+      }
+    }
+    // JS fallback: mirror-only, nothing to send.
+  }
+
   private wasmSyncEdges(edges: InternalEdge[]): void {
+    if (edges.length === 0) return;
     if (this.worker) {
       // Batch edge additions for efficiency
       const commands = edges.map((e) => ({
@@ -491,4 +690,14 @@ export class WasmPhysicsSimulation {
       this.wasmSim.set_alpha(alpha);
     }
   }
+}
+
+/** Stable node id for a trader/token pair. */
+function agentIdFor(trader: string, tokenAddress: string): string {
+  return `agent:${trader}:${tokenAddress}`;
+}
+
+/** Directional edge identity, matching the backend's dedupe rule. */
+function edgeKey(edge: InternalEdge): string {
+  return `${edge.sourceId}->${edge.targetId}`;
 }
