@@ -386,7 +386,8 @@ function think({ mob, prey, distance, rand }: { mob: Mob; prey: Prey; distance: 
       mob.rest = strayed / kind.stroll
       return { heading: mob.yaw, ...STILL }
     }
-    if (distance < kind.reach) {
+    // a player already on the ground is never struck again: no new windup starts against a downed player
+    if (distance < kind.reach && prey.alive) {
       enter(mob, 'windup')
       return { heading: toPrey, ...STILL }
     }

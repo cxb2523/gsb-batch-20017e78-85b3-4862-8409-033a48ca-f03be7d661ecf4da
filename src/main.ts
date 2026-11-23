@@ -54,6 +54,8 @@ const GRACE_SECONDS = 0.8
 // struck down, the player lies this long and then starts again at the forest
 const DOWN_SECONDS = 2.8
 const DOWN_EYE_HEIGHT = 0.4
+// one sword swing lasts 0.42 s (SWING_SECONDS in viewmodel.ts): a step at least this long runs any swing to its end
+const SWING_FLUSH_SECONDS = 1
 // what is heard of each thing a creature does. Snarls of one pack start up to ALERT_STAGGER_SECONDS apart
 const MOB_SOUNDS: Record<MobEvent['type'], SoundName> = { alert: 'goblinAlert', blow: 'club', hurt: 'goblinHurt', death: 'goblinDeath', idle: 'goblinIdle' }
 const ALERT_STAGGER_SECONDS = 0.35
@@ -367,8 +369,14 @@ function hurt(damage: number) {
   player.health = Math.max(0, player.health - damage)
   player.calm = 0
   player.blow = 1
-  audio.play({ sound: player.health > 0 ? 'hurt' : 'down' })
-  if (player.health > 0) return
+  if (player.health > 0) {
+    audio.play({ sound: 'hurt' })
+    return
+  }
+  // the last heart: enter the down state as one transition. The player's own action sounds stop first, so the
+  // down sound is not hushed with the steps and swings of the round that ended
+  audio.hush()
+  audio.play({ sound: 'down' })
   player.down = 0
   player.grounded = true
   player.vx = player.vz = 0
@@ -376,7 +384,26 @@ function hurt(damage: number) {
 
 /** the player starts again at the forest, whole, and so do the creatures */
 function rise() {
-  Object.assign(player, world.start, { vx: 0, vz: 0, stride: 0, grounded: true, vy: 0, dip: 0, health: MAX_HEALTH, calm: 0, down: -1 })
+  Object.assign(player, world.start, {
+    vx: 0,
+    vz: 0,
+    bob: 0,
+    stride: 0,
+    grounded: true,
+    y: 0,
+    vy: 0,
+    dip: 0,
+    health: MAX_HEALTH,
+    calm: 0,
+    down: -1,
+    blow: 0,
+  })
+  // the picture clears at once: the first frame of the new round is neither red nor black
+  dark = 0
+  // any swing still under way ends here, so the sword starts at rest (a whole swing takes SWING_FLUSH_SECONDS)
+  handsUpdate(SWING_FLUSH_SECONDS, debug.time)
+  // nothing the old round queued — staggered alerts above all — may sound in the new one
+  audio.cut()
   mobs.reset()
 }
 

@@ -44,6 +44,20 @@ const HEARING_RANGE = 45
 const PAN_MOST = 0.7
 // seconds the wind takes to follow a gust
 const WIND_EASE_SECONDS = 0.6
+// a voice made in a round that has ended is faded for this long rather than cut off with a click
+const CUT_FADE_SECONDS = 0.08
+// the player's own action sounds fade out over this long when the player is struck down
+const HUSH_FADE_SECONDS = 0.2
+
+/** One played sample, still sounding or waiting on its delay. The loops (wind, torch) and the song are not voices. */
+interface Voice {
+  source: AudioBufferSourceNode
+  gain: GainNode
+  /** when it was asked to start, on the context clock; a voice ahead of it is still waiting */
+  startsAt: number
+  /** it belongs to the player (no `at`), not to a creature */
+  own: boolean
+}
 
 export function buildAudio() {
   const closing = new AbortController()
@@ -53,6 +67,8 @@ export function buildAudio() {
   // all of these exist once the player has touched the page
   let live: { context: AudioContext; master: GainNode; wind: GainNode; song: HTMLAudioElement } | undefined
   let muted = false
+  // every one-shot that has been asked for and has not ended: some are still waiting on their delay
+  const voices = new Set<Voice>()
 
   const start = () => {
     const context = new AudioContext()
@@ -112,6 +128,30 @@ export function buildAudio() {
     live.song.play().catch(() => {})
   })
 
+  /**
+   * Stops one voice. One still waiting on its delay is cancelled before it ever sounds; a sounding one is
+   * faded over fadeSeconds so its end does not click. Loops and the song are not voices and are left alone.
+   */
+  function stopVoice(voice: Voice, fadeSeconds: number) {
+    if (!live) return
+    const { context } = live
+    voices.delete(voice)
+    voice.source.onended = null
+    if (voice.startsAt > context.currentTime) {
+      try {
+        voice.source.stop()
+      } catch {
+        // already stopped
+      }
+      return
+    }
+    const now = context.currentTime
+    voice.gain.gain.cancelScheduledValues(now)
+    voice.gain.gain.setValueAtTime(voice.gain.gain.value, now)
+    voice.gain.gain.linearRampToValueAtTime(0, now + fadeSeconds)
+    voice.source.stop(now + fadeSeconds + 0.02)
+  }
+
   return {
     /** Call from every key, click and touch: the first one starts the sound, a later one wakes it again. */
     unlock() {
@@ -156,7 +196,28 @@ export function buildAudio() {
       const panner = context.createStereoPanner()
       panner.pan.value = side
       source.connect(gain).connect(panner).connect(master)
-      source.start(context.currentTime + delay)
+      const startsAt = context.currentTime + delay
+      source.start(startsAt)
+      const voice: Voice = { source, gain, startsAt, own: !at }
+      voices.add(voice)
+      source.onended = () => voices.delete(voice)
+    },
+    /**
+     * The player is struck down: the sounds that carry the player's own actions (steps, landings, swings and
+     * the rest) stop or fade out. What the creatures are saying keeps going, and so do the wind, the torch
+     * and the song.
+     */
+    hush() {
+      if (!live) return
+      for (const voice of [...voices]) if (voice.own) stopVoice(voice, HUSH_FADE_SECONDS)
+    },
+    /**
+     * A new round starts at the forest: every one-shot of the round that ended is cleared, including the
+     * alerts still waiting on their stagger delay, so nothing queued before the respawn can sound after it.
+     */
+    cut() {
+      if (!live) return
+      for (const voice of [...voices]) stopVoice(voice, CUT_FADE_SECONDS)
     },
     /** Turns all sound off or on again. Returns whether it is off now. */
     toggleMute() {
