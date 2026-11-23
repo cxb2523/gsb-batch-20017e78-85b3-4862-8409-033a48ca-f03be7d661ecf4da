@@ -67,6 +67,12 @@ export interface SplatFile {
     textureReady?: boolean;
     offset?: number;
 
+    // 回收缓存（recycleMap）恢复校验用：记录回收时的纹理尺寸与槽位
+    texWidth?: number;
+    texHeight?: number;
+    texDepth?: number;
+    recycleLayer?: number;
+
     // 数据
     spxHeader?: SpxHeader;
     downloadCount?: number;

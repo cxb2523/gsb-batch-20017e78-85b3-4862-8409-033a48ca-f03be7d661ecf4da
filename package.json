@@ -7,7 +7,8 @@
         "build": "tsc && vite build",
         "build-pkg": "tsc && vite build --config vite-pkg.config.ts && node buildPkg.js --before && vite build --config vite-pkg.config.ts && node buildPkg.js --after",
         "preview": "vite preview",
-        "resort-const": "node scripts/resortConst.js"
+        "resort-const": "node scripts/resortConst.js",
+        "test": "node --experimental-transform-types --import ./tests/register-stubs.ts tests/run.ts"
     },
     "dependencies": {
         "@dimforge/rapier3d-compat": "^0.19.3",

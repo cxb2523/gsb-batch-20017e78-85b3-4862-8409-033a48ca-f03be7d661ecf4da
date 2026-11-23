@@ -166,6 +166,7 @@ import FvEffect from './shaders/chunks/FvEffect.glsl';
 import WatermarkEffect from './shaders/chunks/WatermarkEffect.glsl';
 import { SplatFile } from '../../modeldata/SplatTiles';
 import { SplatGpuCache } from './SplatGpuCache';
+import { GpuCacheUploadQueue } from './GpuCacheUploadQueue';
 import { isMobile, QualityLevels } from '../../utils/GlobalConstants';
 
 export function setupSplatMesh(events: Events) {
@@ -386,16 +387,22 @@ export function setupSplatMesh(events: Events) {
             fire(NotifyWkA01BackSplatBuffer, dataArray);
         });
 
-        let cacheDoing = false;
+        let gpuCacheUploadQueue: GpuCacheUploadQueue = null;
         on(SplatUploadTextureGpuCache, async (splatFile: SplatFile) => {
-            if (cacheDoing) return (await sleep(5)) && fire(SplatUploadTextureGpuCache, splatFile);
-            cacheDoing = true;
+            // 网格销毁后排队请求直接丢弃，不再重试、不再触碰纹理
+            if (disposed || !splatCacheManager || splatCacheManager.isDisposed || splatFile.textureReady) return;
 
-            await splatCacheManager.uploadSplatFile(splatFile);
-            splatFile.textureReady = true;
+            if (!gpuCacheUploadQueue) gpuCacheUploadQueue = new GpuCacheUploadQueue();
+            const handled = await gpuCacheUploadQueue.enqueue(splatFile, async (file: SplatFile) => {
+                // 等待期间可能已销毁，上传前再次确认
+                if (disposed || splatCacheManager.isDisposed) return;
+                await splatCacheManager.uploadSplatFile(file);
+            });
 
-            fire(NotifyViewerNeedUpdate);
-            cacheDoing = false;
+            // 被销毁丢弃或未真正就绪时，不做任何状态变更与刷新
+            if (handled && !disposed && splatFile.textureReady) {
+                fire(NotifyViewerNeedUpdate);
+            }
         });
 
         on(SplatUpdateSh12Texture, async (datas: Uint8Array[]) => {
@@ -621,7 +628,10 @@ export function setupSplatMesh(events: Events) {
             SplatMaterialDispose,
             () => {
                 material.dispose();
+                gpuCacheUploadQueue?.dispose();
+                gpuCacheUploadQueue = null;
                 splatCacheManager?.dispose();
+                splatCacheManager = null;
                 dataTexture0?.dispose();
                 dataTexture1?.dispose();
                 dataTextureSh12?.dispose();

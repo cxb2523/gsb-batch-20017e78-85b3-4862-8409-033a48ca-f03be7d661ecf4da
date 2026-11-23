@@ -1134,8 +1134,11 @@ function postWkA10TargetLayer(fileKey: string, targetLayer: number) {
 }
 
 function postWkA10Recycle(oldFile: SplatFile) {
-    const { fileKey, offset, downloadCount, xyz } = oldFile;
-    worker.postMessage({ [WkA10Recycle]: true, [WkFileKey]: fileKey, [WkOffset]: offset, [WkDownloadCount]: downloadCount, [WkXyz]: xyz }, [xyz.buffer]);
+    const { fileKey, offset, downloadCount, xyz, targetLayer } = oldFile;
+    worker.postMessage(
+        { [WkA10Recycle]: true, [WkFileKey]: fileKey, [WkOffset]: offset, [WkDownloadCount]: downloadCount, [WkLayer]: targetLayer, [WkXyz]: xyz },
+        [xyz.buffer],
+    );
 }
 
 function calcAllWkA10TargetLayer(): boolean {
