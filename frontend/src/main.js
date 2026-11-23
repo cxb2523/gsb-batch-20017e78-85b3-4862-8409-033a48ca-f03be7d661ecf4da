@@ -46,13 +46,14 @@ function ingestPacket(p) {
 }
 
 function resetWorld() {
-  traffic.clear();
+  traffic.clear();   // also drops the freeze backlog and any sealed bursts
   stats.reset();
   flows.reset();
   dns.reset();
   liveDropped = 0;
   statusRing.length = 0; // counters restarted — stale baselines would go negative
   frozen = false;
+  traffic.setFrozen(false);
   ui.setFrozen(false);
   picker.deselect();
 }
@@ -70,7 +71,10 @@ const live = new LiveSource({
   onPackets: (items, dropped) => {
     if (mode !== 'live') return;
     for (const p of items) trackPacket(p); // analysis first (retrans/SNI marks)
-    if (!frozen) traffic.ingestBatch(items, 110); // frozen road: count, don't spawn
+    // The controller holds arrivals itself while frozen (bounded, timestamped)
+    // and replays them at their true cadence on thaw — never silently drops
+    // them, never lets them pile onto the entry as a fake convoy.
+    traffic.ingestBatch(items, 110);
     liveDropped = dropped;
   },
   onError: (msg) => ui.toast(msg, 'error'),
@@ -115,13 +119,15 @@ const ui = new UI({
   onPlayToggle() {
     if (mode === 'live') {
       // freeze-frame: stop the road so fast vehicles can be inspected/clicked;
-      // analysis and stats keep running on the live stream underneath
+      // analysis and stats keep running on the live stream underneath, and
+      // held arrivals replay at their real cadence when the road resumes
       frozen = !frozen;
+      traffic.setFrozen(frozen);
       ui.setFrozen(frozen);
       return;
     }
     if (!playback.loaded) return;
-    if (playback.atEnd) { seekTo(0); }
+    if (playback.atEnd) { seekTo(0); return; }
     playback.playing = !playback.playing;
   },
   onSpeedChange(speed) { playback.speed = speed; },
@@ -258,7 +264,9 @@ function step(now, render) {
     if (render) ui.updatePlayback(playback);
   }
 
-  if (!(frozen && mode === 'live')) traffic.update(dt, t);
+  // TrafficController owns the frozen state: while frozen it holds arrivals
+  // and leaves the road, entry occupancy and queues untouched.
+  traffic.update(dt, t);
 
   if (render) {
     picker.update(t);

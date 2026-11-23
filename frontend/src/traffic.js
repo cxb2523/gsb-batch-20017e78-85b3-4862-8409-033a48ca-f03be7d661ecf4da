@@ -14,6 +14,19 @@
 //     one road-train = N packets (click it for the breakdown), the same
 //     packet→flow shift sFlow/NetFlow make at scale.
 // Every packet always counts in the dashboard stats; only visuals aggregate.
+//
+// FREEZE / SOURCE-CHANGE INVARIANT: the road, its entry occupancy
+// (tails/lastSub), the pending burst aggregates (pendingAgg) and the spawn
+// queue are all expressions of ONE road clock and ONE source. Freezing pauses
+// that clock — the road, the queue and the aggregates stop advancing together,
+// while statistics (driven separately by the caller) keep counting. Arrivals
+// during the pause are NOT spawned, NOT aggregated and NOT discarded: they are
+// held with their true arrival timestamps. Thawing resumes the same clock, so
+// held arrivals are admitted strictly in order at the rhythm they arrived — the
+// road picks up where it stopped instead of dumping the backlog at once, and no
+// held packet is folded into a fresh convoy. Switching source (live ⇄ pcap) or
+// seeking resets every one of these structures, so a new segment starts on an
+// empty road with empty queues and cannot inherit the old one's occupancy.
 import * as THREE from 'three';
 import {
   FAIL_RED, FLAG_COLORS, HALF_LEN, HIGHWAY, LANES, LANE_REPR, LANE_SPEED,
@@ -23,6 +36,11 @@ import { FlarePool, LabelPool, VehiclePool } from './vehicles.js';
 
 const MAX_CONVOY_SAMPLES = 8;
 const GAP_BUFFER = 2.4; // bumper-to-bumper clearance at spawn, world units
+const MAX_BACKLOG = 20000;  // arrivals held during a freeze (visuals only)
+
+/** Entry gate to exit gate distance for any lane (the road's own cull margin
+ *  included). Age × speed beyond this means the vehicle has left the road. */
+const ROAD_SPAN = 2 * HALF_LEN + 20;
 
 // ICMP messages that are error reports, not probes (ride with red bodies)
 const ICMP_ERR_V4 = new Set([3, 5, 11, 12]);
@@ -51,6 +69,9 @@ export class TrafficController {
     for (const type of Object.keys(TYPE_SPECS)) this.pools[type] = new VehiclePool(scene, type);
     this.flares = new FlarePool(scene);
     this.queue = [];            // live batches: [{due, pkt}], due is monotonic
+    this.backlog = [];          // arrivals held during a freeze: [{at, pkt}]
+    this.sealedAggs = new Map();// `${lane}|${dir}` -> bursts sealed at freeze time
+    this.frozen = false;        // road clock paused (statistics continue outside)
     this.tails = new Map();     // `${lane}|${dir}|${sub}` -> last spawned rec
     this.lastSub = new Map();   // `${lane}|${dir}` -> sub used last (alternate files)
     this.pendingAgg = new Map();// `${lane}|${dir}` -> accumulating burst
@@ -88,13 +109,107 @@ export class TrafficController {
   activeCount() { return Object.values(this.pools).reduce((n, p) => n + p.active.size, 0); }
 
   /** PCAP playback path. */
-  ingest(pkt) { this.schedule(pkt); }
+  ingest(pkt) {
+    if (this.frozen) this.holdArrival(performance.now(), pkt);
+    else this.schedule(pkt);
+  }
 
-  /** Live path: spread a batch over `spreadMs` so arrivals look continuous. */
+  /** Live path: spread a batch over `spreadMs` so arrivals look continuous.
+   *  While frozen the batch is held with its due times instead of spawned —
+   *  nothing is dropped, so a thaw can resume the same rhythm. */
   ingestBatch(items, spreadMs = 100) {
     const now = performance.now();
     const step = spreadMs / Math.max(items.length, 1);
-    for (let i = 0; i < items.length; i++) this.queue.push({ due: now + i * step, pkt: items[i] });
+    for (let i = 0; i < items.length; i++) {
+      const at = now + i * step;
+      if (this.frozen) this.holdArrival(at, items[i]);
+      else this.queue.push({ due: at, pkt: items[i] });
+    }
+  }
+
+  /** Freeze / thaw the road clock.
+   *
+   *  Freezing pauses vehicles, the queue and the aggregates together; arrivals
+   *  are held (with their arrival times) rather than spawned or dropped, and a
+   *  burst that was accumulating at the boundary is sealed so it can never
+   *  absorb post-thaw packets — a pause must not fabricate a convoy.
+   *
+   *  Thawing replays the held arrivals through the normal admission pipeline at
+   *  their true inter-arrival rhythm (never one instantaneous dump), so the road
+   *  picks up where it stopped. */
+  setFrozen(next) {
+    const value = !!next;
+    if (value === this.frozen) return;
+    this.frozen = value;
+    if (value) {
+      for (const item of this.queue) this.holdArrival(item.due, item.pkt);
+      this.queue.length = 0;
+      // seal in-progress bursts: they replay as-is and never gain new members
+      for (const [key, agg] of this.pendingAgg) this.sealedAggs.set(key, agg);
+      this.pendingAgg.clear();
+    } else {
+      this.thaw();
+    }
+  }
+
+  holdArrival(at, pkt) {
+    this.backlog.push({ at, pkt });
+    if (this.backlog.length > MAX_BACKLOG) this.backlog.shift();
+  }
+
+  /** Thaw the road and resume held arrivals.
+   *
+   *  Freezing is a pause of the ROAD, not of the world: vehicles stop where
+   *  they are and resume from there. Held arrivals therefore replay through the
+   *  normal admission pipeline at their true inter-arrival cadence — the road
+   *  picks up where it stopped instead of dumping the backlog at the gate, and
+   *  since the gate still holds the vehicles that were stopped on it, admission
+   *  re-applies the usual sub-lane / convoy rules rather than inventing new
+   *  pile-ups. Packets older than one gate-to-gate traversal could no longer be
+   *  on the road and are dropped just as normal exit would have removed them;
+   *  none is merged into a new convoy. Bursts sealed at the freeze boundary are
+   *  emitted as their own convoys, with no new members. */
+  thaw() {
+    const now = performance.now();
+    const held = this.backlog;
+    this.backlog = [];
+    if (!held.length && !this.sealedAggs.size) return;
+
+    // Entry occupancy must describe the road as it now stands (vehicles were
+    // parked during the pause), so new arrivals are judged against the real
+    // tail rather than a stale reference.
+    this.recomputeTails();
+
+    held.sort((a, b) => a.at - b.at);
+    const t0 = held.length ? held[0].at : now;
+    // Replay from "now" at the true arrival spacing, so the backlog is drained
+    // at the rate it arrived (a 5 s freeze replays ~5 s of traffic, not a dump).
+    for (const e of held) {
+      const age = Math.max((now - e.at) / 1000, 0);
+      if (age * LANE_SPEED[laneFor(e.pkt)] > ROAD_SPAN) continue; // would have exited
+      this.queue.push({ due: now + (e.at - t0), pkt: e.pkt });
+    }
+    // Due order: the backlog drains before fresh arrivals hit the gate.
+    this.queue.sort((a, b) => a.due - b.due);
+    // Bursts sealed at the freeze boundary go out as their own convoys.
+    for (const [key, agg] of this.sealedAggs) {
+      if (!this.spawnConvoy(agg)) this.pendingAgg.set(key, agg);
+    }
+    this.sealedAggs.clear();
+  }
+
+  /** Rebuild entry occupancy from the road itself: per lane/dir/sub-lane the
+   *  vehicle closest to the entry gate is what a new arrival must clear. */
+  recomputeTails() {
+    this.tails.clear();
+    for (const pool of Object.values(this.pools)) {
+      for (const rec of pool.active.values()) {
+        if (rec.sub < 0 || !rec.lane) continue;
+        const key = `${rec.lane}|${rec.dir}|${rec.sub}`;
+        const cur = this.tails.get(key);
+        if (!cur || rec.z * rec.dirSign < cur.z * cur.dirSign) this.tails.set(key, rec);
+      }
+    }
   }
 
   /** True when a vehicle of length `len` fits at the entry of this sub-lane. */
@@ -310,6 +425,9 @@ export class TrafficController {
 
   update(dt, t) {
     const now = performance.now();
+    // Frozen: the road clock is paused. Vehicles, the spawn queue and the
+    // pending aggregates all hold still together (statistics run elsewhere).
+    if (this.frozen) return;
     if (this.queue.length) {
       let i = 0;
       while (i < this.queue.length && this.queue[i].due <= now) i++;
@@ -339,8 +457,16 @@ export class TrafficController {
     }
   }
 
+  /** Reset to a blank road for a new stream or timeline position. Vehicles,
+   *  entry occupancy, burst aggregates, the spawn queue AND the freeze backlog
+   *  all go together, so no packet of the previous source/position can appear
+   *  on the next one or be replayed into it. Freeze state is cleared too —
+   *  callers re-assert it if needed. */
   clear() {
+    this.frozen = false;
     this.queue.length = 0;
+    this.backlog.length = 0;
+    this.sealedAggs.clear();
     this.tails.clear();
     this.lastSub.clear();
     this.pendingAgg.clear();

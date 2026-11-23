@@ -170,8 +170,12 @@ mode and PCAP mode never need privileges.
   `4` chase the selected vehicle (click one first; auto-returns when it exits) ·
   `5` slow auto-orbit (b-roll)
 * **`Space` in live mode freezes the road** — vehicles stop mid-flight so you
-  can click the fast ones; analysis and stats keep counting underneath
-  (in PCAP mode `Space` is play/pause, as before)
+  can click the fast ones; analysis and stats keep counting underneath. New
+  packets that arrive while frozen are held, not dropped: on resume they flow
+  in at their real arrival cadence (no clump at the gate, no false convoys, no
+  inflated MERGED count). Switching LIVE ⇄ PCAP or scrubbing the timeline
+  clears the road and every pending queue, so a new segment never inherits the
+  previous one's traffic (in PCAP mode `Space` is play/pause, as before)
 * **📷 button** saves a PNG of the current view; the bandwidth sparkline is
   stacked by lane color, and TCP HEALTH includes currently-open connections
 * **CB button** (header): colorblind-safe palette (Okabe-Ito based — no
@@ -205,7 +209,9 @@ frontend/ (ES modules, no build step)
                    is generated from this — colors always match the road)
   src/vehicles.js  InstancedMesh pools — the object pool IS the instance slots;
                    ~10 draw calls for thousands of vehicles
-  src/traffic.js   lane headway scheduling, convoy aggregation, flares
+  src/traffic.js   lane headway scheduling, convoy aggregation, flares,
+                   freeze/thaw of the road clock (held arrivals replay at their
+                   real cadence; a source switch or seek resets all of it)
   src/flows.js     SYN/SYN-ACK matcher (half-open / refused / RST)
   src/playback.js  pcap timeline clock: play/pause/scrub/speed
   src/stats.js     rolling-window stats engine (clock-agnostic)
