@@ -79,6 +79,7 @@ export class Engine {
 
   setQuality(name) {
     if (!QUALITY[name]) return;
+    const changed = name !== this.quality;
     const old = this.q;
     this.quality = name;
     this.q = { ...QUALITY[name] };
@@ -96,6 +97,9 @@ export class Engine {
       this.lighting.refresh();
     }
     this.resize(true);
+    // The sky and the main light only take the new quality on in the next update() (exposure,
+    // fog, shadow range); the bake waits for that, so it is never made from the old picture.
+    if (changed && this.sky) this.sky.requestEnvironment();
   }
 
   setFov(fov) {
@@ -115,6 +119,7 @@ export class Engine {
     const w = Math.max(2, Math.round(cw * s)),
       h = Math.max(2, Math.round(ch * s));
     if (!force && w === this.w && h === this.h) return;
+    const sizeChanged = w !== this.w || h !== this.h;
     this.w = w;
     this.h = h;
     this.renderer.setSize(w, h, false);
@@ -137,6 +142,9 @@ export class Engine {
     this.camera.aspect = cw / ch;
     this.camera.updateProjectionMatrix();
     this.lighting.refresh();
+    // A new picture size means a new exposure reading and a new shadow footprint; the sky's
+    // reflection should show that state at once (the bake itself runs after the next update()).
+    if (sizeChanged && this.sky) this.sky.requestEnvironment();
   }
 
   /** Advance sky, weather and lights. Call once per frame before render(). */

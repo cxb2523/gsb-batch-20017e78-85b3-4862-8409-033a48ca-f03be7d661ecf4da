@@ -162,6 +162,13 @@ export class Sky {
     this.envScene.add(this.envMesh);
     this.envRT = null;
     this._envAge = 1e9;
+    // set when something outside the clock (a quality change, a resize) will make the next bake
+    // differ from the last: the bake itself waits until update() has brought the sky and light up
+    // to date, so it is only a request, never an immediate render here
+    this._envWanted = false;
+    // true once the engine has applied this frame's sky, light and exposure; a bake made before
+    // that would carry the old picture, so updateEnvironment refuses to start until it is set
+    this._envReady = false;
     this._k = { zen: [0, 0, 0], hor: [0, 0, 0], glow: [0, 0, 0], sun: [0, 0, 0] };
   }
 
@@ -282,18 +289,59 @@ export class Sky {
       this.mesh.scale.setScalar(camera.far * 0.0085);
     }
     this._envAge += dt;
+    // the sky, its light and the exposure are now current: a bake may be made from this state
+    this._envReady = true;
+  }
+
+  /** Ask for a re-bake on the next frame, once the sky and the light have caught up. Cheap and
+   *  coalescing: any number of calls before that frame cost one bake, so only the last state wins. */
+  requestEnvironment() {
+    this._envWanted = true;
+    // whatever was baked last no longer matches what the engine is about to show: hold the bake
+    // back until update() has applied the new quality (exposure, fog, shadow range) to the sky
+    this._envReady = false;
   }
 
   /** Re-bake the sky into the scene's environment map now and then. */
   updateEnvironment(scene, force = false) {
-    if (!force && this._envAge < 2.5) return;
+    // the state this would bake must be the state of this frame, never an earlier one
+    if (!this._envReady) return;
+    if (!force && !this._envWanted && this._envAge < 2.5) return;
+    // one attempt per frame at most; on failure the timed cadence tries again later
     this._envAge = 0;
+    this._envWanted = false;
+    const renderer = this.renderer;
+    // fromScene() borrows the renderer (target, tone mapping, auto clear, xr): a bake that throws
+    // half-way must not leave the frame that follows drawing with those settings
+    const prev = {
+      target: renderer.getRenderTarget(),
+      face: renderer.getActiveCubeFace(),
+      level: renderer.getActiveMipmapLevel(),
+      toneMapping: renderer.toneMapping,
+      autoClear: renderer.autoClear,
+      xr: renderer.xr.enabled,
+    };
+    let rt = null;
     this.uniforms.uEnv.value = 1;
     this.envMesh.scale.setScalar(10);
-    const rt = this.pmrem.fromScene(this.envScene, 0, 1, 2000);
-    this.uniforms.uEnv.value = 0;
-    scene.environment = rt.texture;
-    if (this.envRT) this.envRT.dispose();
-    this.envRT = rt;
+    try {
+      rt = this.pmrem.fromScene(this.envScene, 0, 1, 2000);
+    } catch (err) {
+      // leave the old map in place: it is still what the scene reflects by
+      console.error('[sky] environment re-bake failed: ' + (err && err.message ? err.message : err));
+    } finally {
+      this.uniforms.uEnv.value = 0;
+      renderer.toneMapping = prev.toneMapping;
+      renderer.autoClear = prev.autoClear;
+      renderer.xr.enabled = prev.xr;
+      renderer.setRenderTarget(prev.target, prev.face, prev.level);
+      if (rt && rt.texture) {
+        // swap and release the old map in the same breath; never drop one the scene still points at
+        const old = this.envRT;
+        scene.environment = rt.texture;
+        this.envRT = rt;
+        if (old && old !== rt) old.dispose();
+      }
+    }
   }
 }
