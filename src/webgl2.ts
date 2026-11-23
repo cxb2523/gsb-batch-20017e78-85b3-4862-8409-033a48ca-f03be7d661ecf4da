@@ -403,9 +403,9 @@ export class WebGL2Backend implements Backend {
     this.lastSrc = null;
     this.last = undefined;
     this.count = 0;
-    this.unitCount = 0;
     this.sprites = false;
-    this.armed = false;
+    // The old context's units and textures are gone; nothing about them can be reused.
+    this.resetUnits();
     this.setup();
     this.lost = false;
     if (shader) this.setShader(shader);
@@ -434,6 +434,23 @@ export class WebGL2Backend implements Backend {
   private readonly fallback: Matrix = [1, 0, 0, 1, 0, 0];
   private blend: BlendMode | "mask" = "normal";
   private submitted = 0;
+
+  /**
+   * Forget every unit the batch holds: the texture, the source and filtering it was assigned for, and the state that
+   * lets a sprite skip the look-up. Called wherever the batch is submitted or its units are handed to another
+   * pipeline, so the unit state always describes the batch being built and a sprite never reuses a unit that now
+   * samples something else. The arrays keep their length, so this runs without allocating.
+   */
+  private resetUnits(): void {
+    this.unitCount = 0;
+    this.lastUnit = 0;
+    this.lastSmooth = false;
+    this.armed = false;
+    this.units.fill(null);
+    this.unitSmooth.fill(false);
+    this.unitInfo.fill(undefined);
+    this.unitSrc.fill(null);
+  }
 
   /** Draw calls this frame, counting the batch still pending (read before `end()` flushes it). */
   get drawCalls(): number {
@@ -610,6 +627,8 @@ export class WebGL2Backend implements Backend {
     const sy = (o.scaleY ?? 1) * (o.flipY ? -1 : 1);
     const r = o.rotation ?? 0;
     const flash = o.flash ?? 0;
+    // Fast path: reuse a unit only when this batch still holds that source under that filtering. Every submit and
+    // every replay clears the unit state, so this loop never sees a unit left by an earlier batch or a layer.
     if (this.armed && ver === this.bver && this.count < this.capacity) {
       const src = fr.image;
       const us = this.unitSrc;
@@ -676,9 +695,11 @@ export class WebGL2Backend implements Backend {
       this.submitted++;
     }
     gl.bindVertexArray(this.vao);
-    // The units now hold the layer's textures: the next sprite resolves its own again.
+    // The units now hold the layer's textures, and texinfo describes them: forget both, so the next sprite resolves
+    // its own texture instead of reusing a layer's unit, and the batch it opens uploads its own texinfo.
     this.lastSrc = null;
     this.last = undefined;
+    this.resetUnits();
     gl.uniform1f(p.snapok, 0);
     return true;
   }
@@ -1420,8 +1441,8 @@ export class WebGL2Backend implements Backend {
       gl.bindTexture(gl.TEXTURE_2D, this.units[i] ?? null);
       gl.bindSampler(i, this.samplerFor(this.units[i], this.unitSmooth[i] === true));
     }
-    this.unitCount = 0;
-    this.armed = false;
+    // The shape program has taken the units: forget them, so a sprite after this batch resolves its own texture.
+    this.resetUnits();
     gl.useProgram(p.program);
     gl.bindVertexArray(p.vao);
     this.syncView(p);
@@ -1465,9 +1486,8 @@ export class WebGL2Backend implements Backend {
     this.flushShapes();
     if (this.lost || this.count === 0) {
       this.count = 0;
-      this.unitCount = 0;
-      this.armed = false;
       this.sprites = false;
+      this.resetUnits();
       return;
     }
     const gl = this.gl;
@@ -1498,8 +1518,8 @@ export class WebGL2Backend implements Backend {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.count);
     this.submitted++;
     this.count = 0;
-    this.unitCount = 0;
-    this.armed = false;
+    // The units are done with: forget them all, so the next sprite resolves its own texture into a fresh unit.
+    this.resetUnits();
   }
 
   /** Upload `u_view` to a program if the destination size changed since it last drew. The program must be bound. */

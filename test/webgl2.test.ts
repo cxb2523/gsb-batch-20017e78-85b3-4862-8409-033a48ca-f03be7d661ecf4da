@@ -37,7 +37,11 @@ function fakeGL() {
       if (key in t) return t[key];
       if (typeof key !== "string") return undefined;
       if (/^[A-Z0-9_]+$/.test(key)) return key; // constants: their own name, readable in assertions
-      return (...args: unknown[]) => {
+      return (...rawArgs: unknown[]) => {
+        // Spryte reuses these buffers for the next batch, as the GPU would not: copy them so each call keeps its data.
+        // Everything else keeps its identity, which tests check (a caller's own Float32Array is uploaded as is).
+        const copy = key === "bufferSubData" || key === "uniform3fv";
+        const args = copy ? rawArgs.map((a) => (a instanceof Float32Array ? a.slice() : a)) : rawArgs;
         calls.push({ name: key, args });
         if (key.startsWith("create")) {
           const obj = { kind: key.slice(6), deleted: false };
@@ -56,6 +60,31 @@ function fakeGL() {
 
 const M: Matrix = [16, 0, 0, 16, 0, 0];
 const image = (w = 16, h = 16) => ({ width: w, height: h }) as unknown as TextureSource;
+
+/**
+ * Pairs every instance the backend uploaded with the `u_texinfo` sent for its draw. Each batch uploads u_texinfo and
+ * then its instances, so an instance's texture unit and the sizes texinfo gives that unit can be checked together.
+ */
+function uploadedBatches(calls: { name: string; args: unknown[] }[]) {
+  const batches: { units: number[]; frames: number[][]; info: Float32Array }[] = [];
+  let info: Float32Array | undefined;
+  for (const c of calls) {
+    if (c.name === "uniform3fv") info = c.args[1] as Float32Array;
+    else if (c.name === "bufferSubData" && c.args[2] instanceof Float32Array) {
+      const f = c.args[2] as Float32Array;
+      const count = (c.args[4] as number) / 14;
+      const units: number[] = [];
+      const frames: number[][] = [];
+      for (let i = 0; i < count; i++) {
+        units.push((f[i * 14 + 12] as number) & 7);
+        frames.push([f[i * 14 + 10] as number, f[i * 14 + 11] as number]);
+      }
+      batches.push({ units, frames, info: info ?? new Float32Array(0) });
+      info = undefined;
+    }
+  }
+  return batches;
+}
 
 describe("WebGL2Backend", () => {
   it("uses highp texture coordinates so large atlases sample the right texel on mobile GPUs", () => {
@@ -142,6 +171,58 @@ describe("WebGL2Backend", () => {
     expect(be.drawCalls).toBe(2);
     be.end();
     expect(count("drawArraysInstanced")).toBe(2);
+  });
+
+  it("resolves a new texture's unit after a full batch submits, instead of reusing a stale one", () => {
+    const { gl, calls } = fakeGL();
+    const draw = new Draw(new WebGL2Backend(gl), false);
+    // Distinct sizes, so a unit that samples the wrong image gives a visibly different texinfo.
+    const imgs = Array.from({ length: 12 }, (_, i) => image(16 * (i + 1), 8 * (i + 1)));
+    draw.begin("#000", 100, 50, 1);
+    // The first 8 fill every unit. The 9th must submit that batch and start a new one: it, and every sprite after it,
+    // has to land on the new batch's own units, with texinfo written for the images it samples.
+    for (let i = 0; i < 12; i++) draw.sprite(imgs[i] as TextureSource, 10, 10, { rotation: 0.5 });
+    // Re-drawing an early image after the split still resolves a fresh unit for it rather than a stale unit 0.
+    draw.sprite(imgs[0] as TextureSource, 30, 10, { rotation: 0.5 });
+    draw.end();
+    const batches = uploadedBatches(calls);
+    expect(batches).toHaveLength(2);
+    const all = batches.flatMap((b) => b.units.map((unit, i) => ({ unit, frame: b.frames[i] as number[], info: b.info })));
+    expect(all).toHaveLength(13);
+    for (const { unit, frame, info } of all) {
+      // Sprites read 1 / width and ±1 / height from the unit texinfo names: they must be this sprite's own image.
+      expect(info[unit * 3]).toBeCloseTo(1 / frame[0]!, 6);
+      expect(Math.abs(info[unit * 3 + 1]!)).toBeCloseTo(1 / frame[1]!, 6);
+    }
+    // Each batch stays within the 8-unit limit, and the new batch's first sprite is on a unit it re-resolved.
+    for (const b of batches) expect(Math.max(...b.units) + 1).toBeLessThanOrEqual(8);
+    expect(batches[1]?.units[0]).toBe(0);
+  });
+
+  it("forgets every unit's source, filtering and size when a batch submits, not just how many it holds", () => {
+    // White-box: after a submit the arrays must describe no batch at all, so nothing later can read a stale unit
+    // even by index. `unitCount` alone would hide a stale entry; this checks the entries themselves.
+    const { gl } = fakeGL();
+    const be = new WebGL2Backend(gl) as unknown as {
+      begin: (c: number, w: number, h: number, s: number) => void;
+      quad: (...a: unknown[]) => void;
+      unitCount: number;
+      unitSrc: (TextureSource | null)[];
+      unitSmooth: boolean[];
+      unitInfo: unknown[];
+      units: unknown[];
+      armed: boolean;
+    };
+    be.begin(0x000000ff, 100, 50, 1);
+    for (let i = 0; i < 8; i++) be.quad(M, image(), 0, 0, 16, 16, 0xffffffff, 0, i % 2 === 0);
+    // A ninth, unseen source submits the batch: at this instant nothing may be left over from it.
+    const ninth = image();
+    be.quad(M, ninth, 0, 0, 16, 16, 0xffffffff, 0, false);
+    expect(be.unitCount).toBe(1);
+    expect(be.unitSrc).toEqual([ninth, null, null, null, null, null, null, null]);
+    expect(be.unitSmooth).toEqual([false, false, false, false, false, false, false, false]);
+    expect(be.unitInfo.slice(1)).toEqual([undefined, undefined, undefined, undefined, undefined, undefined, undefined]);
+    expect(be.units.slice(1)).toEqual([null, null, null, null, null, null, null]);
   });
 
   it("skips drawing while the context is lost and re-uploads after restore", () => {
@@ -386,6 +467,32 @@ describe("WebGL2Backend", () => {
       draw.sprite(image(), 10.4, 10.6, { rotation: 1, scaleX: 2, origin: [0, 1] });
       draw.end();
       expect(sprite(calls).map((v) => Math.round(v * 1000) / 1000)).toEqual([10.4, 10.6, 1, 2, 1, 0, 1, 0, 0, 0, 16, 16, 16]);
+    });
+
+    it("resolve their own texture after a layer replay, not a unit the layer left behind", () => {
+      const { gl, calls } = fakeGL();
+      const backend = new WebGL2Backend(gl);
+      const draw = new Draw(backend, false);
+      // The layer's image is a different size from the sprite's, so a stale texinfo entry would show up as its size.
+      const layerImg = image(64, 64);
+      const own = image(32, 32);
+      const layer = draw.record((d) => d.sprite(layerImg, 10, 10, { origin: [0, 0] }));
+      draw.begin("#000", 100, 50, 1);
+      draw.replay(layer);
+      // The replay bound the layer's textures and wrote a texinfo for them: the next sprite must resolve its own.
+      const st = backend as unknown as { unitCount: number; unitSrc: (TextureSource | null)[]; armed: boolean };
+      expect([st.unitCount, st.unitSrc[0], st.armed]).toEqual([0, null, false]);
+      draw.sprite(own, 10, 10, { rotation: 0.5 });
+      draw.end();
+      const batches = uploadedBatches(calls);
+      // The replay itself and the sprite's batch: the sprite must not have joined a batch that keeps the layer's units.
+      expect(batches).toHaveLength(1);
+      const [batch] = batches as [(typeof batches)[number]];
+      expect(batch.units).toHaveLength(1);
+      const unit = batch.units[0] as number;
+      // Its own 32x32 image, not the layer's 64x64.
+      expect(batch.info[unit * 3]).toBeCloseTo(1 / 32, 6);
+      expect(Math.abs(batch.info[unit * 3 + 1]!)).toBeCloseTo(1 / 32, 6);
     });
   });
 
