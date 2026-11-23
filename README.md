@@ -149,9 +149,12 @@ Watch for the **PULL UP** warning.
 - **Sound** is made in the browser (nothing to download): engine, cannon, missiles, explosions, hits, power-ups,
   and a beep when a missile is homing on you in Versus. It starts with your first click or key press (browsers
   require that). **Sound: ON/OFF** in the hangar's top bar and on the pause screen.
-- **Graphics: Auto / High / Low** in the hangar. High adds a gradient sky, clouds, the sun, smoke from explosions
-  and longer missile trails. Auto uses High, measures the frame rate a few seconds into a flight, and switches this
-  device to Low if it runs under 45 fps or stutters. The pause screen shows the frame rate and what Auto picked.
+- **Graphics: Auto / High / Low** in the hangar's top bar and on the pause screen. High adds a gradient sky, clouds,
+  the sun, smoke from explosions and longer missile trails. Auto uses High, measures the frame rate a few seconds into
+  a flight, and switches this device to Low if it runs under 45 fps or stutters. Switching takes effect at once, in
+  the middle of a flight too: the sky, and every explosion and missile trail made after the switch, follow the new
+  level (particles already in the air just finish their lives). Toggling back and forth adds no GPU memory. The pause
+  screen shows the frame rate and the level in force, including what Auto picked.
 - Explosions, muzzle flashes and warnings are kept modest on purpose: no bright flashes, and nothing blinks more
   than twice a second (fast flashing can trigger photosensitive epilepsy).
 

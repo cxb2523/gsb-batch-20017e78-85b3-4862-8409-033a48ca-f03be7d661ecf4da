@@ -6,6 +6,12 @@
 // turned white against the bright sky); debris and smoke shrink away.
 // High graphics quality (quality.js) adds smoke to explosions, more debris and longer trails.
 //
+// Beyond looks, the level also decides how many particles each new effect gets: boom() and the missile trails read
+// this.high, which follows Quality's notification chain (set up here in the constructor), so switching in the middle
+// of a flight changes the very next explosion or trail. Particles already in the air keep their own numbers and are
+// still stepped to the end of their life, whatever the level; nothing is ever left behind. No geometry or material is
+// created or disposed on a switch: the pools and their slots are the ones built at start.
+//
 // Kept modest on purpose: no white flash, small short fireballs, and a steady muzzle glow instead of a flicker at the
 // fire rate (11 a second). Bright flashes, and anything flashing more than 3 times a second, can trigger
 // photosensitive epilepsy, and big explosions also hide the fight.
@@ -22,6 +28,11 @@ function randomDir(v) { do { v.set(R() * 2 - 1, R() * 2 - 1, R() * 2 - 1); } whi
 export class Effects {
   constructor(scene) {
     this.scene = scene;
+    // the effects' own copy of the level, kept current by the quality module's notification chain (not read from
+    // Quality at each particle: one switch reaches every effect at once, and the chain is the single place that
+    // decides). Particles already in the air are unaffected and finish their lives normally.
+    this.high = Quality.high;
+    Quality.onChange(level => { this.high = level === 'high'; });
     const pool = (geo, mat, n) => {
       const mesh = new THREE.InstancedMesh(geo, mat, n);
       mesh.count = 0;
@@ -49,7 +60,7 @@ export class Effects {
 
   // an explosion: size 1 = a fighter, 2 = a bomber or a plane like yours, 3 = a boss; vel = what it was flying at
   boom(pos, size = 1, vel = null) {
-    const hi = Quality.high, v0 = vel ? vel.clone().multiplyScalar(0.35) : new THREE.Vector3();
+    const hi = this.high, v0 = vel ? vel.clone().multiplyScalar(0.35) : new THREE.Vector3();
     const v = new THREE.Vector3(), o = new THREE.Vector3();
     // fireballs (no white flash: see the top of this file)
     const nf = Math.round((hi ? 5 : 3) + size);
@@ -90,7 +101,8 @@ export class Effects {
   update(dt, weapons = null) {
     // smoke trails behind missiles (yours, and other players' in versus): they also show where a missile is coming from
     if (weapons) {
-      const every = Quality.high ? 0.03 : 0.06, life = Quality.high ? 0.9 : 0.55;
+      const hi = this.high;
+      const every = hi ? 0.03 : 0.06, life = hi ? 0.9 : 0.55;
       for (const list of [weapons.missiles, weapons.pvpMissiles]) {
         for (const m of list) {
           const t = (this.trailT.get(m) || 0) + dt;

@@ -58,10 +58,15 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff2d8, 1.15);
 sun.position.set(600, 1200, 400);
 scene.add(sun);
-// high graphics quality: gradient sky, clouds and the sun (sky.js); low keeps the plain sky colour
+// high graphics quality: gradient sky, clouds and the sun (sky.js); low keeps the plain sky colour.
+// On the quality module's notification chain: this runs on every switch, whether it comes from the hangar button,
+// the pause screen or the Auto measurement, so a flight changes look at once instead of at the next take-off.
+// setEnabled only toggles visibility of the objects built here once; nothing is rebuilt or disposed.
 const skyDome = new Sky(scene, sun);
 skyDome.setEnabled(Quality.high);
-Quality.onChange(() => skyDome.setEnabled(Quality.high));
+Quality.onChange(level => skyDome.setEnabled(level === 'high'));
+// the pause screen follows the same chain: the level a drop lands on (Auto included) is what it shows
+Quality.onChange(() => refreshPauseQuality());
 
 // mix two 0xRRGGBB colors (t = 0 -> a, 1 -> b)
 const mixHex = (a, b, t) => {
@@ -652,10 +657,18 @@ function showPauseMenu() {
   $('pauseInfo').textContent = ladder.active ? `AI Ladder · level ${ladder.level} · you ${ladder.me} - ${ladder.ai} AI`
     : real ? `Wave ${waves.wave} · score ${score}` + (flightMap.daily && !unranked ? " · today's map (ranked)" : '')
     : testFlight ? 'Test flight' : 'Training';
-  $('pausePerf').textContent = Quality.readout();
+  refreshPauseQuality();
   $('pauseSound').textContent = `Sound: ${Sound.on() ? 'ON' : 'OFF'}`;
   $('pauseNote').textContent = ladder.active ? 'Restart starts this level over. End run goes back to the hangar (your ladder progress is kept).'
     : real ? 'Restart and End run need two clicks. Both count like being shot down: this run\'s score is saved.' : '';
+}
+// the pause screen's graphics button and frame-rate / level readout. It is refreshed when the menu opens and on
+// every quality change (see the onChange registration above), so an Auto drop, or a switch made here, updates the
+// readout in place. (The frame rate itself is not sampled while paused, so nothing else in it moves meanwhile.)
+function refreshPauseQuality() {
+  const btn = document.getElementById('pauseGfx');
+  if (btn) btn.textContent = `Graphics: ${Quality.settingLabel()}`;
+  document.getElementById('pausePerf').textContent = Quality.readout();
 }
 function hidePause() { paused = null; document.getElementById('pauseBox').style.display = 'none'; }
 function resumeGame() {
@@ -1305,6 +1318,9 @@ document.getElementById('pauseSound').onclick = () => { Sound.toggle(); document
 document.getElementById('pauseRestart').onclick = () => confirmClick('pauseRestart', pauseRestart);
 document.getElementById('pauseEnd').onclick = () => confirmClick('pauseEnd', pauseEnd);
 document.getElementById('pauseHangar').onclick = () => { hidePause(); if (training) endTraining(); else enterHangar(); };
+// the pause screen's own graphics button: same chain as the hangar one (Quality.cycle announces it; main.js, effects.js
+// and the hangar's button all react), so nothing about the levels is decided here
+document.getElementById('pauseGfx').onclick = () => Quality.cycle();
 document.getElementById('tPause').onclick = () => pauseGame();
 document.getElementById('overR').onclick = () => { if (!gameOver) return; if (ladder.active) ladderAgain(); else if (coop.active) { if (coop.isHost) coop.start(flightMap); } else restart(); };
 document.getElementById('overN').onclick = () => { if (gameOver && !coop.active && !ladder.active) sortie(randomPreset(planeName)); };

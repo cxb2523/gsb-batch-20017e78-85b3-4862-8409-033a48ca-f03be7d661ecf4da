@@ -970,7 +970,9 @@ export class Hangar {
       this.$('hgGfx').title = `Graphics: ${Quality.label()}. Auto uses High unless this device measured too slow. Click to switch`;
     };
     gfx();
-    this.$('hgGfx').onclick = () => { Quality.cycle(); gfx(); };
+    // the button only cycles the setting; the labels follow the quality module's notification chain (a change from
+    // the pause screen or the Auto measurement refreshes this button too, without any click here)
+    this.$('hgGfx').onclick = () => Quality.cycle();
     Quality.onChange(gfx);
     this.$('hgBackupCopy').onclick = () => this.copyBackup();
     this.$('hgBackupRestore').onclick = () => this.restoreBackup(this.$('hgBackupIn').value);
