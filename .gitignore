@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.workbuddy/
+# 内网 EGO 品牌 logo（EGO_BRAND=true 时 server.js 动态注入；不进公开仓库，由内网部署方放入 assets/）
+assets/logo.png
