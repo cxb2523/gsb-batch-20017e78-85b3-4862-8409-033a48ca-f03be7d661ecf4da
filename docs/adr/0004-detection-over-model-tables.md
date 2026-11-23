@@ -1,8 +1,11 @@
 # ADR 0004: Select format variants from the file, not from the camera model
 
 Status: accepted (2026-09-18); amended (2026-09-27): without `is_raw_gyro`, the gyro sample
-layout is told from the median stamp step each candidate decodes over the first 32 samples, not
-from the payload size
+layout is told from the stamp step each candidate decodes over the first 32 samples, not from
+the payload size; amended (2026-11-24): that guess runs the parser's own sample validity first
+and keeps only the stamps the parser would, so uninitialised slots, unreadable stamps and
+readings a flipped bit moved are left out before the spacing is measured, and a probe with too
+few usable samples is refused with a reason rather than read with a guessed layout
 
 ## Context
 

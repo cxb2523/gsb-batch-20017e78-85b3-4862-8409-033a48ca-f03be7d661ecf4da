@@ -7,7 +7,6 @@ import { ByteReader } from '../../../../shared/binary/ByteReader';
 import { GyroViewError, hasErrorCode } from '../../../../shared/errors/GyroViewError';
 import type { Vector3 } from '../../../../shared/math/Vector3';
 import type { GyroSample, GyroTrack } from '../../../motion/gyro/GyroTrack';
-import { medianStep } from '../../../motion/gyro/medianStep';
 import { repairedTimeline } from '../../../motion/gyro/repairedTimeline';
 import type { SensorRanges } from '../../info/RecordingInfo';
 
@@ -21,6 +20,10 @@ const MAX_PLAUSIBLE_INTERVAL_US = 10_000;
  * uninitialised or glitched stamps at the start are outvoted, in one small read.
  */
 const SAMPLES_TO_GUESS_FROM = 32;
+/**
+ * The fewest usable samples a layout must decode a stamp from before its spacing can decide:
+ * one interval needs two samples, and a record with fewer than that says nothing.
+ */
 const MIN_SAMPLES_TO_GUESS_FROM = 2;
 /**
  * Readings past these are no motion a camera makes: the X5 declares a 32 g and a 2000 degrees a
@@ -70,8 +73,14 @@ export const GYRO_LAYOUT_PROBE_SIZE = FLOAT_SAMPLE_SIZE * SAMPLES_TO_GUESS_FROM;
 
 /**
  * The sample layout of the gyro record: from the info record's flag when present, otherwise from
- * the timestamps the candidates decode in the record's first bytes (`head`). Undefined when
- * there is neither a flag nor a record to look at.
+ * the samples the candidates decode in the record's first bytes (`head`). Undefined when there is
+ * neither a flag nor a record to look at.
+ *
+ * Guessing judges the bytes by the parser's own sample validity (see {@link evidenceOf}): a slot
+ * the camera left all zero, a slot whose bytes cannot be a reading and a stamp the parser would
+ * mend as stray are all left out before the spacing between stamps is measured. A damaged start
+ * therefore cannot pull the guess either way, and a record with too few usable samples is
+ * refused with a reason instead of being misread.
  */
 export function selectGyroSampleLayout(
   hints: GyroLayoutHints,
@@ -81,13 +90,75 @@ export function selectGyroSampleLayout(
   const float = new FloatGyroSampleLayout();
   if (hints.isRawGyro !== undefined) return hints.isRawGyro ? raw : float;
   if (head === undefined) return undefined;
-  const plausible = [raw, float].filter((layout) => hasPlausibleTimestamps(head, layout));
+  const candidates = [raw, float].map((layout) => ({ layout, evidence: evidenceOf(head, layout) }));
+  const plausible = candidates.filter(({ evidence }) => isPlausibleFit(evidence));
   const [winner] = plausible;
-  if (winner && plausible.length === 1) return winner;
+  if (winner && plausible.length === 1) return winner.layout;
   throw new GyroViewError(
     'unsupported-gyro-record',
-    `cannot tell the gyro sample layout from the first ${head.byteLength} bytes without the info record`,
+    `cannot tell the gyro sample layout from the first ${head.byteLength} bytes without the info record: ${reasonNothingFits(candidates, plausible.length)}`,
   );
+}
+
+/**
+ * What the leading samples say about one candidate layout, judged by the same validity the
+ * parser applies to every sample.
+ */
+interface LayoutEvidence {
+  /**
+   * Whole samples the probe holds in this layout.
+   */
+  readonly slots: number;
+  /**
+   * Slots the camera never wrote: all zero, left out before any other rule.
+   */
+  readonly unwrittenSamples: number;
+  /**
+   * Slots that hold a sample the parser would keep: neither unwritten nor damaged, and with its
+   * stamp not mended as stray.
+   */
+  readonly trustedSamples: number;
+  /**
+   * Steps between consecutive trusted samples that are a plausible IMU interval.
+   */
+  readonly plausibleSteps: number;
+}
+
+/**
+ * A layout fits when the samples it decodes step at a plausible IMU interval: at least two
+ * trusted samples, at least half of the written slots holding one (a wrong layout damages nearly
+ * all of them), and at least half of the intervals between them plausible (damaged bytes step at
+ * no interval an IMU writes). A knock or a vibration changes readings, not stamps, so it decides
+ * nothing here.
+ */
+function isPlausibleFit(evidence: LayoutEvidence): boolean {
+  const written = evidence.slots - evidence.unwrittenSamples;
+  const intervals = Math.max(evidence.trustedSamples - 1, 0);
+  return (
+    evidence.trustedSamples >= MIN_SAMPLES_TO_GUESS_FROM &&
+    evidence.trustedSamples * 2 >= written &&
+    evidence.plausibleSteps * 2 >= intervals
+  );
+}
+
+/**
+ * Why no single layout explains the probe: too few usable samples to tell, several layouts that
+ * each could, or samples that step at no plausible interval.
+ */
+function reasonNothingFits(
+  candidates: readonly { readonly evidence: LayoutEvidence }[],
+  plausibleCount: number,
+): string {
+  if (plausibleCount > 1) return 'both layouts explain its samples';
+  const [best] = candidates.toSorted(
+    (left, right) => right.evidence.trustedSamples - left.evidence.trustedSamples,
+  );
+  const evidence = best?.evidence;
+  if (!evidence) return 'there are no samples to tell from';
+  const tooFew = `too few usable samples (${evidence.trustedSamples} of ${evidence.slots} slots, the rest unwritten or damaged)`;
+  return evidence.trustedSamples >= MIN_SAMPLES_TO_GUESS_FROM
+    ? 'no layout decodes sample stamps that step at a plausible IMU interval'
+    : tooFew;
 }
 
 /**
@@ -165,35 +236,55 @@ function isWithin(vector: Vector3, bound: number): boolean {
 }
 
 /**
- * A layout fits when the stamps it decodes step by a plausible IMU interval: the median step,
- * so a few stamps left at zero or glitched at the start do not decide.
+ * What the leading samples say about one candidate layout, judged by the very pipeline the
+ * parser applies to every sample: {@link slotAt} leaves out a slot the camera never wrote and one
+ * whose bytes cannot be a reading (a stamp past the safe integers, a value no camera measures),
+ * a component a flipped bit moved is dropped (see {@link SampleColumns.dropFlippedBits}), and a
+ * stamp the parser would mend as stray (see {@link repairedTimeline}) is left out of the step
+ * evidence. The spacing is measured between the stamps that survive, as recorded: mending every
+ * stamp onto a grid would make damaged bytes look regular, so only the intervals the bytes
+ * themselves show are trusted.
  */
-function hasPlausibleTimestamps(payload: Uint8Array, layout: GyroSampleLayout): boolean {
-  const stamps = stampsOf(payload, layout);
-  if (stamps.length < MIN_SAMPLES_TO_GUESS_FROM) return false;
-  const median = medianStep(stamps);
-  return median >= MIN_PLAUSIBLE_INTERVAL_US && median <= MAX_PLAUSIBLE_INTERVAL_US;
+function evidenceOf(payload: Uint8Array, layout: GyroSampleLayout): LayoutEvidence {
+  const reader = new ByteReader(payload);
+  const slots = Math.min(Math.floor(payload.byteLength / layout.sampleSize), SAMPLES_TO_GUESS_FROM);
+  const columns = new SampleColumns(slots);
+  let unwrittenSamples = 0;
+  for (let index = 0; index < slots; index += 1) {
+    const slot = slotAt(reader, layout, index * layout.sampleSize);
+    if (slot === UNWRITTEN) unwrittenSamples += 1;
+    else if (slot) columns.push(slot);
+  }
+  columns.dropFlippedBits(layout.flipSteps);
+  const trusted = trustedStamps(columns.captureTimes());
+  return {
+    slots,
+    unwrittenSamples,
+    trustedSamples: trusted.length,
+    plausibleSteps: countPlausibleSteps(trusted),
+  };
 }
 
 /**
- * The stamps `layout` decodes from the leading samples; one that cannot be a stamp is skipped.
+ * The stamps {@link repairedTimeline} would leave where they are: a stray one is left out of the
+ * step evidence, as the parser mends it instead of trusting it.
  */
-function stampsOf(payload: Uint8Array, layout: GyroSampleLayout): Float64Array {
-  const reader = new ByteReader(payload);
-  const count = Math.floor(payload.byteLength / layout.sampleSize);
-  const stamps: number[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const stamp = stampAt(reader, layout, index * layout.sampleSize);
-    if (stamp !== undefined) stamps.push(stamp);
-  }
-  return Float64Array.from(stamps);
+function trustedStamps(recorded: Float64Array): number[] {
+  const { times } = repairedTimeline(recorded);
+  return [...times].filter((time, index) => time === recorded[index]);
 }
 
-function stampAt(reader: ByteReader, layout: GyroSampleLayout, offset: number): number | undefined {
-  try {
-    return layout.timestampAt(reader, offset);
-  } catch (error) {
-    if (hasErrorCode(error, 'binary-unsafe-integer')) return undefined;
-    throw error;
+function countPlausibleSteps(times: readonly number[]): number {
+  let plausibleSteps = 0;
+  for (let index = 1; index < times.length; index += 1) {
+    if (isPlausibleInterval((times[index] ?? 0) - (times[index - 1] ?? 0))) plausibleSteps += 1;
   }
+  return plausibleSteps;
+}
+
+/**
+ * Spacing a camera's IMU writes between samples: 100 Hz to 10 kHz.
+ */
+function isPlausibleInterval(intervalUs: number): boolean {
+  return intervalUs >= MIN_PLAUSIBLE_INTERVAL_US && intervalUs <= MAX_PLAUSIBLE_INTERVAL_US;
 }

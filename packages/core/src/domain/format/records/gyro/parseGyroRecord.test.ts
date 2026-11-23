@@ -7,7 +7,12 @@ import {
   RAW_COMPONENT_SIZE,
   RAW_SAMPLE_SIZE,
 } from './gyroLayouts';
-import { parseGyroRecord, selectGyroSampleLayout, type GyroLayoutHints } from './parseGyroRecord';
+import {
+  GYRO_LAYOUT_PROBE_SIZE,
+  parseGyroRecord,
+  selectGyroSampleLayout,
+  type GyroLayoutHints,
+} from './parseGyroRecord';
 import { degrees, degreesToRadians } from '../../../../shared/units/angle';
 import { captureError } from '../../../../../test/support/errors';
 import { loadFixture } from '../../../../../test/support/fixtures';
@@ -239,6 +244,24 @@ describe('parseGyroRecord with the raw X5 layout', () => {
     expect(parsed.track.length).toBe(3);
     expect(parsed.strayBytes).toBe(1);
   });
+
+  it('counts a damaged start as unwritten and damaged without mending its stamps', () => {
+    // A zeroed slot is no damage; a flipped stamp and a flipped reading are; the rest parse.
+    const samples = Array.from({ length: 12 }, (_unused, index) =>
+      encodeRawReading(5_000_000 + index * 1000, [0, 1, 0], 0),
+    );
+    samples[1] = new Uint8Array(RAW_SAMPLE_SIZE);
+    samples[3] = bitFlipped(samples[3] ?? new Uint8Array(), 7, 0x80);
+    samples[6] = bitFlipped(samples[6] ?? new Uint8Array(), RAW_ACCELERATION_OFFSET + 1, 0x80);
+    const parsed = read(new Uint8Array(samples.flatMap((s) => [...s])), RAW_X5);
+    expect(parsed.layout).toBe('raw');
+    expect(parsed.unwrittenSamples).toBe(1);
+    expect(parsed.damagedSamples).toBe(2);
+    expect(parsed.mendedStamps).toBe(0);
+    expect([...parsed.track.captureTimes]).toEqual(
+      [0, 2, 4, 5, 7, 8, 9, 10, 11].map((index) => 5_000_000 + index * 1000),
+    );
+  });
 });
 
 describe('parseGyroRecord with the float layout', () => {
@@ -264,6 +287,14 @@ describe('selectGyroSampleLayout', () => {
     expect(selectGyroSampleLayout(NO_HINTS, payload)?.name).toBe('raw');
   });
 
+  it('tells the raw layout of the office recording from the probe alone', () => {
+    const head = loadFixture('x5/office/record-03-gyro-first2000.bin').subarray(
+      0,
+      GYRO_LAYOUT_PROBE_SIZE,
+    );
+    expect(selectGyroSampleLayout(NO_HINTS, head)?.name).toBe('raw');
+  });
+
   it('tells raw samples despite a stamp left at zero and one glitched among the first', () => {
     const stamps = Array.from({ length: 32 }, (_unused, index) => 5_000_000 + index * 1000);
     stamps[0] = 0;
@@ -275,12 +306,109 @@ describe('selectGyroSampleLayout', () => {
     expect(selectGyroSampleLayout(NO_HINTS, payload)?.name).toBe('raw');
   });
 
+  it('tells raw samples despite zeroed slots and flipped stamps among the first 32, and parses them', () => {
+    const samples = Array.from({ length: 40 }, (_unused, index) =>
+      encodeRawReading(9_000_000 + index * 1000, [0, 1, index / 40], index),
+    );
+    for (const index of [0, 7, 21]) samples[index] = new Uint8Array(RAW_SAMPLE_SIZE);
+    // One stamp past the safe integers, which neither phase can read, and one far off its
+    // neighbours but readable, which the parser mends.
+    samples[3] = bitFlipped(samples[3] ?? new Uint8Array(), 7, 0x80);
+    samples[17] = bitFlipped(samples[17] ?? new Uint8Array(), 6, 0x01);
+    const payload = new Uint8Array(samples.flatMap((sample) => [...sample]));
+
+    const parsed = read(payload, NO_HINTS);
+    expect(parsed.layout).toBe('raw');
+    expect(parsed.unwrittenSamples).toBe(3);
+    expect(parsed.damagedSamples).toBe(1);
+    expect(parsed.strayBytes).toBe(0);
+    expect(parsed.track.length).toBe(36);
+    // The stray stamp is put back on the grid the untouched samples show.
+    expect(parsed.mendedStamps).toBe(1);
+    expect([...parsed.track.captureTimes]).toEqual(
+      Array.from({ length: 40 }, (_unused, index) => 9_000_000 + index * 1000).filter(
+        (_time, index) => ![0, 3, 7, 21].includes(index),
+      ),
+    );
+  });
+
+  it('refuses a probe whose slots are mostly unusable bytes', () => {
+    const samples = Array.from({ length: 32 }, (_unused, index) =>
+      encodeRawReading(9_000_000 + index * 1000, [0, 1, 0], 0),
+    );
+    for (const index of [1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 19, 21, 22, 23, 25])
+      samples[index] = new Uint8Array(RAW_SAMPLE_SIZE).fill(0xff);
+    const payload = new Uint8Array(samples.flatMap((sample) => [...sample]));
+    expect(captureError(() => selectGyroSampleLayout(NO_HINTS, payload))).toMatchObject({
+      code: 'unsupported-gyro-record',
+    });
+  });
+
+  it('refuses a probe of nothing but garbage bytes', () => {
+    const garbage = new Uint8Array(FLOAT_SAMPLE_SIZE * 32);
+    for (let index = 0; index < garbage.length; index += 1)
+      garbage[index] = (index * 37 + 11) & 0xff;
+    expect(captureError(() => selectGyroSampleLayout(NO_HINTS, garbage))).toMatchObject({
+      code: 'unsupported-gyro-record',
+    });
+    const empty = new Uint8Array(0);
+    expect(captureError(() => selectGyroSampleLayout(NO_HINTS, empty))).toMatchObject({
+      code: 'unsupported-gyro-record',
+    });
+  });
+
+  it('keeps a knock and a vibration in the layout decision, as the parser keeps them', () => {
+    const knock = [1, 1, 5, 23, 9, 3, 1];
+    const vibration = Array.from(
+      { length: 40 },
+      (_unused, index) => 10 * Math.sin(index * (Math.PI / 2) + 0.3),
+    );
+    const payload = new Uint8Array(
+      [...knock, ...vibration].flatMap((g, index) => [
+        ...encodeRawReading(2_000_000 + index * 1000, [g, 1, 0], 0),
+      ]),
+    );
+    const layout = selectGyroSampleLayout(NO_HINTS, payload);
+    expect(layout?.name).toBe('raw');
+    expect(layout?.sampleSize).toBe(RAW_SAMPLE_SIZE);
+    expect(parseGyroRecord(payload, layout!).damagedSamples).toBe(0);
+  });
+
+  it('ignores a partial trailing sample while telling the layout, and reports it after', () => {
+    const samples = Array.from({ length: 32 }, (_unused, index) =>
+      encodeRawReading(7_000_000 + index * 1000, [0, 1, 0], 0),
+    );
+    samples[4] = new Uint8Array(RAW_SAMPLE_SIZE);
+    const payload = new Uint8Array([...samples.flatMap((sample) => [...sample]), 0xab, 0xcd]);
+    const parsed = read(payload, NO_HINTS);
+    expect(parsed.layout).toBe('raw');
+    expect(parsed.strayBytes).toBe(2);
+    expect(parsed.unwrittenSamples).toBe(1);
+    expect(parsed.track.length).toBe(31);
+  });
+
   it('recognises float samples by their millisecond spacing', () => {
     const payload = new Uint8Array([
       ...encodeFloatSample(5000, [0, 0, 1], [0, 0, 0]),
       ...encodeFloatSample(5001, [0, 0, 1], [0, 0, 0]),
     ]);
     expect(selectGyroSampleLayout(NO_HINTS, payload)?.name).toBe('float');
+  });
+
+  it('tells float samples despite zeroed slots and a flipped value among the first 32', () => {
+    const samples = Array.from({ length: 32 }, (_unused, index) =>
+      encodeFloatSample(5_000_000 + index, [0, 0.2, -1], [0.1, 0.2, 0.3]),
+    );
+    for (const index of [1, 13, 26]) samples[index] = new Uint8Array(FLOAT_SAMPLE_SIZE);
+    samples[8] = bitFlipped(samples[8] ?? new Uint8Array(), ANGULAR_Y_HIGH_BYTE, 0x40);
+    const payload = new Uint8Array(samples.flatMap((sample) => [...sample]));
+
+    const parsed = read(payload, NO_HINTS);
+    expect(parsed.layout).toBe('float');
+    expect(parsed.unwrittenSamples).toBe(3);
+    expect(parsed.damagedSamples).toBe(1);
+    expect(parsed.track.length).toBe(28);
+    expect(parsed.track.sampleAt(0).captureTime).toBe(5_000_000_000);
   });
 
   it('refuses to guess from a single sample or implausible timestamps', () => {
