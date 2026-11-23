@@ -1,24 +1,32 @@
 import Page from '@/components/Page'
+import { createImpactPlayback, shouldAcceptImpactTimeEdit } from '@/lib/impactTimeline'
+import type { ImpactTimelineContext } from '@/lib/impactTimeline'
 import { defaultImpactUniforms, impact } from '@/shaders'
-import type { ImpactUniforms } from '@/shaders/impact'
+import { defaultImpactVisualUniforms } from '@/shaders/impact'
+import type { ImpactVisualUniforms } from '@/shaders/impact'
 import { useFrame } from '@react-three/fiber'
 import { button, folder, useControls } from 'leva'
 import type { ButtonInput } from 'leva/dist/declarations/src/types'
-import { useMemo, useRef } from 'react'
+import { useLayoutEffect, useMemo, useRef } from 'react'
 import { Vector4 } from 'three'
-import { MeshBasicNodeMaterial } from 'three/webgpu'
+import type { MeshBasicNodeMaterial } from 'three/webgpu'
 
-type Preset = { name: string; uniforms: ImpactUniforms }
+type Preset = { name: string; visual: ImpactVisualUniforms; duration: number }
 
+/**
+ * Presets only carry the visuals they own plus a duration. Playback state (time,
+ * seed, autoplay) is never baked into a preset: the timeline redraws it on every
+ * switch, so a preset can't resurrect a stale playhead or seed.
+ */
 const impactPresets: Preset[] = [
   {
     name: 'Smash',
-    uniforms: {
-      ...defaultImpactUniforms,
+    duration: 0.5,
+    visual: {
+      ...defaultImpactVisualUniforms,
       circleColor: new Vector4(1, 0.1, 0, 1),
       vesicaColor: new Vector4(1, 0.6, 0, 1),
       vesicaCount: 6,
-      duration: 0.5,
       circleSizeStart: 0,
       circleSizeEnd: 0.6,
       circleThickness: 0.13,
@@ -26,150 +34,214 @@ const impactPresets: Preset[] = [
   },
   {
     name: 'Void Blast',
-    uniforms: {
-      ...defaultImpactUniforms,
+    duration: 0.7,
+    visual: {
+      ...defaultImpactVisualUniforms,
       circleColor: new Vector4(0, 0, 0, 0.9),
       vesicaColor: new Vector4(0.1, 0, 1, 1),
       vesicaCount: 6,
       circleSizeStart: 1,
       circleSizeEnd: 0.2,
       circleThickness: 0.18,
-      duration: 0.7,
     },
   },
   {
     name: 'Cherry Blossom',
-    uniforms: {
-      ...defaultImpactUniforms,
+    duration: 0.7,
+    visual: {
+      ...defaultImpactVisualUniforms,
       circleColor: new Vector4(1, 0.8, 1, 1),
       vesicaColor: new Vector4(1, 0.4, 1, 1),
       vesicaCount: 10,
       circleSizeStart: 0.2,
       circleSizeEnd: 0.6,
       circleThickness: 0.1,
-      duration: 0.7,
     },
   },
   {
     name: 'Default',
-    uniforms: {
-      ...defaultImpactUniforms,
+    duration: defaultImpactUniforms.duration,
+    visual: {
+      ...defaultImpactVisualUniforms,
       circleColor: defaultImpactUniforms.circleColor.clone(),
       vesicaColor: defaultImpactUniforms.vesicaColor.clone(),
     },
   },
 ]
 
-const defaultUniforms = impactPresets[0].uniforms
+const defaultPreset = impactPresets[0]
+const defaultUniforms = defaultPreset.visual
+const defaultDuration = defaultPreset.duration
+
+type LevaColor = { r: number; g: number; b: number; a: number }
+
+/** Controls mirrored one-way from the page. Leva excludes transient inputs from its own setter type. */
+type ImpactControlPatch = Partial<{
+  circleColor: LevaColor
+  vesicaColor: LevaColor
+  circleSizeStart: number
+  circleSizeEnd: number
+  circleThickness: number
+  vesicaCount: number
+  time: number
+  duration: number
+  autoplay: boolean
+}>
+
+const toLevaColor = (color: Vector4): LevaColor => ({
+  r: color.x * 255,
+  g: color.y * 255,
+  b: color.z * 255,
+  a: color.w,
+})
+
+const fromLevaColor = (color: LevaColor) => new Vector4(color.r / 255, color.g / 255, color.b / 255, color.a)
+
+const toLevaUniforms = (visual: ImpactVisualUniforms) => ({
+  circleColor: toLevaColor(visual.circleColor),
+  vesicaColor: toLevaColor(visual.vesicaColor),
+  circleSizeStart: visual.circleSizeStart,
+  circleSizeEnd: visual.circleSizeEnd,
+  circleThickness: visual.circleThickness,
+  vesicaCount: visual.vesicaCount,
+})
 
 const ImpactMaterial = () => {
   const materialRef = useRef<MeshBasicNodeMaterial>(null)
 
-  const [
-    {
-      circleColor,
-      vesicaColor,
-      duration,
-      time,
-      autoplay,
-      vesicaCount,
+  // The shader starts with the timeline's own values, so the very first frame
+  // already matches the preset shown in the controls.
+  const { uniforms, nodes } = useMemo(
+    () => impact({ time: 0, seed: defaultImpactUniforms.seed, duration: defaultDuration }),
+    [],
+  )
+  const playback = useMemo(
+    () => createImpactPlayback({ duration: defaultDuration, seed: defaultImpactUniforms.seed }),
+    [],
+  )
+
+  /** The single write path from controls/presets into the shader's visual uniforms. */
+  const applyVisualUniforms = useMemo(
+    () => (visual: ImpactVisualUniforms) => {
+      uniforms.circleColor.value.copy(visual.circleColor)
+      uniforms.vesicaColor.value.copy(visual.vesicaColor)
+      uniforms.circleSizeStart.value = visual.circleSizeStart
+      uniforms.circleSizeEnd.value = visual.circleSizeEnd
+      uniforms.circleThickness.value = visual.circleThickness
+      uniforms.vesicaCount.value = visual.vesicaCount
+    },
+    [uniforms],
+  )
+
+  const [{ circleColor, vesicaColor, vesicaCount, circleSizeStart, circleSizeEnd, circleThickness }, setControlsRaw] =
+    useControls(() => {
+      const handleTimeChange = (value: number, _path: string, context: ImpactTimelineContext) => {
+        // Programmatic slider refreshes and the initial call echo back through
+        // onChange; only real panel edits are allowed to move the playhead.
+        if (!shouldAcceptImpactTimeEdit(playback.state, value, context)) return
+        playback.seekFromPanel(value)
+        uniforms.time.value = playback.state.time
+      }
+
+      const handleDurationChange = (value: number) => {
+        playback.setDurationFromPanel(value)
+        uniforms.duration.value = playback.state.duration
+      }
+
+      const handleAutoplayChange = (value: boolean) => {
+        playback.setAutoplayFromPanel(value)
+        // Pausing stops the throttled refreshes; snap the slider to the exact
+        // playhead so the user starts dragging from what is on screen.
+        if (!playback.state.autoplay) setControls({ time: playback.state.time })
+      }
+
+      const presets: Record<string, ButtonInput> = Object.fromEntries(
+        impactPresets.map(preset => [
+          preset.name,
+          button(() => {
+            playback.applyPreset(preset)
+            // Write the new looks before the next frame is drawn, so the first
+            // frame after the click already uses the preset's colors and sizes.
+            applyVisualUniforms(preset.visual)
+            uniforms.time.value = playback.state.time
+            uniforms.seed.value = playback.state.seed
+            uniforms.duration.value = playback.state.duration
+            setControls({
+              ...toLevaUniforms(preset.visual),
+              duration: preset.duration,
+              autoplay: true,
+              time: 0,
+            })
+          }),
+        ]),
+      )
+
+      return {
+        Animation: folder({
+          time: {
+            value: 0,
+            min: 0,
+            max: 1,
+            step: 0.01,
+            transient: true,
+            onChange: handleTimeChange,
+            onEditStart: () => playback.beginScrub(),
+            onEditEnd: () => playback.endScrub(),
+          },
+          duration: {
+            value: defaultDuration,
+            min: 0,
+            max: 3,
+            step: 0.1,
+            transient: true,
+            onChange: handleDurationChange,
+          },
+          autoplay: { value: true, transient: true, onChange: handleAutoplayChange },
+        }),
+        Uniforms: folder({
+          circleColor: { value: toLevaColor(defaultUniforms.circleColor) },
+          vesicaColor: { value: toLevaColor(defaultUniforms.vesicaColor) },
+          circleSizeStart: { value: defaultUniforms.circleSizeStart, min: 0, max: 1, step: 0.01 },
+          circleSizeEnd: { value: defaultUniforms.circleSizeEnd, min: 0, max: 1, step: 0.01 },
+          circleThickness: { value: defaultUniforms.circleThickness, min: 0, max: 1, step: 0.01 },
+          vesicaCount: {
+            value: defaultUniforms.vesicaCount,
+            min: 0,
+            max: 15,
+            step: 1,
+          },
+        }),
+        Presets: folder(presets),
+      }
+    })
+
+  // Transient inputs are omitted from leva's setter type; the page writes them
+  // deliberately, so widen the setter once here instead of casting per call.
+  const setControls = setControlsRaw as (patch: ImpactControlPatch) => void
+
+  // Shadows and preset clicks both arrive through the controls; mirror them into
+  // the uniforms before paint so a frame never renders the previous visuals.
+  useLayoutEffect(() => {
+    applyVisualUniforms({
+      circleColor: fromLevaColor(circleColor),
+      vesicaColor: fromLevaColor(vesicaColor),
       circleSizeStart,
       circleSizeEnd,
       circleThickness,
-    },
-    setControls,
-  ] = useControls(() => {
-    const presets: Record<string, ButtonInput> = Object.fromEntries(
-      impactPresets.map(preset => [
-        preset.name,
-        button(() => {
-          const { seed, aspect, ...rest } = preset.uniforms
-          setControls({
-            ...rest,
-            circleColor: {
-              r: preset.uniforms.circleColor.x * 255,
-              g: preset.uniforms.circleColor.y * 255,
-              b: preset.uniforms.circleColor.z * 255,
-              a: preset.uniforms.circleColor.w,
-            },
-            vesicaColor: {
-              r: preset.uniforms.vesicaColor.x * 255,
-              g: preset.uniforms.vesicaColor.y * 255,
-              b: preset.uniforms.vesicaColor.z * 255,
-              a: preset.uniforms.vesicaColor.w,
-            },
-            autoplay: true,
-            time: 0,
-          })
-        }),
-      ]),
-    )
-
-    return {
-      Animation: folder({
-        time: { value: 0, min: 0, max: 1, step: 0.01 },
-        duration: { value: 0.5, min: 0, max: 3, step: 0.1 },
-        autoplay: { value: true },
-      }),
-      Uniforms: folder({
-        circleColor: {
-          value: {
-            r: defaultUniforms.circleColor.x * 255,
-            g: defaultUniforms.circleColor.y * 255,
-            b: defaultUniforms.circleColor.z * 255,
-            a: defaultUniforms.circleColor.w,
-          },
-        },
-        vesicaColor: {
-          value: {
-            r: defaultUniforms.vesicaColor.x * 255,
-            g: defaultUniforms.vesicaColor.y * 255,
-            b: defaultUniforms.vesicaColor.z * 255,
-            a: defaultUniforms.vesicaColor.w,
-          },
-        },
-        circleSizeStart: { value: defaultUniforms.circleSizeStart, min: 0, max: 1, step: 0.01 },
-        circleSizeEnd: { value: defaultUniforms.circleSizeEnd, min: 0, max: 1, step: 0.01 },
-        circleThickness: { value: defaultUniforms.circleThickness, min: 0, max: 1, step: 0.01 },
-        vesicaCount: {
-          value: defaultUniforms.vesicaCount,
-          min: 0,
-          max: 15,
-          step: 1,
-        },
-      }),
-      Presets: folder(presets),
-    }
-  })
-
-  const { uniforms, nodes } = useMemo(() => impact(), [])
+      vesicaCount,
+    })
+  }, [applyVisualUniforms, circleColor, vesicaColor, circleSizeStart, circleSizeEnd, circleThickness, vesicaCount])
 
   useFrame((_, delta) => {
-    if (!autoplay) return
+    const step = playback.advance(delta)
 
-    uniforms.time.value += delta / duration
+    // The timeline is the only writer of the playback uniforms.
+    uniforms.time.value = step.time
+    uniforms.seed.value = step.seed
+    uniforms.duration.value = playback.state.duration
 
-    if (uniforms.time.value > 1) {
-      uniforms.seed.value = Math.round(Math.random() * 1000)
-      uniforms.time.value = 0
-    }
-
-    setControls({ time: uniforms.time.value })
+    if (step.reflect) setControls({ time: step.time })
   })
-
-  uniforms.time.value = time
-  uniforms.circleColor.value.x = circleColor.r / 255
-  uniforms.circleColor.value.y = circleColor.g / 255
-  uniforms.circleColor.value.z = circleColor.b / 255
-  uniforms.circleColor.value.w = circleColor.a
-  uniforms.vesicaColor.value.x = vesicaColor.r / 255
-  uniforms.vesicaColor.value.y = vesicaColor.g / 255
-  uniforms.vesicaColor.value.z = vesicaColor.b / 255
-  uniforms.vesicaColor.value.w = vesicaColor.a
-  uniforms.circleSizeStart.value = circleSizeStart
-  uniforms.circleSizeEnd.value = circleSizeEnd
-  uniforms.circleThickness.value = circleThickness
-  uniforms.vesicaCount.value = vesicaCount
 
   return <meshBasicNodeMaterial ref={materialRef} {...nodes} transparent />
 }

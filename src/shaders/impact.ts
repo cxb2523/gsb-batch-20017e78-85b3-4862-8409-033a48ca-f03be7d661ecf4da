@@ -20,6 +20,26 @@ export const defaultImpactUniforms = {
 
 export type ImpactUniforms = typeof defaultImpactUniforms
 
+/**
+ * Uniforms driven by the playback timeline rather than by preset visuals.
+ * Keeping them separate means presets can never accidentally carry a stale
+ * `time` or `seed` into the next render.
+ */
+export const impactPlaybackUniformKeys = ['time', 'aspect', 'duration', 'seed'] as const
+
+export type ImpactPlaybackUniforms = Pick<ImpactUniforms, (typeof impactPlaybackUniformKeys)[number]>
+
+export type ImpactVisualUniforms = Omit<ImpactUniforms, (typeof impactPlaybackUniformKeys)[number]>
+
+export const defaultImpactVisualUniforms: ImpactVisualUniforms = {
+  circleColor: defaultImpactUniforms.circleColor.clone(),
+  vesicaColor: defaultImpactUniforms.vesicaColor.clone(),
+  vesicaCount: defaultImpactUniforms.vesicaCount,
+  circleSizeStart: defaultImpactUniforms.circleSizeStart,
+  circleSizeEnd: defaultImpactUniforms.circleSizeEnd,
+  circleThickness: defaultImpactUniforms.circleThickness,
+}
+
 export type ImpactOptions = {
   instanceIndex?: IndexNode
   instanceCount?: number
@@ -28,11 +48,13 @@ export type ImpactOptions = {
 export const impact = (uniforms: Partial<ImpactUniforms> = {}, options: ImpactOptions = {}) => {
   const init = { ...defaultImpactUniforms, ...uniforms }
 
+  // Colors are cloned so each impact instance owns its uniforms; callers mutate
+  // them in place and must not be able to reach the shared defaults.
   const u = {
     time: uniform(init.time),
     aspect: uniform(init.aspect),
-    circleColor: uniform(init.circleColor),
-    vesicaColor: uniform(init.vesicaColor),
+    circleColor: uniform(init.circleColor.clone()),
+    vesicaColor: uniform(init.vesicaColor.clone()),
     duration: uniform(init.duration),
     seed: uniform(init.seed),
     circleSizeStart: uniform(init.circleSizeStart),
