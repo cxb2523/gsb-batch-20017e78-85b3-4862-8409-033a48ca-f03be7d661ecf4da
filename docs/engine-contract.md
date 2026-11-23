@@ -54,7 +54,10 @@ core.encode(encoder, { color, depth, velocity, deltaTime }, { near, far, perspec
 1. `configure(config)` sizes everything for a display resolution and a path. It
    reallocates the output and the guides, and drops history. Call it again on
    resize or on a path change, then re-read `output` and `renderWidth` /
-   `renderHeight`.
+   `renderHeight`. It also finalizes any unfinished split frame
+   (`guidesPending` becomes `false`, ping-pong indices reset), so a
+   `dispatchUpscale()` orphaned by the reconfigure throws instead of touching
+   the new working set — begin a new frame with `dispatchGuides()`.
 2. `await prepare()` compiles the path's pipelines. Until `isReady` is true, every
    `dispatch*` / `encode*` throws `UpscalerNotReadyError`, so skip the upscale in
    the frames before that.
@@ -62,7 +65,10 @@ core.encode(encoder, { color, depth, velocity, deltaTime }, { near, far, perspec
    (or the split pair, below).
 4. `resetHistory()` on a camera cut or teleport. Passing `reset: true` in the
    inputs does the same for one frame.
-5. `dispose()` when done.
+5. `dispose()` when done. It is terminal: the instance stays unusable and every
+   stateful call (`configure`, `dispatch*`, `encode*`, `beginFrame`,
+   `resetHistory`, `prepare`, the `gpuTiming` setter) rejects with an explicit
+   disposed error. Construct a new instance instead of reviving one.
 
 `core.settings` is the live `RuntimeSettings` object (sharpness, auto-exposure,
 debug view…). It is read every frame and held by reference: mutate it, or pass

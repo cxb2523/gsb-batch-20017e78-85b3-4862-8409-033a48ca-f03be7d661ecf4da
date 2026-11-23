@@ -184,9 +184,16 @@ export class UpscalerCore<THandle = GPUTexture> {
     private _warnedMsaa = false;
     private _historyIndex = 0;
     private _depthIndex = 0;
+    // Scatter ping-pong is flipped per guides encode; reset with the other
+    // indices so a reconfigure never inherits a half-frame buffer choice.
+    private _scatterIndex = 0;
     private _initialized = false;
     private _generation = 0;
     private _deviceLost = false;
+    // A disposed instance is permanently dead: every public entry point
+    // rejects instead of silently reviving it (dispose() is not a teardown
+    // of the pre-configure state — configure() on a fresh instance starts one).
+    private _disposed = false;
     private readonly _passes = new Map<string, ComputePass>();
     private readonly _requests = new Map<string, Promise<void>>();
     private readonly _failures = new Map<string, unknown>();
@@ -205,7 +212,6 @@ export class UpscalerCore<THandle = GPUTexture> {
     // Reconstructed previous depth (u32 = f32 bits), ping-ponged: one is
     // scattered into while the depth clip empties the other for next frame.
     private _reconstructedDepth: [GPUBuffer, GPUBuffer] | null = null;
-    private _scatterIndex = 0;
     private _dilatedMotion: GPUTexture | null = null;
     private _masks: GPUTexture | null = null;
     private _easuOutput: GPUTexture | null = null;
@@ -314,6 +320,7 @@ export class UpscalerCore<THandle = GPUTexture> {
      * Configuring queues this too, but only an explicit call retries.
      */
     prepare(): Promise<void> {
+        if (this._disposed) return Promise.reject(this._disposedError());
         this._ensureResources();
         const preparation = this._deviceLost
             ? Promise.reject(new Error("@pmndrs/upscaler: GPU device lost."))
@@ -326,13 +333,26 @@ export class UpscalerCore<THandle = GPUTexture> {
 
     /** Mandatory passes are ready; newly requested optional passes may still be preparing. */
     get isReady(): boolean {
-        return this._initialized && !this._deviceLost &&
+        return !this._disposed && this._initialized && !this._deviceLost &&
             this._mandatoryPasses().every(name => this._passes.has(name));
     }
 
     /** The debug view actually used by the most recent frame (None while preparing). */
     get activeDebugView(): DebugView {
         return this._effectiveSettings.debugView;
+    }
+
+    private _disposedError(): Error {
+        return new Error(
+            '@pmndrs/upscaler: this UpscalerCore has been disposed — its GPU resources are gone. ' +
+                'Construct a new instance instead of reusing a disposed one.',
+        );
+    }
+
+    // Every stateful public entry point goes through this: after dispose() the
+    // instance must not revive (its textures/passes were destroyed).
+    private _ensureLive(): void {
+        if (this._disposed) throw this._disposedError();
     }
 
     private _ensureResources(): void {
@@ -429,6 +449,7 @@ export class UpscalerCore<THandle = GPUTexture> {
     }
 
     private _startDispatch(): void {
+        this._ensureLive();
         if (!this.isReady) {
             throw notReadyError(this, 'Upscaler', this._deviceLost ? 'device-lost' : 'preparing');
         }
@@ -453,10 +474,32 @@ export class UpscalerCore<THandle = GPUTexture> {
     /**
      * (Re)configures resolutions and the active pipeline. Allocates the
      * working texture set — call on startup, resize, or mode change.
+     *
+     * Reconfiguring terminates any unfinished split frame: `guidesPending`
+     * becomes `false`, every ping-pong index returns to its initial half, and
+     * the previous path's detector/debug activations and block memories are
+     * discarded with the old texture set. A later `dispatchUpscale()` is then
+     * rejected explicitly rather than encoding against the new configuration.
      * @param config - Display size, quality mode/ratio, and pipeline path
      */
     configure(config: UpscalerConfig): void {
+        this._ensureLive();
         this._ensureResources();
+
+        //* Close any half-open split frame. The old guides stage encoded
+        //* against the previous path/resolution, so its pending flag and
+        //* ping-pong positions must never carry into the new configuration.
+        this._guidesPending = false;
+        this._historyIndex = 0;
+        this._depthIndex = 0;
+        this._scatterIndex = 0;
+        this._latestDepthWrite = 0;
+        this._latestHistoryWrite = 0;
+        // The detector/debug activations belong to the old pass graph; the
+        // next dispatch re-evaluates them from scratch (and marks the fresh
+        // block memory stale-driven empty on first use).
+        this._shadingActive = false;
+        this._debugActive = false;
 
         // A new pass graph: samples still in flight from the old one must not
         // land in gpuTimings after it.
@@ -639,6 +682,7 @@ export class UpscalerCore<THandle = GPUTexture> {
     }
 
     set gpuTiming(enabled: boolean) {
+        this._ensureLive();
         if (enabled === this._gpuTiming) return;
         this._gpuTiming = enabled;
         if (!this._initialized) return;
@@ -651,6 +695,7 @@ export class UpscalerCore<THandle = GPUTexture> {
 
     /** Drops all temporal history on the next dispatch (camera cut etc.). */
     resetHistory(): void {
+        this._ensureLive();
         this._pendingReset = true;
         this._jitter.reset();
     }
@@ -668,6 +713,7 @@ export class UpscalerCore<THandle = GPUTexture> {
      * there is nothing to apply
      */
     beginFrame(): JitterOffset | null {
+        this._ensureLive();
         if (!this._jittering) return null;
         this._jitter.advance();
         return this.jitter;
@@ -860,7 +906,10 @@ export class UpscalerCore<THandle = GPUTexture> {
     }
 
     private _stageUpscale(inputs: DispatchInputs, camera: FrameCamera): void {
-        if (!this.isReady) throw new Error("@pmndrs/upscaler: await init() (or prepare()) before dispatchUpscale().");
+        this._ensureLive();
+        // The split-frame and path guards come before the readiness gate: a
+        // late dispatch after a reconfigure must report the abandoned frame
+        // explicitly even while the new path's pipelines are still compiling.
         if (this._path !== 'temporal') {
             throw new Error(
                 `@pmndrs/upscaler: dispatchUpscale() requires the temporal path (got '${this._path}').`,
@@ -871,6 +920,7 @@ export class UpscalerCore<THandle = GPUTexture> {
                 '@pmndrs/upscaler: call dispatchGuides() first (or use the all-in-one dispatch()).',
             );
         }
+        if (!this.isReady) throw new Error("@pmndrs/upscaler: await init() (or prepare()) before dispatchUpscale().");
         if (!this._output || !this._outputGPU) {
             throw new Error('@pmndrs/upscaler: configure() must run before dispatchUpscale().');
         }
@@ -890,17 +940,34 @@ export class UpscalerCore<THandle = GPUTexture> {
         this._depthIndex = 1 - this._depthIndex;
     }
 
-    /** Releases every GPU resource the core allocated (never the device). */
+    /**
+     * Releases every GPU resource the core allocated (never the device).
+     * The instance is permanently unusable afterwards: every stateful call
+     * rejects with an explicit error — construct a new instance instead.
+     */
     dispose(): void {
+        if (this._disposed) return;
+        this._disposed = true;
         this._generation++;
         this._passes.clear();
         this._requests.clear();
         this._failures.clear();
         this._shadingActive = false;
         this._debugActive = false;
+        // Finalize any split frame and return every ping-pong index to its
+        // initial half so no half-frame state outlives the working set.
+        this._guidesPending = false;
+        this._historyIndex = 0;
+        this._depthIndex = 0;
+        this._scatterIndex = 0;
+        this._latestDepthWrite = 0;
+        this._latestHistoryWrite = 0;
+        this._frameIndex = 0;
+        this._pendingReset = true;
         this._destroyTextures();
         this._constants?.dispose();
         this._reprojectBuffer?.destroy();
+        this._reprojectBuffer = null;
         this._timer?.dispose();
         this._timer = null;
         this._initialized = false;

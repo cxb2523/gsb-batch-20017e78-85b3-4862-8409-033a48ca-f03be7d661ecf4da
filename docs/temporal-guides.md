@@ -108,6 +108,13 @@ upscaler.dispatchUpscale({ color: beautyColor, deltaTime }, camera); // + reacti
 - A split frame is in flight between the two calls (`upscaler.guidesPending`). Inside it,
   `dispatch()` and a second `dispatchGuides()` throw; finish with `dispatchUpscale()`.
   `dispatchUpscale()` without a preceding `dispatchGuides()` throws too.
+- Reconfiguring (`configure()`) — a path switch or a resize — abandons any in-flight split
+  frame: `guidesPending` reads `false`, the ping-pong indices return to their initial half,
+  and the previous path's shading-change block memory, exposure and history state are
+  destroyed with the old texture set (the next temporal frame starts each from empty).
+  A `dispatchUpscale()` left over from the abandoned frame is then rejected with an
+  explicit error rather than writing into the new configuration; start a fresh frame with
+  `dispatchGuides()`.
 - Frame-end bookkeeping (ping-pong flips, the history reset) happens once per frame: in
   `dispatch()`, in `dispatchUpscale()`, or, on the `guides` path, in `dispatchGuides()`.
 - `upscaler.gpuTimings` reports both submits together: the early stage's timings are held

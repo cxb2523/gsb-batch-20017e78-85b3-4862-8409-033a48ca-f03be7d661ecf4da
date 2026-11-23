@@ -269,7 +269,9 @@ function frame(dt: number) {
 - **Split frames and guides:** `dispatchGuides()` / `dispatchUpscale()` and
   `path: 'guides'` are specified in [Temporal guides](temporal-guides.md).
 - **Teardown:** `dispose()` releases every GPU resource the upscaler allocated,
-  including the guide textures. It doesn't touch your inputs.
+  including the guide textures. It doesn't touch your inputs. The disposed
+  instance is terminal — every further call rejects — so construct a new
+  upscaler instead of reusing it.
 
 ## Runtime settings
 
