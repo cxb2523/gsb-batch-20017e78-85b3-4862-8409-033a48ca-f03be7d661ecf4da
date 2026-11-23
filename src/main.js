@@ -1201,7 +1201,7 @@ function connect() {
     else if (m.t === "joined") createOther(m.player);
     else if (m.t === "left") removeOther(m.id);
     else if (m.t === "chat") receiveChat(m.id, m.name, m.text);
-    else if (m.t === "radio") receiveCommand(m.command);
+    else if (m.t === "radio") receiveCommand(m.command, m.now);
     else if (m.t === "error") addToHistory("system", m.msg);
     else if (m.t === "name") {
       const o = others.get(m.id);

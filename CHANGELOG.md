@@ -17,6 +17,7 @@
 - A single room, `lobby`: `?room=` is gone and the server refuses other room names, so nobody can open extra rooms to run up the bill.
 
 ### Fixed
+- **Radio clock consistency** ([ADR 002](docs/adr/002-radio-synced-by-the-clock.md)): the room server now sends its own clock with every radio command (join, reconnect, admin change), and the client computes the position from it instead of trusting the device's `Date.now()`. A reconnect re-sends the current command; a join always sends one (with `null` when there is none) so a stale saved command is dropped. Commands that arrive before the player is ready are applied in `onReady`; `ENDED`/`onError` from a video being replaced can no longer drag the new command back. Phones seek to the room's current second at the first touch, and pause/resume/unmute land on the same second on desktop and phone. `node scripts/check-radio-sync.mjs` checks all three paths.
 - Chat history scrolls to older messages; new messages only pull you down if you were already at the bottom.
 - Long words without spaces now wrap in the chat bubble and history.
 

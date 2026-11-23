@@ -6,7 +6,9 @@
 //   server -> client: { t: "you", id } | { t: "state", players: [...] }
 //                     { t: "joined", player } | { t: "left", id } | { t: "pos", ... }
 //                     { t: "chat", id, name, text, at } | { t: "name", id, name }
-//                     { t: "gender", id, gender } | { t: "radio", command } | { t: "error", msg }
+//                     { t: "gender", id, gender }
+//                     { t: "radio", command: { idx, at } | null, now } | { t: "error", msg }
+//                     (now = server clock in ms when sent; the client uses it to correct its own clock)
 //
 // Security (the client is public, so nothing coming from it is trusted):
 //  - max message size, per-connection rate limit, max players per room
@@ -76,8 +78,12 @@ export class Room {
     this.state.acceptWebSocket(server);
     server.serializeAttachment({ id, name: "trainer", gender: "male", x: 0, z: 0, dir: "down", step: 0, ip });
     server.send(JSON.stringify({ t: "you", id }));
-    const radio = await this.state.storage.get("radio");
-    if (radio) server.send(JSON.stringify({ t: "radio", command: radio }));
+    // The room is the only clock: every join/reconnect gets the current command
+    // (or null) plus the server's time right now, even when there is no command,
+    // so the client can correct a skewed device clock and drop a stale command
+    // from an earlier visit instead of trusting its own Date.now().
+    const radio = (await this.state.storage.get("radio")) || null;
+    server.send(JSON.stringify({ t: "radio", command: radio, now: Date.now() }));
     server.send(JSON.stringify({ t: "state", players: this.players().filter((p) => p.id !== id) }));
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -159,9 +165,12 @@ export class Room {
         return;
       }
       await this.state.storage.delete(lockKey);
-      const command = { idx: Math.max(0, Math.min(999, m.idx | 0)), at: Date.now() };
+      const now = Date.now();
+      const command = { idx: Math.max(0, Math.min(999, m.idx | 0)), at: now };
       await this.state.storage.put("radio", command);
-      this.broadcast({ t: "radio", command });
+      // `now` is delivery metadata (the sender's clock reference), not part of the
+      // stored command: it is re-stamped on every send, including on reconnect.
+      this.broadcast({ t: "radio", command, now });
     } else if (m.t === "chat") {
       const text = cleanText(m.text, 140);
       if (!text) return;
