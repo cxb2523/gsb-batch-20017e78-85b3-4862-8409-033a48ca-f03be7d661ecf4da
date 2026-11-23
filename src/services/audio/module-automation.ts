@@ -203,9 +203,13 @@ export const getCurrentValueForParam = ( modules: InstrumentModules, instrument:
         case FILTER_LFO_SPEED:
             value = filter.lfo.frequency.value / Config.MAX_FILTER_LFO_SPEED;
             break;
-        case FILTER_LFO_DEPTH:
-            value = ( filter.lfoAmp.gain.value / Config.MAX_FILTER_LFO_DEPTH ) * 100 / filter.filter.frequency.value;
+        case FILTER_LFO_DEPTH: {
+            // lfoAmp gain is expressed as ( depth / 100 ) * filter frequency, guard against
+            // a zero frequency to avoid a division by zero yielding NaN (no modulation at 0 Hz)
+            const frequency = filter.filter.frequency.value;
+            value = frequency === 0 ? 0 : ( filter.lfoAmp.gain.value / Config.MAX_FILTER_LFO_DEPTH ) * 100 / frequency;
             break;
+        }
 
         // delay effects
         case DELAY_ENABLED:
@@ -221,6 +225,7 @@ export const getCurrentValueForParam = ( modules: InstrumentModules, instrument:
             break;
         case DELAY_CUTOFF:
             value = delay.delay.cutoff / Config.MAX_DELAY_CUTOFF;
+            break;
         case DELAY_OFFSET:
             value = delay.delay.offset - Config.MIN_DELAY_OFFSET;
             break;
@@ -403,20 +408,46 @@ function applyExternalEvent( audioContext: BaseAudioContext, event: EffluxAudioE
  * @param {number} startTimeInSeconds relative to the currentTime of the AudioContext, when the change should take place
  * @param {number=} durationInSeconds the total duration of the change (only rqeuired when 'doGlide' is true)
  * @param {boolean=} doGlide whether to "glide" to the value (linear change), defaults to false for instant change
- * @param {Object=} data optional data Object to track the status of the scheduled parameter changes (can for instance
- *                  be EventVoiceList which shouldn't cancel previously scheduled changes upon repeated invocation)
+ * @param {EventVoice=} data optional EventVoice to track the status of the scheduled parameter changes. When provided
+ *                  previously scheduled changes are not cancelled while a glide is still in progress, allowing multiple
+ *                  consecutive automation events to extend the same ramp. The gliding state is reset once the glide
+ *                  has completed (lazily evaluated on the next invocation) or when an instant change is applied.
  */
 function scheduleParameterChange( param: AudioParam, value: number, startTimeInSeconds: number,
-    durationInSeconds: number, doGlide?: boolean, data?: any ): void {
+    durationInSeconds: number, doGlide?: boolean, data?: EventVoice ): void {
 
-    if ( !doGlide || ( data && !data.gliding )) {
-        param.cancelScheduledValues( startTimeInSeconds );
-        param.setValueAtTime(( doGlide ) ? param.value : value, startTimeInSeconds );
-    }
-    if ( doGlide ) {
-        param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
-        if ( data ) {
-            data.gliding = true;
+    if ( data ) {
+        // lazily reset the gliding state when the previously scheduled glide has completed by now,
+        // this ensures a retriggered event (e.g. on a loop or pattern jump) starts a fresh glide
+        // towards its new target value instead of extending an expired ramp
+        if ( data.gliding && data.glideEnd !== undefined && data.glideEnd <= startTimeInSeconds ) {
+            data.gliding = false;
         }
     }
+
+    if ( !doGlide ) {
+        // instant change: cancel all pending changes and force the new value immediately,
+        // any glide that was in progress is terminated and its tracking state reset
+        param.cancelScheduledValues( startTimeInSeconds );
+        param.setValueAtTime( value, startTimeInSeconds );
+        if ( data ) {
+            data.gliding  = false;
+            data.glideEnd = undefined;
+        }
+        return;
+    }
+
+    if ( data ) {
+        // a tracked voice only anchors the ramp to its current value at the start of a fresh glide,
+        // while a glide is still in progress consecutive automation events extend the same ramp
+        if ( !data.gliding ) {
+            param.cancelScheduledValues( startTimeInSeconds );
+            param.setValueAtTime( param.value, startTimeInSeconds );
+        }
+        data.gliding  = true;
+        data.glideEnd = startTimeInSeconds + durationInSeconds;
+    }
+    // when no voice is tracked (e.g. panner, EQ and filter modules) retain the legacy behaviour
+    // of appending consecutive ramps without cancelling previously scheduled parameter changes
+    param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
 }

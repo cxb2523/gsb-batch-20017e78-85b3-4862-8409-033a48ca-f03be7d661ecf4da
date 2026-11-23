@@ -34,7 +34,18 @@ export type EventVoice = {
     outputNode: GainNode;
     frequency: number;
     vo: InstrumentOscillator,
-    gliding: false
+    /**
+     * whether a gliding parameter change (linear ramp) is currently active
+     * for this voice. Reset to false when the scheduled glide has completed
+     * (see glideEnd) or when a new, non-gliding change is applied.
+     */
+    gliding: boolean;
+    /**
+     * the time (in seconds, relative to the AudioContext clock) at which the
+     * most recently scheduled glide reaches its target value. Used to lazily
+     * reset the gliding state once the glide has completed.
+     */
+    glideEnd?: number;
 };
 
 /**
