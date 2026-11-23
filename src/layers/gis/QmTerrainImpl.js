@@ -175,6 +175,9 @@ class QmTileManager {
   requestSatTiles(viewport) {
     const satCache = this._satCacheRef.cache
     if (!satCache) return
+    // Mark the start of a request frame so the sat cache protects the imagery
+    // requested here from eviction.
+    satCache.beginFrame()
     for (const tile of this.tiles.values()) {
       if (tile.status !== 'loaded') continue
       satCache.requestForBbox(tile.satCrsBbox, viewport)
@@ -216,7 +219,11 @@ class QmTileManager {
   }
 
   async _loadTile(spec) {
-    this.tiles.set(spec.key, { status: 'loading' })
+    // Keep a reference to this load's entry: if the tile is evicted and
+    // re-requested while this load is in flight, the entry is replaced and this
+    // (now stale) load must not write its results back over the newer one.
+    const entry = { status: 'loading' }
+    this.tiles.set(spec.key, entry)
     this.accessOrder.push(spec.key)
 
     try {
@@ -224,7 +231,7 @@ class QmTileManager {
       if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${spec.url}`)
       const buffer = await response.arrayBuffer()
 
-      if (!this.tiles.has(spec.key)) return  // evicted while loading
+      if (this.tiles.get(spec.key) !== entry) return  // evicted or superseded while loading
 
       const { triangleCount, indices, u: uArr, v: vArr, elevation: elevArr } =
         parseQuantizedMesh(buffer)
@@ -261,7 +268,7 @@ class QmTileManager {
       const satCrsBbox = { minX: mnSX, maxX: mxSX, minY: mnSY, maxY: mxSY }
 
       if (this.tiles.size > MAX_TILE_CACHE) {
-        for (const k of this.accessOrder) {
+        for (const k of [...this.accessOrder]) {
           if (k !== spec.key && !this._neededKeys.has(k) && this.tiles.has(k)) {
             this._evictTile(k)
             if (this.tiles.size <= MAX_TILE_CACHE) break
@@ -283,9 +290,13 @@ class QmTileManager {
       })
       this.onLoad()
     } catch (err) {
-      this.tiles.delete(spec.key)
-      const i = this.accessOrder.indexOf(spec.key)
-      if (i >= 0) this.accessOrder.splice(i, 1)
+      // Only remove the entry if it is still this load's — a newer load for the
+      // same key may already be in flight and must not be disturbed.
+      if (this.tiles.get(spec.key) === entry) {
+        this.tiles.delete(spec.key)
+        const i = this.accessOrder.indexOf(spec.key)
+        if (i >= 0) this.accessOrder.splice(i, 1)
+      }
       console.warn(`[QmTerrainImpl] ${err.message}`)
     }
   }

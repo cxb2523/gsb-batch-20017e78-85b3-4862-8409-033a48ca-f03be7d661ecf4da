@@ -129,7 +129,7 @@ class TerrainColumn extends ColumnData {
 
 // ─── DtmTileManager ──────────────────────────────────────────────────────────
 
-class DtmTileManager {
+export class DtmTileManager {
   constructor({ regl, source, dtmTileCrs, plotCrs, satTileCrs, tessellation,
                 xTexFns, zTexFns, dtmTexFns,
                 satTexFns, satUvXTexFns, satUvYTexFns, dtmUvRangeFns,
@@ -149,6 +149,9 @@ class DtmTileManager {
     this.accessOrder = []
     this._neededKeys = new Set()
     this._neededSpecs = []
+    // Slots referenced by the current render items — imagery is requested only
+    // for these footprints, keeping sat requests in sync with what is rendered.
+    this._activeSlots = []
     this._lastXDomain = null
     this._lastYDomain = null
     this._lastViewport = null
@@ -322,13 +325,14 @@ class DtmTileManager {
   requestSatTiles(viewport) {
     const satCache = this._satCacheRef.cache
     if (!satCache) return
-    for (const [key, tile] of this.tiles.entries()) {
-      if (tile.status !== 'loaded') continue
-      // For WMS/COG, only request sat tiles for the current needed tile(s).
-      // Old tiles accumulate in the cache (different bbox per pan position)
-      // and would otherwise trigger sat tile requests for stale positions every frame.
-      if ((this.source.type === 'wms' || this.source.type === 'cog') && !this._neededKeys.has(key)) continue
-      satCache.requestForBbox(tile.slot.satCrsBbox, viewport)
+    // Request imagery only for the slots used by the current render items
+    // (needed tiles and ancestor fallbacks). Requesting for every cached tile
+    // would keep stale footprints alive and overflow the sat cache, causing an
+    // evict-reload loop. beginFrame() marks the keys requested this frame so
+    // the sat cache never evicts imagery the current render items rely on.
+    satCache.beginFrame()
+    for (const slot of this._activeSlots) {
+      satCache.requestForBbox(slot.satCrsBbox, viewport)
     }
   }
 
@@ -385,6 +389,11 @@ class DtmTileManager {
         }
       }
     }
+
+    // Record the slots the current render items depend on — requestSatTiles()
+    // asks the sat cache for exactly these footprints (including slots that have
+    // no sat tile yet, so missing imagery gets requested).
+    this._activeSlots = renderItems.map(item => item.slot)
 
     // Push fn[] entries, computing sat UVs once per ancestor slot.
     const computedSlots = new Set()
@@ -451,14 +460,18 @@ class DtmTileManager {
   }
 
   async _loadTile(spec) {
-    this.tiles.set(spec.key, { status: 'loading' })
+    // Keep a reference to this load's entry: if the tile is evicted and
+    // re-requested while this load is in flight, the entry is replaced and this
+    // (now stale) load must not write its results back over the newer one.
+    const entry = { status: 'loading' }
+    this.tiles.set(spec.key, entry)
     this.accessOrder.push(spec.key)
     try {
       let dtmTex
       if (spec.type === 'cog' || spec.type === 'cogTiles') {
         const cogSource = spec.type === 'cogTiles' ? { ...this.source, url: spec.url } : this.source
         const result = await fetchCogData(cogSource, spec.bbox, spec.width, spec.height, 'nearest')
-        if (!this.tiles.has(spec.key)) return
+        if (this.tiles.get(spec.key) !== entry) return
         if (!result) throw new Error(`COG DTM fetch returned no data for ${spec.key}`)
         if (result.isFloat) {
           // Pad single-channel float32 into RGBA float so WebGL 2 can sample it.
@@ -478,7 +491,7 @@ class DtmTileManager {
           img.onerror = () => reject(new Error(`Failed to load DTM tile: ${spec.url}`))
           img.src = spec.url
         })
-        if (!this.tiles.has(spec.key)) return
+        if (this.tiles.get(spec.key) !== entry) return
         dtmTex = this.regl.texture({ data: img, flipY: false, min: 'nearest', mag: 'nearest', format: 'rgba', type: 'uint8' })
       }
 
@@ -511,8 +524,11 @@ class DtmTileManager {
           if (k !== spec.key && !this._neededKeys.has(k)) this._evictTile(k)
         }
       } else if (this.tiles.size > MAX_TILE_CACHE) {
-        for (const k of this.accessOrder) {
-          if (k !== spec.key && this.tiles.has(k)) {
+        // Evict least-recently-loaded tiles, but never tiles the current view
+        // still needs — evicting a needed tile punches a hole that is only
+        // re-requested on the next domain change, then immediately evicted again.
+        for (const k of [...this.accessOrder]) {
+          if (k !== spec.key && !this._neededKeys.has(k) && this.tiles.has(k)) {
             this._evictTile(k)
             if (this.tiles.size <= MAX_TILE_CACHE) break
           }
@@ -527,9 +543,13 @@ class DtmTileManager {
       this._rebuildArrays()
       this.onLoad()
     } catch (err) {
-      this.tiles.delete(spec.key)
-      const i = this.accessOrder.indexOf(spec.key)
-      if (i >= 0) this.accessOrder.splice(i, 1)
+      // Only remove the entry if it is still this load's — a newer load for the
+      // same key may already be in flight and must not be disturbed.
+      if (this.tiles.get(spec.key) === entry) {
+        this.tiles.delete(spec.key)
+        const i = this.accessOrder.indexOf(spec.key)
+        if (i >= 0) this.accessOrder.splice(i, 1)
+      }
       console.warn(`[TerrainTileLayer] ${err.message}`,
         '| spec.bbox', spec.bbox, '| dtmTileCrs', this.dtmTileCrs,
         '| plotCrs', this.plotCrs, '| satTileCrs', this.satTileCrs)
@@ -551,6 +571,16 @@ export class SatTileCache {
     this.onLoad = onLoad
     this.tiles = new Map()
     this.accessOrder = []
+    // Sat tile keys requested since the last beginFrame() — protected from
+    // eviction so imagery used by current render items is never destroyed.
+    this._neededKeys = new Set()
+  }
+
+  // Called by the terrain manager once per frame, before its requestForBbox()
+  // calls. Keys requested during the frame are treated as needed and will not
+  // be evicted; keys no longer requested become eviction candidates.
+  beginFrame() {
+    this._neededKeys = new Set()
   }
 
   // Returns { texture, bounds, key } for the best available sat tile covering satCrsBbox,
@@ -586,6 +616,7 @@ export class SatTileCache {
     const source = this.source
     if (source.type === 'wms') {
       const key = this._wmsKey(satCrsBbox)
+      this._neededKeys.add(key)
       if (!this.tiles.has(key)) {
         const url = buildWmsUrl(source, satCrsBbox, this.satTileCrs, viewport?.width ?? 256, viewport?.height ?? 256)
         this._loadTile({ key, url, bounds: satCrsBbox })
@@ -619,6 +650,7 @@ export class SatTileCache {
     }
 
     const key = `${z}/${tx}/${ty}`
+    this._neededKeys.add(key)
     if (!this.tiles.has(key)) {
       const url    = source.type === 'wmts' ? buildWmtsUrl(source, z, tx, ty) : buildXyzUrl(source, z, tx, ty)
       const bounds = tileToMercBbox(tx, ty, z)
@@ -627,7 +659,11 @@ export class SatTileCache {
   }
 
   async _loadTile({ key, url, bounds }) {
-    this.tiles.set(key, { status: 'loading' })
+    // Keep a reference to this load's entry: if the tile is evicted and
+    // re-requested while this load is in flight, the entry is replaced and this
+    // (now stale) load must not write its texture back over the newer one.
+    const entry = { status: 'loading' }
+    this.tiles.set(key, entry)
     this.accessOrder.push(key)
     try {
       const img = new Image()
@@ -637,13 +673,16 @@ export class SatTileCache {
         img.onerror = () => reject(new Error(`Failed to load sat tile: ${url}`))
         img.src = url
       })
-      if (!this.tiles.has(key)) return
+      if (this.tiles.get(key) !== entry) return
       const texture = this.regl.texture({ data: img, flipY: false, min: 'linear', mag: 'linear' })
       this.tiles.set(key, { status: 'loaded', texture, bounds })
       console.log('[Terrain] sat tile loaded', key, 'bounds', bounds, img.width, 'x', img.height)
       if (this.tiles.size > MAX_TILE_CACHE) {
-        for (const k of this.accessOrder) {
-          if (k !== key && this.tiles.has(k)) {
+        // Evict least-recently-loaded tiles, but never imagery requested for the
+        // current frame — destroying a texture a render item still references
+        // leaves holes and dangling references to destroyed GPU textures.
+        for (const k of [...this.accessOrder]) {
+          if (k !== key && !this._neededKeys.has(k) && this.tiles.has(k)) {
             this.tiles.get(k).texture?.destroy()
             this.tiles.delete(k)
             this.accessOrder.splice(this.accessOrder.indexOf(k), 1)
@@ -653,9 +692,13 @@ export class SatTileCache {
       }
       this.onLoad()
     } catch (err) {
-      this.tiles.delete(key)
-      const i = this.accessOrder.indexOf(key)
-      if (i >= 0) this.accessOrder.splice(i, 1)
+      // Only remove the entry if it is still this load's — a newer load for the
+      // same key may already be in flight and must not be disturbed.
+      if (this.tiles.get(key) === entry) {
+        this.tiles.delete(key)
+        const i = this.accessOrder.indexOf(key)
+        if (i >= 0) this.accessOrder.splice(i, 1)
+      }
       console.warn(`[TerrainTileLayer] ${err.message}`)
     }
   }
@@ -667,6 +710,8 @@ export class SatTileCache {
   destroy() {
     for (const tile of this.tiles.values()) tile.texture?.destroy()
     this.tiles.clear()
+    this.accessOrder.length = 0
+    this._neededKeys.clear()
   }
 }
 
