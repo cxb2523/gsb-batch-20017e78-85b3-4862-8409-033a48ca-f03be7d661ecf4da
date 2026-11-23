@@ -363,6 +363,17 @@ export class Sim {
   // Scratch arrays reused every tick inside resolveHits, preallocated once
   // so the hot path never allocates.
   private readonly activeFlag: Uint8Array;
+  // Per-tick, transient (never part of saveState/loadState) record of which
+  // fighters began the current tick inside a hitstop freeze. stepFighter
+  // decrements HITSTOP_TICKS toward zero, so by the time resolveHitsFor runs
+  // later in the same advance() a fighter whose freeze just elapsed reads 0
+  // -- this flag preserves the "was frozen for this whole tick" fact that
+  // hit resolution needs to gate an already-active hitbox. A fighter frozen
+  // at tick start produces no new hit judgements that tick; the flag is
+  // rebuilt every advance(), so a freeze ending on tick N restores normal
+  // hit production on tick N+1. Not serialized: it is purely a function of
+  // HITSTOP_TICKS at tick start, so save/load and rollback stay exact.
+  private readonly frozenFlag: Uint8Array;
   private readonly itemsData: Int32Array;
   private readonly hazardsData: Int32Array;
   private readonly itemSet: ItemSet;
@@ -390,6 +401,7 @@ export class Sim {
     this.data = new Int32Array(numFighters * FighterField.FIELD_COUNT);
     this.dedup = new Int32Array(numFighters * numFighters);
     this.activeFlag = new Uint8Array(numFighters);
+    this.frozenFlag = new Uint8Array(numFighters);
     this.grid = new SpatialGrid(numFighters);
     this.rng = seedRng(seed);
     this.characters =
@@ -912,6 +924,11 @@ export class Sim {
       this.tick = (this.tick + 1) | 0;
       return;
     }
+    // Rebuild the transient frozen-at-tick-start table before anyone steps.
+    // stepFighter marks each fighter whose HITSTOP_TICKS is still positive;
+    // resolveHitsFor reads it afterward to suppress hit production for the
+    // remainder of this tick (see frozenFlag's declaration comment).
+    this.frozenFlag.fill(0);
     for (let i = 0; i < this.numFighters; i++) {
       this.stepFighter(i, inputs[i] as InputFrame);
     }
@@ -1026,6 +1043,11 @@ export class Sim {
     // invulnerability. See knockback.ts HITSTOP_* for how long this is.
     const hitstopTicks = d[base + FighterField.HITSTOP_TICKS] as number;
     if (hitstopTicks > 0) {
+      // Record that this fighter spends the whole tick frozen, so
+      // resolveHitsFor (which runs after every fighter has stepped) can
+      // suppress any hitbox this fighter still has active from before the
+      // freeze -- a frozen attacker must not generate new hit judgements.
+      this.frozenFlag[index] = 1;
       d[base + FighterField.HITSTOP_TICKS] = (hitstopTicks - 1) | 0;
       return;
     }
@@ -1322,6 +1344,12 @@ export class Sim {
     const d = this.data;
     const aBase = attacker * FighterField.FIELD_COUNT;
     if ((d[aBase + FighterField.STATE] as number) !== FighterStateId.ATTACK) return;
+    // A fighter frozen by hitstop produces no hit judgements this tick, even
+    // though the move's active window (and thus its hitbox) is still on
+    // screen: stepFighter froze its move timing and this gate suppresses the
+    // hitbox itself. Once HITSTOP_TICKS reaches zero, frozenFlag is no longer
+    // set for this fighter and hit resolution resumes normally.
+    if (this.frozenFlag[attacker] === 1) return;
 
     const attackerChar = this.characters[attacker] as CharacterData;
     const moveId = d[aBase + FighterField.MOVE_ID] as number;
@@ -2021,6 +2049,11 @@ export class Sim {
     d[base + FighterField.VEL_Y] = 0;
     d[base + FighterField.HITSTUN] = 0;
     d[base + FighterField.SHIELD_STUN] = 0;
+    // A life ends here: any in-flight impact freeze belongs to the life that
+    // just ended, so clear it rather than letting the countdown bleed into
+    // the RESPAWN timer (stepFighter's frozen branch would otherwise eat
+    // respawn ticks) or survive onto a parked DEAD fighter.
+    d[base + FighterField.HITSTOP_TICKS] = 0;
 
     if (!respawns && stocksAfter <= 0) {
       d[base + FighterField.ELIMINATED] = 1;
