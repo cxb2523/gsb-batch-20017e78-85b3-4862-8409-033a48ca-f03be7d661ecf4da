@@ -36,6 +36,10 @@ export interface ClodAsset {
   stream?: true;
   loadTo?(level: number): Promise<void>;
   loading?: Promise<void> | null;
+  /** Streaming assets only: finest level requested while a fetch is in flight (255 = none). */
+  targetLevel?: number;
+  /** Finest level the last selection frame asked for; reset each frame by ClodSelector. */
+  wantLevel?: number;
   [key: string]: unknown;
 }
 

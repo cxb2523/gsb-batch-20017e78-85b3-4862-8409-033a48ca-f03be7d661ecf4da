@@ -90,28 +90,54 @@ export async function loadClodStream(base, name, options = {}) {
   let vEnd = 0, iEnd = 0;
   const grow = (old, add) => { const n = new old.constructor(old.length + add.length); n.set(old); n.set(add, old.length); return n; };
   a.loading = null; a.requests = 0;
+  // Finest level anyone has asked for since the last completed load (255 = nobody wants finer).
+  // Distinct from wantLevel: wantLevel is reset per selection frame, targetLevel survives until
+  // a load actually reaches it, so requests made while a fetch is in flight are not dropped.
+  a.targetLevel = 255;
   // fetch geometry down to `level` and swap in a bigger geometry
   a.loadTo = (level) => {
-    if (a.loading) return a.loading;
+    if (a.loading) {
+      // A fetch is in flight: merge into it instead of starting a parallel one. Every level is a
+      // whole-file prefix, so the merged request only needs to extend to the finest target once
+      // the current fetch settles; coarser requests never undo a finer one.
+      if (level < a.targetLevel) a.targetLevel = level;
+      return a.loading;
+    }
     const r = LR.find((l) => l.level === level) || LR[LR.length - 1];
-    if (r.vertexEnd <= vEnd && r.indexEnd <= iEnd) { a.loadedLevel = Math.min(a.loadedLevel, r.level); return Promise.resolve(); }
-    a.loading = (async () => {
-      const [p, n, u, i] = await Promise.all([range('positions', vEnd * 3, r.vertexEnd * 3), range('normals', vEnd * 4, r.vertexEnd * 4), range('uvs', vEnd * 2, r.vertexEnd * 2), range('indices', iEnd, r.indexEnd)]);
-      a.requests += 4;
-      a.pos = grow(a.pos, p); a.nrm = grow(a.nrm, n); a.uv = grow(a.uv, u); a.idx = grow(a.idx, i);
-      vEnd = r.vertexEnd; iEnd = r.indexEnd;
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(a.pos, 3));
-      geo.setAttribute('normal', new THREE.BufferAttribute(a.nrm, 4, true));
-      geo.setAttribute('uv', new THREE.BufferAttribute(a.uv, 2));
-      geo.setIndex(new THREE.BufferAttribute(a.idx, 1));
-      geo.boundingSphere = a.sphere;
-      const old = a.geometry; a.geometry = geo;
-      for (const b of a.batches) b.geometry = geo;
-      if (old) old.dispose();
-      a.loadedLevel = r.level; a.residentBytes = r.bytes; a.loading = null;
+    if (r.vertexEnd <= vEnd && r.indexEnd <= iEnd) {
+      a.targetLevel = 255; // already resident: nothing to do
+      return Promise.resolve();
+    }
+    a.targetLevel = r.level;
+    const job = (async () => {
+      try {
+        const [p, n, u, i] = await Promise.all([range('positions', vEnd * 3, r.vertexEnd * 3), range('normals', vEnd * 4, r.vertexEnd * 4), range('uvs', vEnd * 2, r.vertexEnd * 2), range('indices', iEnd, r.indexEnd)]);
+        a.requests += 4;
+        a.pos = grow(a.pos, p); a.nrm = grow(a.nrm, n); a.uv = grow(a.uv, u); a.idx = grow(a.idx, i);
+        vEnd = r.vertexEnd; iEnd = r.indexEnd;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(a.pos, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(a.nrm, 4, true));
+        geo.setAttribute('uv', new THREE.BufferAttribute(a.uv, 2));
+        geo.setIndex(new THREE.BufferAttribute(a.idx, 1));
+        geo.boundingSphere = a.sphere;
+        const old = a.geometry; a.geometry = geo;
+        for (const b of a.batches) b.geometry = geo;
+        if (old) old.dispose();
+        a.loadedLevel = r.level; a.residentBytes = r.bytes;
+        const next = a.targetLevel;
+        a.targetLevel = 255;
+        a.loading = null; // release before the chained fetch so it starts a real request, not a merge
+        if (next < r.level) return a.loadTo(next); // finer requests merged in while we were fetching
+      } catch (e) {
+        // Do not leave the asset stuck in loading: the next updateStreaming() must be able to
+        // retry. targetLevel still holds the wanted level, so the retry aims at the same target.
+        a.loading = null;
+        throw e;
+      }
     })();
-    return a.loading;
+    a.loading = job;
+    return job;
   };
   // root "page": as many top levels as fit in rootBytes, but always every cluster of the virtual root group
   let rootLevel = LR[0].level;
@@ -126,13 +152,20 @@ export async function loadClodStream(base, name, options = {}) {
 /**
  * Call once per frame after ClodSelector.select() for assets from loadClodStream: starts a fetch for
  * every asset whose last selection wanted finer levels than are loaded. Returns the pending promises.
+ *
+ * wantLevel is reset per selection frame inside ClodSelector.select(), not here: a finer want that
+ * arrives while a fetch is in flight must be merged into that fetch by loadTo() instead of being
+ * wiped, and batches sharing an asset must see each other's wants within the same frame.
  */
 export function updateStreaming(assets) {
   const pending = [];
   for (const a of assets) {
     if (!a.stream) continue;
-    if (a.wantLevel < a.loadedLevel && !a.loading) pending.push(a.loadTo(a.wantLevel));
-    a.wantLevel = 255;
+    if (a.wantLevel < a.loadedLevel) {
+      const wasLoading = !!a.loading;
+      const p = a.loadTo(a.wantLevel); // merges into an in-flight fetch instead of duplicating it
+      if (!wasLoading) pending.push(p); // only newly started fetches are part of this frame's contract
+    }
   }
   return pending;
 }
@@ -291,6 +324,12 @@ export class ClodSelector {
     let occ = 0;
     for (const b of this.batches) { occ += b.prepare(camPos, this.frustum, this.hzb || null); b._n = 0; }
     this.stats.occluded = occ;
+    // Reset the per-frame "wanted level" before any batch writes it. Several batches can share one
+    // asset; each then takes the min with the wants already recorded this frame instead of
+    // overwriting them, so a coarse want can never clobber another batch's finer want.
+    const resetAssets = this._resetAssets || (this._resetAssets = new Set());
+    resetAssets.clear();
+    for (const b of this.batches) { const a = b.asset; if (a.stream && !resetAssets.has(a)) { resetAssets.add(a); a.wantLevel = 255; } }
     this.frame++;
     const st = this.stats; st.tris = 0; st.clusters = 0; st.visited = 0;
     if (opts.budget > 0) this._selectBudget(opts.errorPx, opts.budget);
@@ -302,7 +341,8 @@ export class ClodSelector {
 
   _selectThreshold(b, t) {
     const a = b.asset, gF = a.groupF, cF = a.clusterF, cU = a.clusterU, mOff = a.memberOff, mIds = a.memberIds;
-    const minLv = a.minMemberLevel, loaded = a.loadedLevel; let want = a.wantLevel;
+    const minLv = a.minMemberLevel, loaded = a.loadedLevel;
+    // another batch of the same asset may have written a finer want earlier this frame
     const dstack = this._dstack || (this._dstack = new Int32Array(8192));
     const K = this.K, cull = this.frustumCull, stamp = b.stamp, stack = this._stack || (this._stack = new Int32Array(8192));
     let n = b._n, tris = 0, visited = 0;
@@ -321,7 +361,7 @@ export class ClodSelector {
             const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - gF[o + 3];
             if (d <= 1e-6 || gF[o + 4] * K > t * d) { // source group still too coarse: refine
               if (minLv[s] < loaded) { // finer data not resident: draw this cluster as a leaf and ask for more
-                if (minLv[s] < want) want = minLv[s];
+                if (minLv[s] < a.wantLevel) a.wantLevel = minLv[s];
                 if (stamp[s] !== sid && !a.loading) {
                   stamp[s] = sid; let dp = 0; dstack[dp++] = s;
                   while (dp > 0) {
@@ -332,7 +372,7 @@ export class ClodSelector {
                       if (!(d2 <= 1e-6 || gF[o2 + 4] * K > t * d2)) continue;
                       stamp[s2] = sid;
                       if (cull) { let vis = true; const x = gF[o2], y = gF[o2 + 1], z = gF[o2 + 2], r = gF[o2 + 3]; for (let q = po; q < po + 24; q += 4) if (pl[q] * x + pl[q + 1] * y + pl[q + 2] * z + pl[q + 3] < -r) { vis = false; break; } if (!vis) continue; }
-                      if (minLv[s2] < want) want = minLv[s2];
+                      if (minLv[s2] < a.wantLevel) a.wantLevel = minLv[s2];
                       dstack[dp++] = s2;
                     }
                   }
@@ -357,7 +397,7 @@ export class ClodSelector {
         }
       }
     }
-    b._n = n; this.stats.tris += tris / 3; this.stats.visited += visited; a.wantLevel = want;
+    b._n = n; this.stats.tris += tris / 3; this.stats.visited += visited;
   }
 
   // ---- budget mode: refine the globally worst group first until the triangle budget is spent

@@ -146,7 +146,7 @@ Fetches `<base>/<name>.json` and `<base>/<name>.bin` whole. The asset holds `met
 Loads the hierarchy and the coarsest levels that fit in `rootBytes`, and fetches finer levels later with Range requests. Use with `updateStreaming`. Useful fields: `loadedLevel` (0 means everything is loaded), `residentBytes`, `fullBytes`. Streaming assets cannot be used with `DiscreteLodSet`.
 
 **`updateStreaming(assets)`** → `Promise[]`
-Call once per frame after `select()`. Starts a fetch for each streaming asset whose last selection wanted finer levels than it has.
+Call once per frame after `select()`. Starts a fetch for each streaming asset whose last selection wanted finer levels than it has. Wants that arrive while a fetch is in flight are merged into it (the fetch chains onward to the finest wanted level once it settles), batches sharing an asset keep the finest want of the frame, and a failed fetch clears the loading state so the next call retries automatically. The returned array holds only fetches started by this call.
 
 **`loadClodMaterial(base, asset, params?)`** → `MeshStandardMaterial`
 Convenience: wires up the base colour, normal and occlusion/roughness/metal textures and the material factors that the preprocessor copied out of the GLB. `params` overrides anything.
