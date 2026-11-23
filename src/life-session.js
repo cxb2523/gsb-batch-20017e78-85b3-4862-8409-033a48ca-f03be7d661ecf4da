@@ -90,7 +90,14 @@ class LifeSession{
     if(!Number.isFinite(event.at))throw new Error('life event time must be finite');
     if(this.events.length>=LIFE_LIMITS.events)throw new Error('life event queue budget exceeded');
     const row={...clone(event),id:event.id||`event:${this.sequence++}`};
-    this.events.push(row);this.events.sort(eventOrder);
+    /* The id is the event's identity across scene rebuilds. A scene rebuild
+       replays the same deterministic schedules against the same session, so a
+       re-scheduled id replaces its row instead of being counted a second time.
+       The clock and sequence only ever move forward. */
+    const existing=this.events.findIndex((q)=>q.id===row.id);
+    if(existing>=0)this.events.splice(existing,1,row);
+    else this.events.push(row);
+    this.events.sort(eventOrder);
     this.metrics.maxQueue=Math.max(this.metrics.maxQueue,this.events.length);
     const record=row.recordId&&this.record(row.recordId);
     if(record&&(record.nextEventAt===null||row.at<record.nextEventAt))record.nextEventAt=row.at;
@@ -300,7 +307,11 @@ class LifeSession{
   addTrace(trace){
     const row={...clone(trace),id:trace.id||`trace:${this.sequence++}`,
       at:trace.at??this.clock.minute};
-    this.traces.push(row);
+    /* Identity idempotency: replaying a rebuild re-asserts the same trace
+       instead of leaving a second copy in the bounded ledger. */
+    const existing=this.traces.findIndex((q)=>q.id===row.id);
+    if(existing>=0)this.traces.splice(existing,1,row);
+    else this.traces.push(row);
     if(this.traces.length>LIFE_LIMITS.traces)
       this.traces.splice(0,this.traces.length-LIFE_LIMITS.traces);
     if(row.expiresAt!==undefined)this.schedule({
@@ -312,7 +323,10 @@ class LifeSession{
   addDisturbance(disturbance){
     const row={...clone(disturbance),id:disturbance.id||`disturbance:${this.sequence++}`,
       at:disturbance.at??this.clock.minute};
-    this.disturbances.push(row);
+    /* Ledger rows are keyed by id, so a rebuild cannot double-book one event. */
+    const existing=this.disturbances.findIndex((q)=>q.id===row.id);
+    if(existing>=0)this.disturbances.splice(existing,1,row);
+    else this.disturbances.push(row);
     if(this.disturbances.length>LIFE_LIMITS.disturbances)
       this.disturbances.splice(0,this.disturbances.length-LIFE_LIMITS.disturbances);
     return row;

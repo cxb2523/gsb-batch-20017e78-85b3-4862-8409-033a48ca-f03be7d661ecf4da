@@ -86,3 +86,51 @@ test('memories and event work are explicitly bounded',()=>{
   assert.equal(s.processDue(start),LIFE_LIMITS.eventsPerStep);
   assert.ok(s.events.length>=5);
 });
+
+test('re-scheduling an event id replaces the row instead of double counting it',()=>{
+  /* A scene rebuild replays deterministic schedules against the same session.
+     The event id is the identity the clock and sequence advance over, so the
+     replay must hold one row per id. */
+  const s=makeSession();
+  s.schedule({id:'replay:1',at:10,type:'observation',recordId:'cohort:roe:1',
+    observation:{id:'o:1',kind:'sound',salience:0.2}});
+  s.schedule({id:'replay:1',at:20,type:'observation',recordId:'cohort:roe:1',
+    observation:{id:'o:2',kind:'sight',salience:0.7}});
+  const replay=s.events.filter((q)=>q.id==='replay:1');
+  assert.equal(replay.length,1);
+  assert.equal(replay[0].at,20);
+  assert.equal(s.processDue(20),s.events.length);
+  assert.equal(s.record('cohort:roe:1').memories.length,1,
+    'the replaced observation fired twice');
+  assert.equal(s.record('cohort:roe:1').memories[0].kind,'sight');
+});
+
+test('trace and disturbance ledgers stay idempotent under replay',()=>{
+  const s=makeSession();
+  s.addTrace({id:'trace:1',kind:'hoof-print',x:1,y:1});
+  s.addTrace({id:'trace:1',kind:'hoof-print',x:2,y:2});
+  assert.equal(s.traces.length,1);
+  assert.deepEqual([s.traces[0].x,s.traces[0].y],[2,2]);
+  s.addDisturbance({id:'dist:1',type:'traffic',patchId:'p:1',intensity:0.4});
+  s.addDisturbance({id:'dist:1',type:'traffic',patchId:'p:1',intensity:0.8});
+  assert.equal(s.disturbances.length,1);
+  assert.equal(s.disturbances[0].intensity,0.8);
+  /* the bounded ledgers still accept distinct rows after a replay */
+  s.addTrace({id:'trace:2',kind:'hoof-print',x:3,y:3});
+  assert.equal(s.traces.length,2);
+});
+
+test('the event queue keeps its time ordering after an in-place replacement',()=>{
+  const s=makeSession();
+  s.schedule({id:'a',at:30,type:'observation',recordId:'cohort:roe:1',
+    observation:{id:'oa',kind:'sound'}});
+  s.schedule({id:'b',at:10,type:'observation',recordId:'cohort:roe:1',
+    observation:{id:'ob',kind:'sound'}});
+  /* replacement that moves earlier must re-sort, never strand the queue */
+  s.schedule({id:'a',at:5,type:'observation',recordId:'cohort:roe:1',
+    observation:{id:'oa2',kind:'sound'}});
+  const ids=s.events.filter((q)=>q.id==='a'||q.id==='b');
+  assert.deepEqual(ids.map((q)=>q.id),['a','b']);
+  assert.deepEqual(ids.map((q)=>q.at),[5,10]);
+});
+

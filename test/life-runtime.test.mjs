@@ -42,6 +42,48 @@ test('runtime installs stable plans into a persistent cross-scene session',()=>{
   assert.ok(life.records().every((q)=>q.commitment&&q.nextEventAt!==null));
 });
 
+test('rebuilding a scene plan over the same session never duplicates records or events',()=>{
+  /* The renderer disposes and rebuilds a Scene on every portal round trip. The
+     LifeRuntime for the same world is reconstructed against the same session,
+     so installing its plan a second time must be a no-op on identities. */
+  const {session}=runtime(57);
+  const gen=makeWorldGen(57,OPT);
+  const recordsBefore=session.records.size;
+  const eventsBefore=session.events.length;
+  const idsBefore=session.events.map((q)=>q.id).sort();
+  const again=new LifeRuntime(session,gen,'frostwood');
+  assert.equal(session.records.size,recordsBefore,
+    're-installing a plan added a second copy of a record');
+  assert.equal(session.events.length,eventsBefore,
+    're-installing a plan re-initialized a scheduled event');
+  assert.deepEqual(session.events.map((q)=>q.id).sort(),idsBefore);
+  assert.deepEqual(again.records().map((q)=>q.id).sort(),
+    [...session.records.values()].filter((q)=>q.sceneId==='frostwood')
+      .map((q)=>q.id).sort());
+});
+
+test('two scene plans share one session and keep their events partitioned',()=>{
+  /* A portal into the meadow installs its roster alongside frostwood's, then
+     the frostwood runtime rebuilds and still owns only its own records. */
+  const session=new LifeSession(59);
+  const frostGen=makeWorldGen(59,OPT);
+  const frost=new LifeRuntime(session,frostGen,'frostwood');
+  const frostIds=frost.records().map((q)=>q.id).sort();
+  const meadowGen=makeWorldGen(59,{biome:'meadow',lake:0.35,density:0.50});
+  const meadow=new LifeRuntime(session,meadowGen,'meadow');
+  const meadowIds=meadow.records().map((q)=>q.id).sort();
+  assert.ok(meadowIds.length>0);
+  assert.equal(new Set([...frostIds,...meadowIds]).size,frostIds.length+meadowIds.length,
+    'the two worlds share a record id');
+  const frostAgain=new LifeRuntime(session,frostGen,'frostwood');
+  assert.deepEqual(frostAgain.records().map((q)=>q.id).sort(),frostIds);
+  /* every queued event resolves to a record the session still holds */
+  for(const event of session.events)
+    if(event.recordId)assert.ok(session.record(event.recordId),
+      `event ${event.id} points at a missing record`);
+});
+
+
 test('nearby realization is budgeted and preserves member identity on return',()=>{
   const {session,life}=runtime(43);
   const first=life.reconcile(0,0,1200,900);
