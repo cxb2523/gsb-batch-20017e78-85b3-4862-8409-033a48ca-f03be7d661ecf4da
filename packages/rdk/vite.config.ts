@@ -1,0 +1,81 @@
+import { resolve } from "node:path";
+
+import { defineConfig } from "vite";
+import dts from "vite-plugin-dts";
+
+/** Peer dependencies kept external (never bundled into the published package) */
+const EXTERNAL_DEPS = [
+  "react",
+  "react-dom",
+  "three",
+  "@ar-js-org/ar.js",
+  "locar",
+  "@react-three/fiber",
+  "@react-three/xr",
+  "onnxruntime-web",
+  "@mediapipe/tasks-vision",
+];
+
+const isExternal = (id: string): boolean =>
+  EXTERNAL_DEPS.some((ext) => id === ext || id.startsWith(`${ext}/`));
+
+/**
+ * Vite configuration.
+ * @see https://vite.dev/config
+ */
+const viteConfig = defineConfig(({ mode }) => ({
+  plugins: [
+    dts({
+      insertTypesEntry: true,
+      include: ["src/**/*"],
+      exclude: ["**/*.test.*", "**/*.spec.*"],
+      outDir: "build",
+    }),
+  ],
+  // Vite 8 resolves tsconfig `paths` (the `@/*` alias) natively
+  resolve: {
+    tsconfigPaths: true,
+  },
+  build: {
+    outDir: "build",
+    lib: {
+      entry: {
+        index: resolve(__dirname, "src/index.ts"),
+        engine: resolve(__dirname, "src/engine/index.ts"),
+        fiducial: resolve(__dirname, "src/fiducial/index.ts"),
+        geolocation: resolve(__dirname, "src/geolocation/index.ts"),
+        immersive: resolve(__dirname, "src/immersive/index.ts"),
+        magic: resolve(__dirname, "src/magic/index.ts"),
+        vision: resolve(__dirname, "src/vision/index.ts"),
+      },
+      formats: ["es", "cjs"],
+      fileName: (format, entryName) =>
+        `${entryName}.${format === "es" ? "js" : "cjs"}`,
+    },
+    minify: mode === "production",
+    rollupOptions: {
+      external: isExternal,
+      output: {
+        globals: {
+          react: "React",
+          "react-dom": "ReactDOM",
+          three: "THREE",
+          "@react-three/fiber": "ReactThreeFiber",
+          "@ar-js-org/ar.js": "ARjs",
+          "@react-three/xr": "ReactThreeXR",
+          locar: "LocAR",
+        },
+      },
+    },
+  },
+  // The ONNX worker is a separate bundle; externalize its deps too so
+  // onnxruntime-web is not inlined (the consumer resolves it as a peer dep)
+  worker: {
+    format: "es",
+    rollupOptions: {
+      external: isExternal,
+    },
+  },
+}));
+
+export default viteConfig;

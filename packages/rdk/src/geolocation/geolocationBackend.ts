@@ -1,0 +1,350 @@
+import { App, LocAR } from "locar";
+
+import { BACKEND_TYPES } from "@/lib/types/engine";
+
+import type { Size } from "@react-three/fiber";
+import type { DeviceOrientationControls, Webcam } from "locar";
+import type {
+  Camera,
+  Group,
+  PerspectiveCamera,
+  Scene,
+  WebGLRenderer,
+} from "three";
+import type { Backend, BackendInitArgs } from "@/lib/types/engine";
+
+/**
+ * GPS update event structure emitted by LocAR.
+ */
+// TODO grab type from LocAR.js once it's exported in TS
+export interface GpsUpdateEvent {
+  position: GeolocationPosition;
+  distMoved: number;
+}
+
+/**
+ * Anchor registration for tracking in the geolocation backend.
+ */
+export interface AnchorEntry {
+  anchor: Group;
+  isAttached: boolean;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  /** Called once attached to LocAR scene. Receives locar instance for coordinate conversion. */
+  onAttach?: (locar: LocAR) => void;
+  onGpsUpdate?: (position: GeolocationPosition, distMoved: number) => void;
+}
+
+export type GeolocationBackend<T> = Backend<T> & {
+  setSize: (newSize: Size) => void;
+};
+
+/**
+ * Internal state exposed by the geolocation backend.
+ */
+export interface GeolocationInternal {
+  locar: LocAR | null;
+  webcam: Webcam | null;
+  deviceOrientation: DeviceOrientationControls | null;
+  scene: Scene | null;
+  camera: Camera | null;
+  /** Last known GPS position. */
+  lastPosition: GeolocationPosition | null;
+  /** Register an anchor with the backend. */
+  registerAnchor: (id: string, entry: AnchorEntry) => void;
+  /** Unregister an anchor from the backend. */
+  unregisterAnchor: (id: string) => void;
+  /** Get an anchor entry by ID. */
+  getAnchor: (id: string) => AnchorEntry | undefined;
+}
+
+/**
+ * State returned by geolocation backend hook.
+ */
+export interface GeolocationBackendState extends GeolocationInternal {
+  /** Whether the backend is still initializing (not yet ready). */
+  isPending: boolean;
+  /** Whether the backend is initialized and ready to use. */
+  isSuccess: boolean;
+}
+
+/**
+ * Options for the geolocation backend.
+ */
+export interface GeolocationSessionOptions {
+  /** Mock latitude. Set if you want to start in fake GPS mode right away. */
+  fakeLat?: number;
+  /** Mock longitude. Set if you want to start in fake GPS mode right away. */
+  fakeLon?: number;
+  /** Custom webcam constraints. */
+  webcamConstraints?: MediaStreamConstraints;
+  /** Horizontal field of view. This will override any R3F canvas setting. LocAR will not render consistently between landscape and portrait without this. Defaults to 80. */
+  hFov?: number;
+  /**
+   * GPS update callback. Fires when a new GPS position is received.
+   * @param position Updated GPS position.
+   * @param distanceMoved Distance moved, in meters, since the last update.
+   */
+  onGpsUpdate?: (position: GeolocationPosition, distanceMoved: number) => void;
+}
+
+/**
+ * Create a location-based AR backend.
+ */
+const createGeolocationBackend = (
+  options?: GeolocationSessionOptions,
+): GeolocationBackend<GeolocationInternal> => {
+  // LocAR's App orchestrates the LocAR core, webcam feed and device orientation
+  // against our existing (react-three-fiber owned) camera, renderer and scene
+  let app: App | null = null;
+  let locar: LocAR | null = null;
+
+  let gpsUpdateHandler: ((data: GpsUpdateEvent) => void) | null = null;
+
+  // exposed so the React anchor can billboard to camera
+  let cameraRef: Camera | null = null;
+  let rendererRef: WebGLRenderer | null = null;
+  let sceneRef: Scene | null = null;
+  let sizeRef: Size | null = null;
+  let lastSize = { width: 0, height: 0 };
+
+  // anchor registry - moved from module-level globals in GeolocationAnchor
+  const anchorRegistry = new Map<string, AnchorEntry>();
+  let lastPosition: GeolocationPosition | null = null;
+
+  /**
+   * Add an anchor to the LocAR scene.
+   */
+  const attachAnchor = (entry: AnchorEntry) => {
+    if (!locar || entry.isAttached) return;
+
+    try {
+      locar.add(entry.anchor, entry.longitude, entry.latitude, entry.altitude);
+      entry.isAttached = true;
+      entry.onAttach?.(locar);
+    } catch (err) {
+      console.error("❌ Failed to attach anchor:", err);
+    }
+  };
+
+  // stable function refs (defined once per backend, not per `getInternal()` call)
+  const registerAnchor = (id: string, entry: AnchorEntry) => {
+    anchorRegistry.set(id, entry);
+
+    // if already a GPS position, attach immediately
+    if (lastPosition !== null && !entry.isAttached) {
+      attachAnchor(entry);
+      entry.onGpsUpdate?.(lastPosition, 0);
+    }
+  };
+
+  const unregisterAnchor = (id: string) => {
+    const entry = anchorRegistry.get(id);
+    if (entry?.isAttached) {
+      try {
+        entry.anchor.removeFromParent();
+      } catch (err) {
+        console.error(`⚠️ Error removing anchor ${id}:`, err);
+      }
+    }
+    anchorRegistry.delete(id);
+  };
+
+  const getAnchor = (id: string) => anchorRegistry.get(id);
+
+  return {
+    type: BACKEND_TYPES.GEOLOCATION,
+
+    async init(args: BackendInitArgs & { scene?: Scene; size: Size }) {
+      const { camera, renderer, scene, size } = args;
+
+      if (!scene)
+        throw new Error(
+          "[geolocationBackend] A THREE.Scene is required for location-based AR",
+        );
+
+      cameraRef = camera;
+      rendererRef = renderer;
+      sceneRef = scene;
+      sizeRef = size;
+
+      // ensure hfov is passed to the Three camera before it's passed to LocAR
+      const cam = cameraRef as PerspectiveCamera;
+      const hFov = options?.hFov ?? 80;
+
+      cam.fov = LocAR.htov(hFov, size.width / size.height);
+      cam.updateProjectionMatrix();
+
+      // App wires the LocAR core, webcam and device orientation against our
+      // existing three.js objects (LocAR >= 0.2.6 `threeObjects` option)
+      app = new App({
+        threeObjects: {
+          // TODO location-based AR assumes a perspective camera; narrow
+          // `BackendInitArgs.camera` to PerspectiveCamera or validate here
+          camera: camera as PerspectiveCamera,
+          renderer,
+          scene,
+        },
+        videoConstraints: (options?.webcamConstraints ?? {
+          video: { facingMode: "environment" },
+          // TODO narrow `webcamConstraints` to LocAR's `{ video: { facingMode } }` shape
+        }) as { video: { facingMode: string } },
+        deviceOrientationOptions: { enabled: true },
+        dimensionsProvider: () =>
+          sizeRef
+            ? { width: sizeRef.width, height: sizeRef.height }
+            : { width: 0, height: 0 },
+      });
+
+      // App renders the camera feed as a DOM <video> (object-fit: cover) behind
+      // the canvas, rather than a stretched `scene.background` texture. Clear the
+      // WebGL canvas to transparent so the feed shows through
+      renderer.setClearAlpha?.(0);
+
+      gpsUpdateHandler = (data: GpsUpdateEvent) => {
+        // store the last known position for new anchors
+        lastPosition = data.position;
+
+        // process all registered anchors
+        for (const entry of anchorRegistry.values()) {
+          if (!entry.isAttached) attachAnchor(entry);
+          entry.onGpsUpdate?.(data.position, data.distMoved);
+        }
+
+        // call session-level callback
+        options?.onGpsUpdate?.(data.position, data.distMoved);
+      };
+
+      // start() initializes the webcam + device orientation and resolves with the
+      // LocAR instance (which extends EventEmitter for gps events)
+      locar = await app.start();
+
+      // Rely on LocAR's default `deviceorientationabsolute` binding on every
+      // platform. An earlier iOS-driven rebind to the plain `deviceorientation`
+      // event was removed: on Android/Chrome it swapped absolute heading for the
+      // plain event's relative values and rotated the scene ~90deg
+      // (omnidotdev/rdk#140), and iOS tracks heading correctly on the default event
+      // (verified on-device), so the rebind is no longer needed
+
+      locar.on("gpsupdate", gpsUpdateHandler);
+
+      app.webcam?.on?.("webcamerror", (err) => {
+        console.error("[geolocationBackend] webcam error:", err);
+      });
+
+      app.deviceOrientationControls?.on?.("deviceorientationerror", (err) => {
+        console.error("[geolocationBackend] Device orientation error:", err);
+      });
+
+      // GPS events; just log here, components can listen via `getInternal()`
+      locar.on("gpserror", (err) => {
+        console.error("[geolocationBackend] gps error:", err);
+      });
+
+      // optional boot in fake mode
+      if (
+        typeof options?.fakeLat === "number" &&
+        typeof options?.fakeLon === "number"
+      ) {
+        locar.fakeGps(options.fakeLon, options.fakeLat);
+      } else {
+        // start GPS (0.2.x returns a Promise; errors surface via the gpserror event)
+        void locar.startGps();
+      }
+
+      // check for existing GPS position from LocAR
+      const lastLocation = locar.getLastKnownLocation();
+      if (lastLocation !== null) {
+        lastPosition = {
+          coords: {
+            longitude: lastLocation.longitude,
+            latitude: lastLocation.latitude,
+            accuracy: 0,
+            altitude: null,
+            altitudeAccuracy: null,
+            heading: null,
+            speed: null,
+            toJSON: () => lastLocation,
+          },
+          timestamp: Date.now(),
+          toJSON: () => lastLocation,
+        };
+      }
+    },
+
+    update() {
+      app?.deviceOrientationControls?.update?.();
+      if (
+        sizeRef !== null &&
+        (sizeRef.width !== lastSize.width || sizeRef.height !== lastSize.height)
+      ) {
+        lastSize = { width: sizeRef.width, height: sizeRef.height };
+        const aspect = sizeRef.width / sizeRef.height;
+        const cam = cameraRef as PerspectiveCamera;
+        cam.aspect = aspect;
+        cam.updateProjectionMatrix();
+        app?.syncFovWithWebcam(aspect);
+      }
+    },
+
+    dispose() {
+      if (locar && gpsUpdateHandler) {
+        locar.off("gpsupdate", gpsUpdateHandler);
+      }
+
+      locar?.stopGps?.();
+
+      // App's Webcam owns the <video> element and media stream; dispose() stops
+      // the tracks and removes the element (LocAR >= 0.2.5), then restore canvas
+      // opacity
+      app?.webcam?.dispose?.();
+      rendererRef?.setClearAlpha?.(1);
+
+      app?.deviceOrientationControls?.dispose?.();
+
+      // clean up all anchors
+      for (const entry of anchorRegistry.values()) {
+        if (entry.isAttached) {
+          try {
+            entry.anchor.removeFromParent();
+          } catch (err) {
+            console.error("⚠️ Error removing anchor:", err);
+          }
+        }
+      }
+      anchorRegistry.clear();
+
+      app = null;
+      locar = null;
+      cameraRef = null;
+      rendererRef = null;
+      sceneRef = null;
+      gpsUpdateHandler = null;
+      lastPosition = null;
+    },
+
+    setSize(newSize: Size) {
+      sizeRef = {
+        width: newSize.width,
+        height: newSize.height,
+        top: 0,
+        left: 0,
+      };
+    },
+
+    getInternal: (): GeolocationInternal => ({
+      locar,
+      webcam: app?.webcam ?? null,
+      deviceOrientation: app?.deviceOrientationControls ?? null,
+      scene: sceneRef,
+      camera: cameraRef,
+      lastPosition,
+      registerAnchor,
+      unregisterAnchor,
+      getAnchor,
+    }),
+  };
+};
+
+export default createGeolocationBackend;

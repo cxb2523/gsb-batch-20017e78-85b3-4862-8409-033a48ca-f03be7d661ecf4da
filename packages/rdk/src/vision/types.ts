@@ -1,0 +1,135 @@
+/** Single 3D landmark point */
+export type VisionLandmark = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+/** Detected landmark group (hand, face, or pose) with confidence */
+export type LandmarkDetection = {
+  landmarks: VisionLandmark[];
+  confidence: number;
+};
+
+/** Detected object with bounding box */
+export type ObjectDetection = {
+  label: string;
+  confidence: number;
+  bbox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+};
+
+/** A per-instance segmentation mask, cropped to its bounding box */
+export type SegmentationMask = {
+  label: string;
+  confidence: number;
+  /** Bounding box in source pixel coordinates */
+  bbox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  /** Row-major alpha values (0-255) covering the bbox, sized maskWidth x maskHeight */
+  mask: Uint8Array;
+  maskWidth: number;
+  maskHeight: number;
+};
+
+/** A single frame of vision detection results */
+export type VisionFrame = {
+  hands: LandmarkDetection[];
+  faces: LandmarkDetection[];
+  poses: LandmarkDetection[];
+  objects: ObjectDetection[];
+  /** Per-instance segmentation masks (present when a segmentation model runs) */
+  masks?: SegmentationMask[];
+  timestamp: number;
+  frameSize: { width: number; height: number };
+  processingTime?: number;
+  segmentationMask?: ImageData;
+};
+
+/** Supported vision tasks */
+export type VisionTask = "hands" | "faces" | "poses" | "objects";
+
+/** Identifier of a registered ONNX output decoder */
+export type ONNXDecoderName = "yolo" | "rfdetr" | "yoloseg";
+
+/** ONNX model configuration */
+export type ONNXModelConfig = {
+  name: string;
+  path: string;
+  /** Square input side length the model expects (default 640) */
+  inputSize?: number;
+  /** Class labels indexed by class id (defaults to COCO-80) */
+  labels?: string[];
+  /** Which registered decoder interprets this model's raw outputs (default "yolo") */
+  decoder?: ONNXDecoderName;
+};
+
+/** Progress callback payload */
+export type VisionProgress = {
+  step: number;
+  total: number;
+  label: string;
+};
+
+/** Options for creating a vision session */
+export type VisionSessionOptions = {
+  /** Which provider to use */
+  provider?: "mediapipe" | "onnx";
+  /** Vision tasks to enable */
+  tasks?: VisionTask[];
+  /** Minimum confidence threshold */
+  minConfidence?: number;
+  /** Maximum results per task */
+  maxResults?: number;
+  /** Frame processing throttle in ms */
+  throttle?: number;
+  /** Use GPU acceleration */
+  useGpu?: boolean;
+  /** Compute a pose segmentation mask (MediaPipe pose only; costly, default off) */
+  segmentation?: boolean;
+  /** External video element (skip internal camera setup) */
+  videoElement?: HTMLVideoElement;
+  /** Progress callback for model loading */
+  onProgress?: (progress: VisionProgress | null) => void;
+  /** MediaPipe-specific options */
+  mediapipe?: {
+    /**
+     * Base URL of the MediaPipe Tasks Vision wasm files. Defaults to the
+     * jsDelivr CDN build matching the supported major version. Set this to
+     * self-host the files or pin an exact version (it must match the installed
+     * `@mediapipe/tasks-vision` version)
+     */
+    wasmBasePath?: string;
+  };
+  /** ONNX-specific options */
+  onnx?: {
+    models: ONNXModelConfig[];
+    /**
+     * Run inference on WebGPU when available (default `false`, CPU via wasm).
+     * Much faster, but some GPU and driver setups hang on WebGPU inference and
+     * freeze the page's rendering. A stalled frame restarts on the CPU, though
+     * a hung GPU can keep the page frozen.
+     */
+    webgpu?: boolean;
+  };
+};
+
+/** Vision provider interface */
+export type VisionProvider = {
+  readonly type: string;
+  initialize(video: HTMLVideoElement): Promise<void>;
+  startDetection(): void;
+  stopDetection(): void;
+  onDetection(callback: (frame: VisionFrame) => void): () => void;
+  /** Subscribe to errors that stop detection for good */
+  onError?(callback: (error: Error) => void): () => void;
+  dispose(): void;
+};

@@ -1,0 +1,32 @@
+{
+  "name": "rdk",
+  "description": "Reality Development Kit, a unified React-first XR engine",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "check": "biome check --diagnostic-level=error packages",
+    "format": "turbo format",
+    "lint": "turbo lint",
+    "clean": "turbo clean",
+    "knip": "knip-bun --cache --tags=-knipignore",
+    "test": "turbo test",
+    "release": "bun run --cwd packages/rdk build && changeset publish",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@changesets/changelog-github": "^1.0.0",
+    "@changesets/cli": "^3.0.1",
+    "husky": "^9.1.7",
+    "knip": "^6.0.0",
+    "turbo": "^2.7.3",
+    "typescript": "^7.0.0"
+  }
+}

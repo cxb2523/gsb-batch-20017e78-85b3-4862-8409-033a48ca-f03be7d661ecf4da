@@ -1,0 +1,379 @@
+// ONNX provider - supports ONNX models like RF-DETR and YOLO
+
+import VisionStoppedError from "./visionStoppedError";
+
+import type {
+  ONNXModelConfig,
+  VisionFrame,
+  VisionProvider,
+  VisionSessionOptions,
+} from "../types";
+import type {
+  ONNXWorkerRequest,
+  ONNXWorkerResponse,
+  ONNXWorkerResult,
+} from "../worker/types";
+
+/**
+ * Timeout before treating a frame as stalled. With `onnx.webgpu` a stall
+ * restarts the worker on the CPU (some GPU and driver setups hang on WebGPU
+ * inference); on the CPU it just resets.
+ */
+const PROCESSING_STALL_TIMEOUT = 5000;
+
+class ONNXProvider implements VisionProvider {
+  readonly type = "onnx" as const;
+
+  private worker: Worker | null = null;
+  private isInitialized = false;
+  private isDisposed = false;
+  private isProcessing = false;
+  private videoElement: HTMLVideoElement | null = null;
+  private animationId: number | null = null;
+  private loadedModels = new Map<string, ONNXModelConfig>();
+  private lastProcessTime = 0;
+  private processingStartTime = 0;
+  private callbacks: Array<(frame: VisionFrame) => void> = [];
+  private errorCallbacks: Array<(error: Error) => void> = [];
+  private isStopped = false;
+  /** Run on the CPU (wasm) only: the default, and after a WebGPU stall */
+  private cpuOnly: boolean;
+  private isRestarting = false;
+  private options: VisionSessionOptions;
+  private messageHandler: ((event: MessageEvent) => void) | null = null;
+  private pendingModelCallbacks = new Map<
+    string,
+    { resolve: () => void; reject: (err: Error) => void }
+  >();
+
+  constructor(options: VisionSessionOptions) {
+    this.options = options;
+    this.cpuOnly = !options.onnx?.webgpu;
+  }
+
+  /** Post a typed request to the worker, with an optional transfer list */
+  private post(message: ONNXWorkerRequest, transfer?: Transferable[]): void {
+    if (transfer) {
+      this.worker?.postMessage(message, transfer);
+    } else {
+      this.worker?.postMessage(message);
+    }
+  }
+
+  async initialize(video: HTMLVideoElement): Promise<void> {
+    this.videoElement = video;
+
+    await this.startWorker();
+  }
+
+  /**
+   * Create the worker, wait for it to initialize, and load the configured
+   * models.
+   */
+  private async startWorker(): Promise<void> {
+    this.worker = new Worker(
+      new URL("../worker/onnxWorker.ts", import.meta.url),
+      { type: "module" },
+    );
+
+    // Single persistent message handler for all worker messages
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("ONNX worker initialization timeout"));
+      }, 10000);
+
+      this.messageHandler = (event: MessageEvent) => {
+        const data = event.data as ONNXWorkerResponse;
+
+        switch (data.type) {
+          case "initialized": {
+            clearTimeout(timeout);
+            this.isInitialized = true;
+            resolve();
+            break;
+          }
+          case "result": {
+            this.isProcessing = false;
+            this.handleResult(data.result);
+            break;
+          }
+          case "skipped": {
+            this.isProcessing = false;
+            break;
+          }
+          case "modelLoaded": {
+            const pending = this.pendingModelCallbacks.get(data.modelName);
+            if (pending) {
+              this.pendingModelCallbacks.delete(data.modelName);
+              pending.resolve();
+            }
+            break;
+          }
+          case "modelError": {
+            const pending = this.pendingModelCallbacks.get(data.modelName);
+            if (pending) {
+              this.pendingModelCallbacks.delete(data.modelName);
+              pending.reject(new Error(data.error));
+            }
+            break;
+          }
+          case "error": {
+            this.isProcessing = false;
+            if (!this.isInitialized) {
+              clearTimeout(timeout);
+              reject(new Error(data.error));
+            } else if (data.fatal) {
+              this.fail(
+                data.error,
+                "Vision tracking stopped because this browser blocked reading camera frames. Allow canvas access for this site, or turn off strict fingerprinting protection.",
+              );
+            } else {
+              console.error("ONNX worker error:", data.error);
+            }
+            break;
+          }
+        }
+      };
+
+      this.worker?.addEventListener("message", this.messageHandler);
+      this.post({ type: "init" });
+    });
+
+    // Load configured models
+    const models = this.options.onnx?.models ?? [];
+    for (const model of models) {
+      await this.loadModel(model);
+    }
+  }
+
+  startDetection(): void {
+    if (!this.isInitialized || !this.videoElement) {
+      console.warn("ONNX provider not initialized");
+      return;
+    }
+
+    const processFrame = () => {
+      if (!this.videoElement || !this.isInitialized || this.isStopped) return;
+
+      const now = Date.now();
+      const throttle = this.options.throttle ?? 100;
+      if (now - this.lastProcessTime < throttle) {
+        this.animationId = requestAnimationFrame(processFrame);
+        return;
+      }
+
+      // Stall recovery: the worker hasn't responded to the last frame
+      if (
+        this.isProcessing &&
+        this.processingStartTime > 0 &&
+        now - this.processingStartTime > PROCESSING_STALL_TIMEOUT
+      ) {
+        if (!this.cpuOnly) {
+          void this.restartOnCpu();
+          return;
+        }
+
+        console.warn("ONNX processing stall detected, resetting");
+        this.isProcessing = false;
+      }
+
+      if (!this.isProcessing) {
+        this.processCurrentFrame();
+      }
+
+      this.animationId = requestAnimationFrame(processFrame);
+    };
+
+    processFrame();
+  }
+
+  stopDetection(): void {
+    if (this.animationId) {
+      cancelAnimationFrame(this.animationId);
+      this.animationId = null;
+    }
+    this.isProcessing = false;
+  }
+
+  onDetection(callback: (frame: VisionFrame) => void): () => void {
+    this.callbacks.push(callback);
+
+    return () => {
+      const index = this.callbacks.indexOf(callback);
+      if (index > -1) this.callbacks.splice(index, 1);
+    };
+  }
+
+  onError(callback: (error: Error) => void): () => void {
+    this.errorCallbacks.push(callback);
+
+    return () => {
+      const index = this.errorCallbacks.indexOf(callback);
+      if (index > -1) this.errorCallbacks.splice(index, 1);
+    };
+  }
+
+  /**
+   * Stop detection for good and notify error subscribers once.
+   */
+  private fail(cause: unknown, message: string): void {
+    if (this.isStopped) return;
+
+    this.isStopped = true;
+    this.stopDetection();
+    console.error("Vision processing stopped:", cause);
+
+    const error = new VisionStoppedError(message, cause);
+
+    for (const callback of this.errorCallbacks) callback(error);
+  }
+
+  dispose(): void {
+    this.isDisposed = true;
+    this.stopDetection();
+    this.teardownWorker();
+
+    this.videoElement = null;
+    this.callbacks.length = 0;
+    this.errorCallbacks.length = 0;
+  }
+
+  /**
+   * Terminate the worker (cancelling any in-flight inference) and forget its
+   * models.
+   */
+  private teardownWorker(): void {
+    if (this.worker) {
+      if (this.messageHandler) {
+        this.worker.removeEventListener("message", this.messageHandler);
+        this.messageHandler = null;
+      }
+      this.post({ type: "dispose" });
+      this.worker.terminate();
+      this.worker = null;
+    }
+
+    this.loadedModels.clear();
+    this.pendingModelCallbacks.clear();
+    this.isInitialized = false;
+  }
+
+  /**
+   * Replace a worker stuck on WebGPU inference with one that runs on the CPU,
+   * then resume detection.
+   */
+  private async restartOnCpu(): Promise<void> {
+    if (this.isRestarting) return;
+
+    this.isRestarting = true;
+    this.cpuOnly = true;
+    console.warn("ONNX inference stalled on WebGPU, falling back to the CPU");
+
+    this.stopDetection();
+    this.teardownWorker();
+
+    try {
+      await this.startWorker();
+    } catch (error) {
+      this.fail(
+        error,
+        "Vision tracking stopped because object detection could not restart.",
+      );
+      return;
+    } finally {
+      this.isRestarting = false;
+    }
+
+    if (this.isDisposed) {
+      this.teardownWorker();
+      return;
+    }
+
+    if (!this.isStopped) this.startDetection();
+  }
+
+  private async loadModel(model: ONNXModelConfig): Promise<void> {
+    if (!this.worker) throw new Error("Worker not initialized");
+
+    const promise = new Promise<void>((resolve, reject) => {
+      this.pendingModelCallbacks.set(model.name, { resolve, reject });
+    });
+
+    this.post({ type: "loadModel", model, cpuOnly: this.cpuOnly });
+
+    await promise;
+    this.loadedModels.set(model.name, model);
+  }
+
+  private processCurrentFrame(): void {
+    if (!this.videoElement || !this.worker || this.isProcessing) return;
+
+    const now = Date.now();
+    this.isProcessing = true;
+    this.lastProcessTime = now;
+    this.processingStartTime = now;
+
+    const { videoWidth, videoHeight } = this.videoElement;
+
+    // Send the full-resolution frame; the worker letterboxes to the model's
+    // input size so aspect ratio is preserved and boxes map back correctly.
+    createImageBitmap(this.videoElement).then(
+      (bitmap) => {
+        if (this.isDisposed) {
+          bitmap.close();
+          return;
+        }
+
+        this.post(
+          {
+            type: "process",
+            imageBitmap: bitmap,
+            sourceWidth: videoWidth,
+            sourceHeight: videoHeight,
+            options: {
+              minConfidence: this.options.minConfidence ?? 0.5,
+              maxResults: this.options.maxResults ?? 100,
+            },
+          },
+          [bitmap],
+        );
+      },
+      (error) => {
+        this.isProcessing = false;
+        console.error("Error creating ImageBitmap:", error);
+      },
+    );
+  }
+
+  private handleResult(result: ONNXWorkerResult): void {
+    const minConfidence = this.options.minConfidence ?? 0.5;
+    const maxResults = this.options.maxResults ?? 100;
+
+    // Filter and limit
+    const objects = result.detections
+      .filter((d) => d.confidence >= minConfidence)
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, maxResults);
+
+    const frame: VisionFrame = {
+      hands: [],
+      faces: [],
+      poses: [],
+      objects,
+      masks: result.masks.length > 0 ? result.masks : undefined,
+      timestamp: result.timestamp,
+      frameSize: result.frameSize,
+      processingTime: result.processingTime,
+    };
+
+    for (const callback of this.callbacks) {
+      try {
+        callback(frame);
+      } catch (error) {
+        console.error("Error in ONNX detection callback:", error);
+      }
+    }
+  }
+}
+
+export default ONNXProvider;

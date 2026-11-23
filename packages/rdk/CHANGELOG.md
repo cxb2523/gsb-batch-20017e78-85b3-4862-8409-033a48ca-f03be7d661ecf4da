@@ -1,0 +1,338 @@
+# @omnidotdev/rdk
+
+## 0.16.0
+
+### Minor Changes
+
+- [#157](https://github.com/omnidotdev/rdk/pull/157) [`f96a708`](https://github.com/omnidotdev/rdk/commit/f96a708027412ed30ed12864fa70963596790fef) Thanks [@coopbri](https://github.com/coopbri)! - Run ONNX vision models (object detection and segmentation) on the CPU by default, with a new `onnx.webgpu` option to opt into WebGPU
+  
+  Some GPU and driver setups hang on WebGPU inference, which froze the whole page as soon as object detection started. ONNX models now run on the CPU unless `onnx: { webgpu: true }` is set. With WebGPU enabled, a stalled frame restarts the model on the CPU, and frames that arrive while a model is still running are dropped instead of failing with "Session already started"
+
+### Patch Changes
+
+- [#155](https://github.com/omnidotdev/rdk/pull/155) [`4ad7e06`](https://github.com/omnidotdev/rdk/commit/4ad7e0621466d524c35d82594d422f91d5af527b) Thanks [@coopbri](https://github.com/coopbri)! - Stop ONNX vision tracking and report the failure through `onError` when the browser blocks reading camera frames, instead of running the model on blank frames
+  
+  Under strict fingerprinting protection (such as Firefox's `privacy.resistFingerprinting`), the browser hands back blank pixels when the ONNX worker reads a frame, so object detection and segmentation silently saw nothing. The ONNX provider now detects this, stops once, and passes a clear error to `onError`, matching the MediaPipe provider
+
+- [#158](https://github.com/omnidotdev/rdk/pull/158) [`3fe8bec`](https://github.com/omnidotdev/rdk/commit/3fe8bec89877e2a40a2c8b93a4d32669eb1665e1) Thanks [@coopbri](https://github.com/coopbri)! - Load ONNX Runtime's wasm files for the installed `onnxruntime-web` version instead of always the latest release from the CDN, so a new ONNX Runtime release can no longer break object detection and segmentation with a JS and wasm mismatch
+
+## 0.15.0
+
+### Minor Changes
+
+- [#144](https://github.com/omnidotdev/rdk/pull/144) [`1572b17`](https://github.com/omnidotdev/rdk/commit/1572b17abbdb450a6c7c847fa71328d95c3fca06) Thanks [@nickw1](https://github.com/nickw1)! - Forward all R3F pointer and click events on `GeoLine` and `GeoPolygon`
+
+- [#152](https://github.com/omnidotdev/rdk/pull/152) [`8471ad4`](https://github.com/omnidotdev/rdk/commit/8471ad476e887f5ed8e803483d8f42c2f8092cd6) Thanks [@coopbri](https://github.com/coopbri)! - Support `@mediapipe/tasks-vision` v1 and add a `mediapipe.wasmBasePath` vision option
+  
+  The MediaPipe wasm now loads from the v1 CDN build, so the `@mediapipe/tasks-vision` peer dependency is now `^1.0.0`. Apps on 0.10 must upgrade, since the JS bundle and wasm have to come from the same release. Set `mediapipe.wasmBasePath` to self-host the wasm files or pin an exact version
+
+### Patch Changes
+
+- [#143](https://github.com/omnidotdev/rdk/pull/143) [`9b2fff4`](https://github.com/omnidotdev/rdk/commit/9b2fff475491dabd31cdeac606aca8f510b4c0a7) Thanks [@nickw1](https://github.com/nickw1)! - Share materials between `GeoLine` and `GeoPolygon` instances with the same style, improving performance in scenes with many lines and polygons
+
+- [#153](https://github.com/omnidotdev/rdk/pull/153) [`bcca57c`](https://github.com/omnidotdev/rdk/commit/bcca57c5c7fd3a9517014241593863e26392353d) Thanks [@coopbri](https://github.com/coopbri)! - Stop MediaPipe vision tracking and report the failure through `onError` when the browser blocks a feature it needs, instead of retrying every frame
+  
+  Under strict fingerprinting protection (such as Firefox's `privacy.resistFingerprinting`), MediaPipe crashes on its first frame. Vision sessions previously stayed on "Starting..." while retrying every frame, which could freeze the tab. They now stop once and pass a clear error to `onError`. Custom vision providers can opt in through a new optional `onError` method on `VisionProvider`
+
+## 0.14.1
+
+### Patch Changes
+
+- [#141](https://github.com/omnidotdev/rdk/pull/141) [`57fd398`](https://github.com/omnidotdev/rdk/commit/57fd3981428537e1df754dbe2b920243206b45bb) Thanks [@coopbri](https://github.com/coopbri)! - fix(geolocation): stop rebinding device orientation to `deviceorientation`
+  
+  The geolocation backend rebound LocAR's `DeviceOrientationControls` from the `deviceorientationabsolute` event to the plain `deviceorientation` event. On Android/Chrome `deviceorientationabsolute` already provides the correct absolute heading, so the rebind swapped it for the plain event's relative values and rotated the whole scene, leaving AR content off by roughly 90 degrees ([#140](https://github.com/omnidotdev/rdk-framework/issues/140)). The rebind was originally added for iOS, but iOS tracks heading correctly on the default event too (verified on-device), so it is removed entirely and every platform now uses LocAR's default `deviceorientationabsolute` binding.
+
+## 0.14.0
+
+### Minor Changes
+
+- [#135](https://github.com/omnidotdev/rdk/pull/135) [`de4b99c`](https://github.com/omnidotdev/rdk/commit/de4b99cf4621cfd0105e397a82e5e68b277766e3) Thanks [@nickw1](https://github.com/nickw1)! - Keep AR content at a consistent scale in both landscape and portrait. The Three camera's horizontal field of view is now matched to the webcam feed's visible area (which CSS `object-fit: cover` crops differently per orientation) via LocAR's FOV APIs, and re-synced on canvas resize/rotation. Adds an optional `hFov` geolocation session option (defaults to 80) and threads the canvas `size` through backend initialization.
+
+### Patch Changes
+
+- [#136](https://github.com/omnidotdev/rdk/pull/136) [`68cdb5a`](https://github.com/omnidotdev/rdk/commit/68cdb5aa4e335e8c3da521a62103db0b4f444d77) Thanks [@nickw1](https://github.com/nickw1)! - Do not start real GPS when a fake location is provided. Previously `startGps()` was always called even when `fakeLat`/`fakeLon` were set, so a real GPS fix would override the fake position; real GPS now starts only when no fake location is configured.
+
+## 0.13.0
+
+### Minor Changes
+
+- [#113](https://github.com/omnidotdev/rdk/pull/113) [`5334385`](https://github.com/omnidotdev/rdk/commit/53343858e29832905e447817de8e56fb201be955) Thanks [@nickw1](https://github.com/nickw1)! - feat(engine): add `@omnidotdev/rdk/engine` subpath export
+  
+  Adds a dedicated `./engine` subpath so `XR` (and the XR store helpers) can be imported without the top-level barrel, which re-exports every module including `fiducial` and its optional `@ar-js-org/ar.js` peer dependency. Import `XR` from `@omnidotdev/rdk/engine` to use a single module (e.g. geolocation) without installing ar.js. Also sets `"sideEffects": false` so the barrel tree-shakes cleanly.
+
+### Patch Changes
+
+- [#120](https://github.com/omnidotdev/rdk/pull/120) [`7026548`](https://github.com/omnidotdev/rdk/commit/70265484fcf15d5b6ca91cc2facdbaf0ac746413) Thanks [@nickw1](https://github.com/nickw1)! - feat(geolocation): add pointer event handlers to `GeoLine` and `GeoPolygon`
+  
+  Adds optional `onClick`, `onPointerOver`, and `onPointerOut` props to `GeoLine` and `GeoPolygon`, forwarded to the underlying R3F scene object. Handlers receive a `ThreeEvent<MouseEvent>` (click) or `ThreeEvent<PointerEvent>` (pointer over/out). When a handler is omitted the element stays non-interactive and is not registered for pointer raycasting, so existing scenes keep their current behavior and cost.
+
+## 0.12.2
+
+### Patch Changes
+
+- [#112](https://github.com/omnidotdev/rdk/pull/112) [`4efc9dc`](https://github.com/omnidotdev/rdk/commit/4efc9dcf8cee80ff1e98a2d5186643bbbffde265) Thanks [@nickw1](https://github.com/nickw1)! - feat(geolocation): add `opacity` prop to `GeoLine`
+  
+  Adds an `opacity` prop (default `1`) to `GeoLine`, applied to both the default triangle-strip mesh and the dashed `Line2` fallback. The material is only marked `transparent` when `opacity < 1`, so fully opaque lines keep their existing render path.
+
+- [#124](https://github.com/omnidotdev/rdk/pull/124) [`f1ba1ac`](https://github.com/omnidotdev/rdk/commit/f1ba1ac046d11a13234cd107181a80cf7251a155) Thanks [@coopbri](https://github.com/coopbri)! - fix(build): resolve internal modules via a `@/` alias instead of `baseUrl`
+  
+  TypeScript 7 removed the `baseUrl` compiler option, which the package relied on to resolve `src`-relative bare imports (e.g. `engine/useXRStore`, `lib/types/engine`). Under TS 7 this broke `vite-tsconfig-paths` resolution, failing the Vitest suite and the library build (including `.d.ts` emission).
+  
+  Replace `baseUrl` with an explicit `@/*` -> `./src/*` path mapping and migrate internal imports to the `@/` prefix. Unlike bare `src`-relative imports, the `@/` prefix cannot collide with npm package names, so a future dependency named `engine`, `lib`, `vision`, etc. can no longer shadow local modules. `vite-tsconfig-paths` is now the single resolver for both build and test (the redundant Vitest `resolve.alias` was removed).
+
+## 0.12.1
+
+### Patch Changes
+
+- [#110](https://github.com/omnidotdev/rdk/pull/110) [`8b870a5`](https://github.com/omnidotdev/rdk/commit/8b870a5ce26d32d141299083bf6274111ed6f1ab) Thanks [@coopbri](https://github.com/coopbri)! - refactor(geolocation): re-platform onto the LocAR.js `App` API (0.2.7)
+
+  Bumps `locar` from `^0.2.3` to `^0.2.7` and rebuilds the geolocation backend on LocAR's `App` orchestrator via its `threeObjects` option, so LocAR wires the core, webcam feed and device orientation against RDK's existing react-three-fiber camera, renderer and scene instead of RDK instantiating `LocAR`, `Webcam` and `DeviceOrientationControls` by hand. Webcam teardown now uses `Webcam.dispose()` (added upstream in 0.2.5), replacing the manual `<video>` element hunt-and-remove workaround. The public API (`GeolocationSession`, `GeolocationAnchor`, `GeoLine`, `GeoPolygon`, `useGeolocationBackend`) is unchanged.
+
+  Also fixes a pre-existing bug where geolocation AR objects never appeared on device: LocAR's `DeviceOrientationControls` binds to the `deviceorientationabsolute` event, which iOS Safari never fires (and some devices deliver as a stuck zero reading), so the camera stayed pitched at its neutral "device flat" pose looking straight down and horizon-placed anchors were never in view. The backend now rebinds the control to the universally-fired `deviceorientation` event so the camera tracks the device on every platform.
+
+## 0.12.0
+
+### Minor Changes
+
+- [#98](https://github.com/omnidotdev/rdk/pull/98) [`62280ca`](https://github.com/omnidotdev/rdk/commit/62280cae627bc2ebbb43473722de6cc1c396cde9) Thanks [@coopbri](https://github.com/coopbri)! - Add ONNX instance segmentation to the vision module. A new `yoloseg` decoder assembles per-instance masks from a YOLOv8/v11-seg model (detection `[1, 4+C+M, A]` + prototype `[1, M, H, W]` outputs) as `sigmoid(coeffs · prototypes)`, thresholded and cropped to each box. Results arrive on `VisionFrame.masks` as `SegmentationMask[]` (label, confidence, source-space bbox, and a cropped alpha mask), with mask buffers transferred zero-copy from the worker.
+
+  The decoder interface now returns `{ objects?, masks? }`, and a `yoloSeg()` model preset + `SegmentationMask` type are exported. The demo gains a "Segment" mode.
+
+## 0.11.0
+
+### Minor Changes
+
+- [#96](https://github.com/omnidotdev/rdk/pull/96) [`016b31e`](https://github.com/omnidotdev/rdk/commit/016b31e49d3e15060882d3df5d6f4dbe083562ed) Thanks [@coopbri](https://github.com/coopbri)! - Add the ML vision module: a `VisionProvider` abstraction with MediaPipe (hand/face/pose landmarks + built-in gesture detection) and ONNX Runtime Web backends, wired into the engine as a first-class `Backend` alongside fiducial/geolocation/magic.
+
+  The ONNX backend runs real inference in a Web Worker with a pluggable `ONNXDecoder` interface and two reference decoders, YOLO (v8/v11, NMS) and RF-DETR (DETR set-prediction, NMS-free), plus `yolo()`/`rfDetr()` model presets and `COCO_LABELS`. Bring your own weights; nothing heavy is bundled (`@mediapipe/tasks-vision` and `onnxruntime-web` are optional peer dependencies).
+
+  Also adds declarative components `VisionOverlay`, `VisionSession`, `HandTracker`, and `VisionAnchor`, plus the `useVisionFrame` hook and `landmarkToWorld` mapping helper.
+
+## 0.10.1
+
+### Patch Changes
+
+- [#92](https://github.com/omnidotdev/rdk/pull/92) [`dab1341`](https://github.com/omnidotdev/rdk/commit/dab1341312e30892b32aa1e51c7c47eb72eac743) Thanks [@coopbri](https://github.com/coopbri)! - Migrate license from MIT to Apache 2.0
+
+- [#93](https://github.com/omnidotdev/rdk/pull/93) [`f7b749a`](https://github.com/omnidotdev/rdk/commit/f7b749a02d34ef1db0dd276b837131f04083e881) Thanks [@coopbri](https://github.com/coopbri)! - Upgrade LocAR.js to 0.2.x. The geolocation backend now renders the camera feed via LocAR's aspect-ratio-preserving DOM video element behind a transparent canvas (instead of a stretched `scene.background` texture), and tears down the media stream and video element on session end.
+
+- [#95](https://github.com/omnidotdev/rdk/pull/95) [`1683a35`](https://github.com/omnidotdev/rdk/commit/1683a358ae3b430fe109d604f2fa3aed073236a7) Thanks [@coopbri](https://github.com/coopbri)! - Upgrade dependencies: `three` and `@types/three` to `^0.185.0` (bumps the `three` peer range), plus dev tooling `vite-plugin-dts` to v5 and `vite-plugin-mkcert` to v2.
+
+## 0.10.0
+
+### Minor Changes
+
+- [#77](https://github.com/omnidotdev/rdk/pull/77) [`9aa76cb`](https://github.com/omnidotdev/rdk/commit/9aa76cba02c531cd3d54634d04b311dde2707740) Thanks [@nickw1](https://github.com/nickw1)! - Use triangle-strip mesh rendering for `GeoLine` for smoother lines with fewer artifacts, falling back to `Line2` when dashing is enabled
+
+## 0.9.1
+
+### Patch Changes
+
+- [#75](https://github.com/omnidotdev/rdk/pull/75) [`45be62b`](https://github.com/omnidotdev/rdk/commit/45be62b9dd269d34e4b4ad6a51712c81ca6b0569) Thanks [@nickw1](https://github.com/nickw1)! - Fix infinite rendering loop in `GeoLine` and `GeoPolygon` components
+
+## 0.9.0
+
+### Minor Changes
+
+- [#67](https://github.com/omnidotdev/rdk-framework/pull/67) [`bb058b5`](https://github.com/omnidotdev/rdk-framework/commit/bb058b5afa0ba72e2b31a6e52678f915c7fa4d87) Thanks [@coopbri](https://github.com/coopbri)! - Add magic window module with camera passthrough and device orientation tracking
+
+- [#65](https://github.com/omnidotdev/rdk-framework/pull/65) [`67807e7`](https://github.com/omnidotdev/rdk-framework/commit/67807e7b82a33fd4639ac0a2a8d6f2bcfce541e9) Thanks [@coopbri](https://github.com/coopbri)! - Add subpath exports for fiducial, geolocation, and immersive modules with multi-entry Vite build
+
+## 0.8.0
+
+### Minor Changes
+
+- [#59](https://github.com/omnidotdev/rdk/pull/59) [`584773c`](https://github.com/omnidotdev/rdk/commit/584773c90dc280fd9534d5b4165950fcca446068) Thanks [@coopbri](https://github.com/coopbri) and [@nickw1](https://github.com/nickw1)! - Add `GeoLine` and `GeoPolygon` components for rendering paths and areas in AR space using lon/lat coordinates. These components complete the core GeoJSON geometry support:
+
+  - `GeoLine`: Renders lines (example use cases are roads, paths, routes) using Three.js `Line2` for variable width support
+  - `GeoPolygon`: Renders filled polygons (zones, areas, boundaries) with optional holes
+
+  Both components accept GeoJSON-style coordinate arrays `[lon, lat, elevation?]` for direct compatibility with mapping APIs and the `locar-tiler` library.
+
+## 0.7.0
+
+### Minor Changes
+
+- [#56](https://github.com/omnidotdev/rdk/pull/56) [`39954c3`](https://github.com/omnidotdev/rdk/commit/39954c39ad6e35a389ba06a16915d4ec186dead2) Thanks [@coopbri](https://github.com/coopbri)! - Add status flags to backend hooks for safe destructuring.
+
+  `useGeolocationBackend()` and `useFiducialBackend()` now return an object with `isPending` and `isSuccess` boolean flags instead of returning `null` on first render. This enables safe destructuring without null checks:
+
+  ```tsx
+  // before (crashed on first render)
+  const geo = useGeolocationBackend();
+  const locar = geo?.locar;
+
+  // after (safe destructuring)
+  const { locar, isPending, isSuccess } = useGeolocationBackend();
+
+  if (isSuccess && locar) {
+    const worldCoords = locar.lonLatToWorldCoords(lon, lat);
+  }
+  ```
+
+  New exported types: `GeolocationBackendState`, `FiducialBackendState`
+
+## 0.6.0
+
+### Minor Changes
+
+- [#52](https://github.com/omnidotdev/rdk/pull/52) [`bdb98ff`](https://github.com/omnidotdev/rdk/commit/bdb98ff56b01d3adb0b30d66c35ce0cad4f2ba27) Thanks [@coopbri](https://github.com/coopbri)! - Refactor backend registry from array to Map for O(1) type-based lookup. Add `type` discriminator to Backend interface and new `useFiducialBackend`/`useGeolocationBackend` hooks for type-safe backend access. Move anchor registry into geolocation backend.
+
+## 0.5.2
+
+### Patch Changes
+
+- [#41](https://github.com/omnidotdev/rdk/pull/41) [`e4db1be`](https://github.com/omnidotdev/rdk/commit/e4db1be2302a0c38a2a3be273d903daa61b89833) Thanks [@coopbri](https://github.com/coopbri)! - Improve geolocation module types
+
+## 0.5.1
+
+### Patch Changes
+
+- [#37](https://github.com/omnidotdev/rdk/pull/37) [`5afc4b2`](https://github.com/omnidotdev/rdk/commit/5afc4b204fac397ba8aec24f6f42176a927b63fc) Thanks [@coopbri](https://github.com/coopbri)! - Stabilized `options` in `GeolocationSession` and `FiducialSession` to prevent an infinite render loop when it was not provided as props
+
+- [#39](https://github.com/omnidotdev/rdk/pull/39) [`319f2d0`](https://github.com/omnidotdev/rdk/commit/319f2d094d70b2689a8c8dd18003238da92f82e6) Thanks [@nickw1](https://github.com/nickw1)! - Restored missing `locar.getLastKnownLocation()` invocation in `GeolocationAnchor`
+
+## 0.5.0
+
+### Minor Changes
+
+- [#35](https://github.com/omnidotdev/rdk/pull/35) [`c66a582`](https://github.com/omnidotdev/rdk/commit/c66a582cec4f261b9947b12643ec525283ae0e9f) Thanks [@coopbri](https://github.com/coopbri)! - **BREAKING:** Changed geolocation module callback prop names: `onAttached` to `onAttach` and `onGpsUpdated` to `onGpsUpdate`. This normalizes the callbacks to present tense, following the React convention.
+
+### Patch Changes
+
+- [#33](https://github.com/omnidotdev/rdk/pull/33) [`826cdb5`](https://github.com/omnidotdev/rdk/commit/826cdb581c8833b4448310ea65031002f56abf2a) Thanks [@coopbri](https://github.com/coopbri)! - Reduced bundle size by properly externalizing dependencies
+
+## 0.4.2
+
+### Patch Changes
+
+- [#31](https://github.com/omnidotdev/rdk/pull/31) [`a0ac723`](https://github.com/omnidotdev/rdk/commit/a0ac7236a187aeceb30ab0bbd9b673df513a6a5b) Thanks [@coopbri](https://github.com/coopbri)! - Fixed a regression where already-registered backends would be reinitialized, causing a render loop
+
+## 0.4.1
+
+### Patch Changes
+
+- [#27](https://github.com/omnidotdev/rdk/pull/27) [`d808716`](https://github.com/omnidotdev/rdk/commit/d808716960b1268387cf7cd9d8d7814e8f473223) Thanks [@nickw1](https://github.com/nickw1)! - Added `onGpsUpdated` callback to geolocation backend
+
+- [#30](https://github.com/omnidotdev/rdk/pull/30) [`4027439`](https://github.com/omnidotdev/rdk/commit/40274394940e35b4e8401b61bfee8621adc68863) Thanks [@coopbri](https://github.com/coopbri)! - - Removed `XRStoreActions` and `XRStoreState` library exports
+  - Added `FiducialAnchorProps` and `GeolocationAnchorProps` library exports
+  - Fixed `GeolocationSession` and `FiducialSession` `options` prop being typed to `any`
+
+## 0.4.0
+
+### Minor Changes
+
+- [#26](https://github.com/omnidotdev/rdk/pull/26) [`fa31da4`](https://github.com/omnidotdev/rdk/commit/fa31da44bb86f403dff9d553e5ba792531b7f462) Thanks [@coopbri](https://github.com/coopbri)! - Added native WebXR support, powered by [`@react-three/xr`](https://github.com/pmndrs/xr).
+
+  **BREAKING:** Removed `cameraSource` prop from XR component. Sessions now auto-configure themselves:
+
+  ```tsx
+  // before
+  <XR cameraSource="video">
+    <FiducialSession />
+  </XR>
+
+  // after
+  <XR>
+    {/* auto-configures video mode */}
+    <FiducialSession />
+  </XR>
+  ```
+
+  **New Features:**
+
+  - `ImmersiveSession` component for WebXR AR/VR
+  - Nested `@react-three/xr`'s store nested under `useXRStore`'s `immersive` property
+  - Added `ImmersiveMode` type export, which maps to and from [official WebXR modes](https://www.w3.org/TR/webxr/#xrsessionmode-enum) (`immersive-ar` ↔ `ar`, `immersive-vr` ↔ `vr`, `inline` ↔ `inline`)
+
+## 0.3.0
+
+### Minor Changes
+
+- [#22](https://github.com/omnidotdev/rdk/pull/22) [`95e4a7c`](https://github.com/omnidotdev/rdk/commit/95e4a7c0bc7b528320d6695436d8b098c305aa27) Thanks [@coopbri](https://github.com/coopbri)! - Migrated the RDK state manager from React Context to Zustand for better performance, flexibility, and access outside of React contexts. 🐻
+
+  **Breaking Changes:**
+
+  - Replaced `XRContext` and `useXR` hook with Zustand store (`useXRStore`)
+  - Renamed types
+    - `XRBackend` → `Backend`
+    - `XRContextValue` → `ContextValue`
+
+  **New Library Exports:**
+
+  - `useXRStore`: Main Zustand store hook for full state access
+  - `getXRStore`: Non-React access to store state
+  - `subscribeToXRStore`: Non-React subscription to store changes
+  - `XRStore`, `XRStoreState`, `XRStoreActions`: TypeScript types
+
+  **Migration Guide:**
+
+  Replace `useXR()` with direct store selectors:
+
+  - `useXR().camera` → `useXRStore((state) => state.camera)`
+  - `useXR().backends` → `useXRStore((state) => state.backends)`
+  - Full store access: `useXRStore()` or `useXRStore(selector)`
+
+  Replace types:
+
+  - `XRBackend` → `Backend`
+  - `XRContextValue` → `ContextValue`
+
+## 0.2.2
+
+### Patch Changes
+
+- [#19](https://github.com/omnidotdev/rdk/pull/19) [`f2b80f6`](https://github.com/omnidotdev/rdk/commit/f2b80f6f78d3252c21cb3921bd4e8d46e81c0a4a) Thanks [@nickw1](https://github.com/nickw1)! - Fix anchor initialization by using `getLastKnownLocation()` (LocAR 0.1.4) to seed GPS data immediately instead of waiting for a new update. This ensures anchors are added to the scene reliably even when GPS arrives before anchor creation.
+
+## 0.2.1
+
+### Patch Changes
+
+- [#17](https://github.com/omnidotdev/rdk/pull/17) [`68b6de2`](https://github.com/omnidotdev/rdk/commit/68b6de2709183129f0fa1f18695d27f38c08caca) Thanks [@nickw1](https://github.com/nickw1)! - Remove unnecessary permission calls in geolocation backend
+
+## 0.2.0
+
+### Minor Changes
+
+- [#8](https://github.com/omnidotdev/rdk/pull/8) [`57d2439`](https://github.com/omnidotdev/rdk/commit/57d243984bcdc2d659e69a75cbc9ebbb1db7c08a) Thanks [@coopbri](https://github.com/coopbri)! - Added experimental geolocation augmented reality support
+
+- [#13](https://github.com/omnidotdev/rdk/pull/13) [`d58ef41`](https://github.com/omnidotdev/rdk/commit/d58ef4154f00492d31173ee2553df1aa396ea2a3) Thanks [@coopbri](https://github.com/coopbri)! - **BREAKING:** Removed `XRCanvas` and its explicit `mode` prop in favor of a composable `XR` context component. An explicit R3F `Canvas` ancestor is now required. Now, usage works like this:
+
+  ```tsx
+  import { Canvas } from "@react-three/fiber";
+  import {
+    FiducialAnchor,
+    FiducialSession,
+    GeolocationAnchor,
+    GeolocationSession,
+    XR,
+  } from "@omnidotdev/rdk";
+
+  <Canvas>
+    <XR>
+      <GeolocationSession>
+        <GeolocationAnchor>{/* ... */}</GeolocationAnchor>
+      </GeolocationSession>
+    </XR>
+  </Canvas>
+
+  // ...
+
+  <Canvas>
+    <XR>
+      <FiducialSession>
+        <FiducialAnchor>{/* ... */}</FiducialAnchor>
+      </FiducialSession>
+    </XR>
+  </Canvas>
+  ```
+
+  This results in a more composable architecture.
+
+  Importantly, `GeolocationSession` and `FiducialSession` cannot be used in the same XR context. This is because their underlying libraries (LocAR.js and AR.js, respectively) both try to access the same camera/video, thus fight over it. A console error will be thrown if both are detected.
+
+## 0.1.0
+
+### Minor Changes
+
+- [#1](https://github.com/omnidotdev/rdk/pull/1) [`2ead4ed`](https://github.com/omnidotdev/rdk/commit/2ead4edf2487667d5667ec9dc6e5182b798c0165) Thanks [@coopbri](https://github.com/coopbri)! - Initial release with experimental fiducial marker-based augmented reality support
