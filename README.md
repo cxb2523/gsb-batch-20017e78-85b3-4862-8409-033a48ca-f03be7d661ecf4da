@@ -214,6 +214,20 @@ blade-pass tone, airflow by dynamic pressure, tyres, touchdown, the reed
 stall horn rising in pitch, flap motor, starter, rain. Muffled in the cabin,
 with Doppler in the fly-by view.
 
+The sound is tied to the aircraft's real state, not just its rpm. The main
+loop posts the truth from the flight model and `js/systems.js` every frame
+(ignition firing or not, how many magnetos are live, battery volts, seized),
+and the worklet obeys it: one live magneto fires only every other cylinder
+event and drops in level; an engine that is cut out or seized keeps only the
+windmill blade-pass tone, air and tyres, with no combustion pulses; the starter
+cranks only on a battery that can feed it, and weakly when it sags.
+Parameters are smoothed per 128-sample block, and swapping aircraft, replacing
+the aircraft or entering the menu fades out and hard-resets the worklet so no
+revs or ignition from the last flight carry over. If the browser has no
+AudioWorklet, or the module fails to load, the simulator and its instruments
+run on without a sound. `node test/audio.mjs` drives the processor directly
+with fake nodes to check all of this.
+
 ## Keys
 
 Arrows yoke · A D rudder · W S throttle (airbrakes in a glider) · F V flaps ·

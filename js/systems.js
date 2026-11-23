@@ -46,6 +46,7 @@ export class Systems {
     this.tanks = null; this.lastFuel = fm.fuel;
     this.trapPitot = null; this.trapStatic = null;
     this.oilLeft = 1; this.seized = false; this.badMag = Math.random() < 0.5 ? 1 : 2;
+    this.magsLive = 2;                         // live ignition circuits right now: 0, 1 or 2 (read by the sound)
     this.variation = 0;
     this.events = [];
     this.ind = { ias: 0, altInd: 0, vsInd: 0, pitch: 0, roll: 0, heading: 0, compass: 0, turnRate: 0, slip: 0, suction: 0, volts: 28, amps: 0, oilP: 0, fuelL: 0, fuelR: 0, tcFlag: false, lowVolts: false, lowVac: false };
@@ -53,7 +54,7 @@ export class Systems {
   }
 
   fail(name) { if (FAILURES[name] && !this.failed[name]) { this.failed[name] = true; this.events.push(name); } }
-  repair() { this.failed = {}; this.oilLeft = 1; this.seized = false; this.fm.fx.trimOffset = 0; this.trapPitot = this.trapStatic = null; }
+  repair() { this.failed = {}; this.oilLeft = 1; this.seized = false; this.seizeT = 0; this.fm.fx.trimOffset = 0; this.trapPitot = this.trapStatic = null; }
   // align the heading gyro with the compass, as a pilot does every quarter of an hour
   syncHeading() { this.hdgErr = wrap(this.compass - (this.fm.out.heading - this.variation)); }
 
@@ -110,6 +111,7 @@ export class Systems {
     let cut = false;
     const mag = sw.magnetos;                       // 0 off, 1 right, 2 left, 3 both
     const live = (mag & 1 && !(F.magneto && this.badMag === 1) ? 1 : 0) + (mag & 2 && !(F.magneto && this.badMag === 2) ? 1 : 0);
+    this.magsLive = live;
     if (live === 0) cut = true; else if (live === 1) power *= 0.88;                // one set of plugs burns slower: 50 to 150 rpm at run-up
     // ---- oil: pressure goes first, then the engine
     if (F.oil && o.firing) this.oilLeft = Math.max(0, this.oilLeft - dt / 45);

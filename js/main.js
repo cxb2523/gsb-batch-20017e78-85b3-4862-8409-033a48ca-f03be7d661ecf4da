@@ -11,6 +11,7 @@ import { Air, fetchLive, presetWeather, describe } from './weather.js';
 import { buildAircraft, buildGroundShadow } from './aircraft.js';
 import { buildCockpit, EYE } from './cockpit.js';
 import { Sound } from './audio.js';
+import { engineSoundState } from './audio-state.js';
 import { Input } from './input.js';
 import { Nav, Coupler, loadNavaids } from './nav.js';
 import { Systems, FAILURES } from './systems.js';
@@ -263,6 +264,7 @@ function trimTo(ias, vs) {
 }
 
 function place() {
+  sound.reset();                       // a fresh placement starts with a silent, cold audio state
   if (!S.airport || !S.weather || !fm) return;
   const w0 = S.weather.wind[0];
   const dep = pickRunway(S.runways, w0.dir, w0.spd);
@@ -321,6 +323,7 @@ function toMenu() {
   document.body.classList.remove('flying');
   $('hud').hidden = true; $('keysBtn').hidden = true; $('keys').hidden = true; $('faultsBtn').hidden = true; $('faults').hidden = true;
   sound.setLevel(0);
+  sound.reset();                       // nothing of this flight follows us back to the menu
   place();
 }
 
@@ -629,9 +632,10 @@ function frame(now) {
     } else S.lastDist = null;
     sound.setLevel(S.paused ? 0 : 0.9);
     sound.update({
-      rpm: o.rpm, load: c.throttle, firing: o.firing ? 1 : 0, speed: o.tas, interior: S.view === 'cockpit' ? 1 : 0,
+      ...engineSoundState(fm, systems),
+      speed: o.tas, interior: S.view === 'cockpit' ? 1 : 0,
       roll: o.onGround ? o.wheelSpeed : 0, stall: S.view === 'cockpit' ? o.stallWarn : 0, flap: o.flapMoving ? 1 : 0,
-      rain: wet * (S.view === 'cockpit' ? 1 : 0.4), starter: c.starter ? 1 : 0, doppler, distance, turb: Math.min(1, air.sigma / 3), scrape: Math.min(1, o.scrape / 10),
+      rain: wet * (S.view === 'cockpit' ? 1 : 0.4), starter: S.def.engine && c.starter ? 1 : 0, doppler, distance, turb: Math.min(1, air.sigma / 3), scrape: Math.min(1, o.scrape / 10),
     });
   }
 
