@@ -21,10 +21,30 @@ export class ShadingUtils {
   }
 
   static setShading(object, patch) {
-    const state = this.normalize({ ...this.getShading(object), ...patch });
+    const prev = this.getShading(object);
+    const state = this.normalize({ ...prev, ...patch });
 
     object.userData.shading = state.mode;
     object.userData.shadingAngle = state.angle;
+
+    // Angle-only changes in auto mode keep the same buffers and slot maps;
+    // re-split smoothing groups in place instead of rebuilding geometry.
+    if (
+      state.mode === 'auto' &&
+      prev.mode === 'auto' &&
+      state.angle !== prev.angle &&
+      object.userData.meshData &&
+      object.userData.renderBuffer &&
+      object.geometry
+    ) {
+      MeshRendererAdapter.updateNormalAngle(
+        object.userData.meshData,
+        object.userData.renderBuffer,
+        object.geometry,
+        state.angle
+      );
+      return state;
+    }
 
     this.rebuildShading(object);
     return state;

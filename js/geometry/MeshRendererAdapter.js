@@ -171,15 +171,22 @@ export class MeshRendererAdapter {
 
     const posAttr = geometry.attributes.position;
     const uvAttr = geometry.attributes.uv;
+    const normalAttr = geometry.attributes.normal;
 
     posAttr.setXYZ(slot, vertex.position.x, vertex.position.y, vertex.position.z);
     uvAttr.setXY(slot, 0, 0);
+
+    // A reused slot may still hold a corner normal from its previous face
+    // occupant; standalone vertices take the same default as the full-build
+    // normal passes use for isolated vertices.
+    if (normalAttr) normalAttr.setXYZ(slot, 0, 1, 0);
 
     renderBuffer.vertexIdToBufferIndex.set(vertexId, [slot]);
     renderBuffer.bufferIndexToVertexId.set(slot, vertexId);
 
     posAttr.needsUpdate = true;
     uvAttr.needsUpdate = true;
+    if (normalAttr) normalAttr.needsUpdate = true;
   }
 
   static deleteVertex(meshData, renderBuffer, geometry, vertexId) {
@@ -210,7 +217,6 @@ export class MeshRendererAdapter {
       this._growVertexBuffer(renderBuffer, geometry, verts.length * 2);
       vertSlot = renderBuffer.slotAllocator.alloc(verts.length);
     }
-
     const posAttr = geometry.attributes.position;
     const uvAttr = geometry.attributes.uv;
     const normalAttr = geometry.attributes.normal;
@@ -286,8 +292,12 @@ export class MeshRendererAdapter {
       for (const slot of faceBufferIndices)
         normalAttr.setXYZ(slot, n.x, n.y, n.z);
     } else {
-      for (const v of verts) {
-        this._recomputeVertexNormals(meshData, renderBuffer, geometry, v.id, mode, angle);
+      // The new face changes corner normals not only at its own vertices but
+      // also at every vertex of a face sharing an edge with it (their
+      // smoothing groups may merge or split when this face appears).
+      const recomputeIds = this._verticesWithFaceNeighbors(meshData, face.vertexIds);
+      for (const vId of recomputeIds) {
+        this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle);
       }
     }
 
@@ -335,15 +345,20 @@ export class MeshRendererAdapter {
       }
     }
 
-    if (mode !== 'flat' && geometry.attributes.normal) {
-      for (const vId of touchedVertexIds) {
-        this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle, faceId);
-      }
-    }
-
     renderBuffer.faceIdToBufferIndices.delete(faceId);
     renderBuffer.faceTriangleOffset.delete(faceId);
     renderBuffer.faceTriangleCount.delete(faceId);
+
+    // Recompute only after the slot maps are clean: vertices only connected
+    // through shared edges of the deleted face must pick up the new smoothing
+    // groups, and the deleted face must no longer contribute to any normal.
+    if (mode !== 'flat' && geometry.attributes.normal) {
+      const recomputeIds = this._verticesWithFaceNeighbors(meshData, touchedVertexIds);
+      const cache = new Map();
+      for (const vId of recomputeIds) {
+        this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle, faceId, cache);
+      }
+    }
 
     indexAttr.needsUpdate = true;
   }
@@ -701,14 +716,61 @@ export class MeshRendererAdapter {
     const normalAttr = geometry.attributes.normal;
     if (!normalAttr) return;
 
-    const affectedVertices = SharpUtils.diffSharpVertices(oldKeys, newKeys);
-    if (affectedVertices.size === 0) return;
+    const diffVertices = SharpUtils.diffSharpVertices(oldKeys, newKeys);
+    if (diffVertices.size === 0) return;
 
+    // A sharp split changes corner normals for every face incident to the
+    // edge endpoints, including faces that only meet those vertices through
+    // another shared edge.
+    const affectedVertices = this._verticesWithFaceNeighbors(meshData, diffVertices);
     const angle = renderBuffer.normalAngle ?? 60;
+    const cache = new Map();
     for (const vId of affectedVertices) {
-      this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle);
+      this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle, null, cache);
     }
     normalAttr.needsUpdate = true;
+  }
+
+  // Apply a new auto-mode angle threshold to the existing geometry without
+  // rebuilding the whole buffer. Smooth/flat modes are unaffected by angle.
+  static updateNormalAngle(meshData, renderBuffer, geometry, angle) {
+    renderBuffer.normalAngle = angle;
+
+    const mode = renderBuffer.normalMode;
+    if (mode !== 'auto') return;
+    const normalAttr = geometry.attributes.normal;
+    if (!normalAttr) return;
+
+    const cache = new Map();
+    for (const vId of meshData.vertices.keys()) {
+      this._recomputeVertexNormals(meshData, renderBuffer, geometry, vId, mode, angle, null, cache);
+    }
+    normalAttr.needsUpdate = true;
+  }
+
+  // Expand a seed set of vertices with every vertex that shares a face with
+  // one of them. This covers corners only reachable through a shared edge.
+  static _verticesWithFaceNeighbors(meshData, seedVertexIds) {
+    const result = new Set();
+    const stack = [...seedVertexIds];
+
+    while (stack.length > 0) {
+      const vId = stack.pop();
+      if (result.has(vId)) continue;
+      result.add(vId);
+
+      const vertex = meshData.vertices.get(vId);
+      if (!vertex) continue;
+      for (const fId of vertex.faceIds) {
+        const face = meshData.faces.get(fId);
+        if (!face) continue;
+        for (const neighborId of face.vertexIds) {
+          if (!result.has(neighborId)) stack.push(neighborId);
+        }
+      }
+    }
+
+    return result;
   }
 
   // ---------- Corner normal helpers ----------

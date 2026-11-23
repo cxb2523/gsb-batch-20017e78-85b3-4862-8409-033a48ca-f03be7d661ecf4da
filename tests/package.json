@@ -1,0 +1,14 @@
+{
+  "name": "kokraf-render-buffer-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local verification for MeshRendererAdapter slot reuse and normal updates",
+  "scripts": {
+    "test": "node --loader ./helpers/import-map-loader.js --test mesh-render-buffer.test.js"
+  },
+  "dependencies": {
+    "earcut": "3.0.2",
+    "three": "0.176.0"
+  }
+}
