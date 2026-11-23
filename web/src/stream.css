@@ -1,0 +1,617 @@
+/* The Stream's insides (render/stream.ts). The container, section.stream,
+   belongs to app.css: the scroll, the padding and the empty message.
+
+   div.stream-text
+     div.prompt-block            the prompt, once, full width
+     div.columns(.one)           A left, B right
+       div.col.a|b(.path)(.front)
+         div.col-head            edge, badge, name, quant, figures, role
+         div.col-wait            before the first token
+         div.col-body            the tokens, the split marker, the stop
+       svg.seam(.on)             the first disagreement, across the gap
+
+   div.tok-card.glass            the hover card, in <body> */
+
+.stream-text {
+  font-family: var(--font-mono);
+  font-size: var(--fs-text);
+  line-height: 1.8;
+}
+/* Some blocks are shown and hidden with the hidden attribute. */
+.stream-text [hidden] {
+  display: none !important;
+}
+
+/* Line icons from render/icons.ts, inline. */
+.stream-text .ico,
+.tok-card .ico {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -2px;
+}
+
+.stream-text .prompt-block,
+.stream-text .col-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The prompt: quieter text, a small label and a hairline that fades out. */
+.stream-text .prompt-block {
+  position: relative;
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  color: var(--prompt);
+}
+.stream-text .prompt-block::before {
+  content: 'Prompt';
+  display: block;
+  margin-bottom: 4px;
+  color: var(--low);
+  font-family: var(--font-ui);
+  font-size: var(--fs-small);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.6;
+  user-select: none;
+}
+.stream-text .prompt-block::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    rgba(var(--high-rgb), 0.16),
+    rgba(var(--high-rgb), 0.06) 45%,
+    rgba(var(--high-rgb), 0) 90%
+  );
+}
+
+.stream-text .columns {
+  position: relative; /* the seam's box */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 32px;
+  align-items: start;
+}
+.stream-text .columns.one {
+  grid-template-columns: minmax(0, 1fr);
+}
+.stream-text .col {
+  --c: var(--a);
+  --c-rgb: var(--a-rgb);
+  min-width: 0;
+}
+.stream-text .col.b {
+  --c: var(--b);
+  --c-rgb: var(--b-rgb);
+}
+.stream-text .col-body {
+  padding: 0 2px;
+}
+
+/* ------------------------------------------------------------ header */
+
+.stream-text .col-head {
+  position: sticky;
+  /* Up to the top edge of .stream, over its top padding (app.css), so no
+     text shows above the stuck header. */
+  top: -20px;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  margin-bottom: 14px;
+  padding: 8px 12px 8px 14px;
+  /* A step of background, no border. */
+  border-radius: var(--radius-control);
+  background: rgba(var(--surface-2-rgb), 0.78);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--edge);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  line-height: 1.4;
+  user-select: none;
+  transition:
+    background-color 160ms var(--ease),
+    box-shadow 160ms var(--ease);
+}
+.stream-text .col-head.pick {
+  cursor: pointer;
+}
+.stream-text .col-head.pick:hover {
+  background: rgba(var(--surface-3-rgb), 0.82);
+}
+/* The model in front: a tint of its colour and a soft halo. */
+.stream-text .col.front .col-head {
+  background:
+    linear-gradient(rgba(var(--c-rgb), 0.07), rgba(var(--c-rgb), 0.07)),
+    rgba(var(--surface-2-rgb), 0.78);
+  box-shadow:
+    var(--edge),
+    0 0 22px -8px rgba(var(--c-rgb), 0.7);
+}
+.stream-text .col-head .edge {
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--c);
+  transform-origin: 0 50%;
+}
+.stream-text .col-head .slot {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-chip);
+  background: rgba(var(--c-rgb), 0.14);
+  box-shadow: inset 0 0 0 1px rgba(var(--c-rgb), 0.3);
+  color: var(--c);
+  font-size: var(--fs-small);
+  font-weight: 700;
+}
+.stream-text .col-head .name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--high);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stream-text .col-head .quant {
+  padding: 1px 6px;
+  border-radius: var(--radius-chip);
+  background: rgba(var(--high-rgb), 0.05);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+}
+.stream-text .col-head .quant:empty {
+  display: none;
+}
+.stream-text .col-head .figs {
+  display: flex;
+  /* On a narrow column the figures wrap instead of running out of the header. */
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px 12px;
+  min-width: 0;
+  margin-left: auto;
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.stream-text .col-head .differ,
+.stream-text .col-head .first {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--dis);
+}
+/* The disagreement shape: a small triangle, as under the Timeline. */
+.stream-text .col-head .tri {
+  width: 0;
+  height: 0;
+  border-right: 4px solid transparent;
+  border-bottom: 6px solid var(--dis);
+  border-left: 4px solid transparent;
+}
+/* "diverges #n →": a solid magenta chip that takes you to the seam. */
+.stream-text .col-head .first {
+  padding: 1px 9px;
+  border-radius: 999px;
+  background: rgba(var(--dis-rgb), 0.08);
+  box-shadow: inset 0 0 0 1px var(--dis);
+  color: var(--dis);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease);
+}
+.stream-text .col-head .first:hover {
+  background: rgba(var(--dis-rgb), 0.2);
+}
+.stream-text .col-head .first:focus-visible {
+  outline: 2px solid rgba(var(--high-rgb), 0.6);
+  outline-offset: 2px;
+}
+.stream-text .col-head .count:empty {
+  display: none;
+}
+.stream-text .col-head .role {
+  flex-basis: 100%;
+  padding-left: 28px; /* under the name, past the badge */
+  color: var(--low);
+  font-size: var(--fs-small);
+}
+.stream-text .col-head .role:empty {
+  display: none;
+}
+
+.stream-text .col-wait {
+  color: var(--low);
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+}
+
+/* ------------------------------------------------------------ tokens */
+
+.stream-text span[data-g],
+.stream-text span[data-o] {
+  cursor: default;
+  border-radius: 4px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  /* Room for the sticky header when a token is scrolled into view. */
+  scroll-margin-top: 72px;
+  transition:
+    background-color 120ms var(--ease),
+    box-shadow 120ms var(--ease);
+}
+.stream-text .prompt {
+  color: var(--prompt);
+}
+/* Control tokens: small rounded chips. */
+.stream-text .ctl {
+  display: inline-block;
+  margin: 0 3px;
+  padding: 0 7px;
+  border-radius: var(--radius-chip);
+  background: rgba(var(--high-rgb), 0.05);
+  box-shadow: inset 0 0 0 1px rgba(var(--high-rgb), 0.1);
+  color: var(--muted);
+  font-size: var(--fs-small);
+  line-height: 1.75;
+  vertical-align: 1px;
+  white-space: pre;
+}
+.stream-text .ctl.prompt {
+  color: var(--prompt);
+}
+/* End of generation: a small solid square after the token. */
+.stream-text .eog::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 1.5px;
+  background: var(--high);
+  vertical-align: 1px;
+}
+/* Selection is neutral white: cyan means model A. The spread shadow pads
+   the highlight without moving the text. */
+.stream-text .sel {
+  background: rgba(var(--high-rgb), 0.08);
+  box-shadow: 0 0 0 2px rgba(var(--high-rgb), 0.08);
+}
+.stream-text .sel.pin {
+  background: rgba(var(--high-rgb), 0.13);
+  box-shadow:
+    0 0 0 2px rgba(var(--high-rgb), 0.13),
+    0 0 0 3px rgba(var(--high-rgb), 0.6);
+}
+.stream-text .ctl.sel {
+  background: rgba(var(--high-rgb), 0.12);
+}
+.stream-text .stop:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  padding: 1px 10px 1px 8px;
+  border-radius: 999px;
+  background: rgba(var(--high-rgb), 0.04);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--fs-small);
+  line-height: 1.6;
+  user-select: none;
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+.stream-text .stop:not(:empty)::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 1.5px;
+  background: var(--muted);
+}
+/* Disagreement: a thin magenta line under the token, out of the line flow
+   so the text does not move. Its opacity follows the divergence (--js,
+   0..1 bit). */
+.stream-text .dis {
+  position: relative;
+}
+.stream-text .dis::before {
+  content: '';
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 1px;
+  left: 1px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--dis);
+  opacity: calc(0.4 + 0.6 * var(--js, 1));
+  pointer-events: none;
+}
+/* In the other column, a pick that is not the text: a magenta pill. */
+.stream-text .diff {
+  margin: 0 1px;
+  padding: 0 3px;
+  border-radius: 5px;
+  background: rgba(var(--dis-rgb), 0.12);
+  box-shadow: inset 0 0 0 1px rgba(var(--dis-rgb), calc(0.3 + 0.4 * var(--js, 1)));
+}
+.stream-text .diff.sel {
+  background: rgba(var(--dis-rgb), 0.24);
+  box-shadow: inset 0 0 0 1px rgba(var(--dis-rgb), 0.8);
+}
+.stream-text .diff.sel.pin {
+  box-shadow:
+    inset 0 0 0 1px rgba(var(--dis-rgb), 0.8),
+    0 0 0 2px rgba(var(--high-rgb), 0.6);
+}
+/* The first disagreement, in both columns: a thin solid magenta ring, out
+   of the line flow. Pinned, it sits outside the selection ring. */
+.stream-text .first-dis {
+  outline: 1.5px solid var(--dis);
+  outline-offset: 1px;
+}
+.stream-text .first-dis.pin {
+  outline-offset: 3px;
+}
+
+/* The seam (render/seam.ts): over the columns, 12px wider each side for
+   the margin bars, never taking the pointer. It joins the first
+   disagreement's line in both columns through the gap between them. */
+.stream-text .seam {
+  position: absolute;
+  top: 0;
+  left: -12px;
+  width: calc(100% + 24px);
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 280ms var(--ease),
+    visibility 0s linear 280ms;
+}
+.stream-text .seam.on {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 280ms var(--ease);
+}
+.stream-text .seam-line {
+  fill: none;
+  stroke: var(--dis);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+.stream-text .seam-dot,
+.stream-text .seam-mark {
+  fill: var(--dis);
+}
+.stream-text .seam-label {
+  fill: var(--dis);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  text-anchor: middle;
+}
+
+/* Where the two models part, in both columns. */
+.stream-text .split-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px;
+  padding: 0 9px 0 7px;
+  border-radius: 999px;
+  background: rgba(var(--dis-rgb), 0.1);
+  box-shadow: inset 0 0 0 1px rgba(var(--dis-rgb), 0.45);
+  color: var(--dis);
+  font-family: var(--font-ui);
+  font-size: var(--fs-small);
+  font-weight: 500;
+  line-height: 1.7;
+  user-select: none;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------- hover card */
+
+.tok-card {
+  --c: var(--a);
+  --c-rgb: var(--a-rgb);
+  position: fixed;
+  z-index: 20;
+  width: 240px;
+  padding: 10px 12px 9px;
+  border-radius: var(--radius-control);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--fs-small);
+  line-height: 1.4;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(3px);
+  transition:
+    opacity 120ms var(--ease),
+    transform 120ms var(--ease);
+}
+.tok-card.b {
+  --c: var(--b);
+  --c-rgb: var(--b-rgb);
+}
+.tok-card.on {
+  opacity: 1;
+  transform: none;
+}
+.tok-card [hidden] {
+  display: none !important;
+}
+.tok-card .tc-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tok-card .tc-slot {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: rgba(var(--c-rgb), 0.16);
+  color: var(--c);
+  font-size: 10px;
+  font-weight: 700;
+}
+.tok-card .tc-ent {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.tok-card .tc-tok {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 6px 0 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.tok-card .tc-text {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+.tok-card .tc-p {
+  margin-left: auto;
+  color: var(--high);
+  font-family: var(--font-mono);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tok-card .tc-rows {
+  display: grid;
+  gap: 3px;
+}
+.tok-card .tc-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) 64px 40px;
+  align-items: center;
+  gap: 6px;
+}
+/* The model's pick: a dot in its colour. */
+.tok-card .tc-row::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.tok-card .tc-row.pick::before {
+  background: var(--c);
+  box-shadow: 0 0 6px rgba(var(--c-rgb), 0.8);
+}
+.tok-card .tc-label {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+.tok-card .tc-row.on .tc-label {
+  color: var(--high);
+}
+.tok-card .tc-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(var(--high-rgb), 0.06);
+}
+.tok-card .tc-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgba(var(--c-rgb), 0.45), var(--c));
+}
+.tok-card .tc-pct {
+  color: var(--high);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* ---------------------------------------------------------- animation 1 */
+
+/* The copy flying from Candidates (it lives in <body>), and the glow it
+   lands with, in the colour of its column. Animation 3 (render/split.ts)
+   uses the Web Animations API. */
+.fly {
+  display: none;
+  position: fixed;
+  z-index: 10;
+  margin: 0;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-text);
+  line-height: 1.8;
+  white-space: pre;
+  color: var(--high);
+  text-shadow:
+    0 0 6px rgba(var(--front-rgb), 0.9),
+    0 0 18px rgba(var(--front-rgb), 0.45);
+  transform-origin: 0 50%;
+}
+.stream-text .born {
+  animation: born 320ms ease-out;
+}
+@keyframes born {
+  from {
+    text-shadow: 0 0 10px rgba(var(--c-rgb, var(--front-rgb)), 0.95);
+  }
+  to {
+    text-shadow: 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stream-text .born {
+    animation: none;
+  }
+  .stream-text .col-head,
+  .stream-text .seam,
+  .stream-text .seam.on,
+  .stream-text span[data-g],
+  .stream-text span[data-o],
+  .stream-text .col-head .first,
+  .tok-card {
+    transition: none;
+  }
+  .tok-card {
+    transform: none;
+  }
+}

@@ -1,0 +1,30 @@
+[
+  {
+    "file": "samples/qwen3.5-4b-q2-vs-q8.ils",
+    "title": "Q2 vs Q8: same text, then each its own",
+    "models": ["Qwen3.5 4B Q2_K", "Qwen3.5 4B Q8_0"],
+    "description": "The same 4B model at two quantizations. First both read the same text and their picks are compared token by token; then each follows its own picks and the texts part at the first disagreement.",
+    "size": 98014
+  },
+  {
+    "file": "samples/qwen3.5-4b-q2-vs-q8-gates.ils",
+    "title": "Gates and a JSON grammar",
+    "models": ["Qwen3.5 4B Q2_K", "Qwen3.5 4B Q8_0"],
+    "description": "A JSON grammar plus penalties, top-k, top-p and temperature, changed halfway to top-k, min-p and a lower temperature. Watch which candidates each gate lets through.",
+    "size": 43606
+  },
+  {
+    "file": "samples/qwen3.5-4b-q2-vs-q8-branches.ils",
+    "title": "Branches",
+    "models": ["Qwen3.5 4B Q2_K", "Qwen3.5 4B Q8_0"],
+    "description": "Generation forked at several points by picking another candidate. Every branch stays in the recording: open any of them from the timeline.",
+    "size": 88921
+  },
+  {
+    "file": "samples/qwen3.5-0.8b-q4-vs-q8-lens.ils",
+    "title": "Relief 3D with the logit lens",
+    "models": ["Qwen3.5-0.8B Q4_K", "Qwen3.5-0.8B Q8_0"],
+    "description": "A thousand tokens from the 0.8B model at two quantizations, with the logit lens on eight layers. Open Relief 3D and switch to Layers to see the answer take shape through the network.",
+    "size": 739578
+  }
+]
