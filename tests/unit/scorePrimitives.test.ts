@@ -6,6 +6,7 @@ import {
   normalizeEntityShape,
   normalizeEntityStyle,
   parseAngleToRad,
+  parseBlockingCues,
   parseEntityPivotRatio,
   parseLensFocalLengthMm,
   parseOptionalVec3,
@@ -13,7 +14,7 @@ import {
   parseVec3,
 } from '../../src/core/scorePrimitives';
 import { radToDeg } from '../../src/core/sphericalMath';
-import { makeScoreYaml, parseValidScore } from '../helpers/scoreFixtures';
+import { makeEntityDef, makeScoreYaml, parseValidScore } from '../helpers/scoreFixtures';
 
 describe('scorePrimitives — Vector, Angle, Enum, Dimension & Pivot Normalizers', () => {
   it('correctly parses vector, angle, lens, and target primitives and fallbacks', () => {
@@ -428,5 +429,72 @@ shots:
     expect(score.blocking![1].pivotRatio).toBe(0.25);
     expect(score.blocking![2].pivotRatio).toBe(0);
     expect(score.shots[0].entities.ground_actor.pivotRatio).toBe(1);
+  });
+});
+
+describe('parseBlockingCues — Continuous adjacent-end chaining', () => {
+  const entities = [
+    makeEntityDef({ id: 'ruby', label: 'Ruby', position: { x: 0, y: 0, z: 0 } }),
+  ];
+
+  it('chains omitted starts from the immediately preceding cue end in continuous mode', () => {
+    const missing: string[] = [];
+    const cues = parseBlockingCues(
+      [
+        { id: 'b1', entity: 'ruby', start: 1.0, end: 5.0 },
+        { id: 'b2', entity: 'ruby', duration: 2.5 },
+        { id: 'b3', entity: 'ruby', start: 9.0, end: 11.0 },
+        { id: 'b4', entity: 'ruby', end: 14.0 },
+      ],
+      entities,
+      true,
+      missing
+    )!;
+
+    expect(missing).toEqual([]);
+    expect(cues.map((c) => [c.startSec, c.endSec])).toEqual([
+      [1.0, 5.0],
+      [5.0, 7.5],
+      [9.0, 11.0],
+      [11.0, 14.0],
+    ]);
+  });
+
+  it('never inflates a chained start from a historical long cue with non-monotonic ends', () => {
+    const cues = parseBlockingCues(
+      [
+        { id: 'long', entity: 'ruby', start: 0.0, end: 12.0 },
+        { id: 'short', entity: 'ruby', end: 6.0 },
+        { id: 'tail', entity: 'ruby', duration: 1.0 },
+      ],
+      entities,
+      true
+    )!;
+
+    expect(cues[0].startSec).toBe(0.0);
+    expect(cues[0].endSec).toBe(12.0);
+    // end 6 is before the chained start -> keep the 0.016s minimum window clamp
+    expect(cues[1].startSec).toBe(12.0);
+    expect(cues[1].endSec).toBeCloseTo(12.016, 4);
+    // adjacent-end semantics: tail starts at short's clamped end, not 12.0
+    expect(cues[2].startSec).toBeCloseTo(12.016, 4);
+    expect(cues[2].endSec).toBeCloseTo(13.016, 4);
+  });
+
+  it('defaults omitted starts to 0 and collects missing ids outside continuous mode', () => {
+    const missing: string[] = [];
+    const cues = parseBlockingCues(
+      [
+        { id: 'b1', entity: 'ruby', start: 0.0, end: 3.0 },
+        { id: 'b2', entity: 'ruby', end: 6.0 },
+      ],
+      entities,
+      false,
+      missing
+    )!;
+
+    expect(cues[0].startSec).toBe(0.0);
+    expect(cues[1].startSec).toBe(0.0);
+    expect(missing).toEqual(['b2']);
   });
 });

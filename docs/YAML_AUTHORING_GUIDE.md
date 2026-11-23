@@ -946,7 +946,7 @@ blocking:
 
 #### Continuous Auto-Chaining & Instant Cuts (`continuous: true` & `cut: true`)
 Just like camera tracks, `blocking:` supports continuous timeline auto-chaining and instant jump cut placement:
-- **Timestamp Auto-Chaining**: In continuous mode (`continuous: true` at score root or on the cue), omitting `start:` automatically chains `startSec = prevBlockEndSec` with monotonic time advancement (`Math.max`), allowing beats down the document to flow sequentially forward in time.
+- **Timestamp Auto-Chaining**: In continuous mode (`continuous: true` at score root or on the cue), omitting `start:` automatically chains `startSec` to the **immediately preceding** cue's `endSec`. The chain always follows the adjacent beat end — a long earlier beat can never lift a later start — so beats down the document stay strictly end-to-end.
 - **Instant Cut Placement (`cut: true`)**: For montage jump cuts or instant relocations without walking, declare `cut: true`. The entity manifests immediately at `position` at `startSec` (`startPos = position`), cross-stage sliding is prevented, the floor trail is suppressed (`trailPoints = []`), and auto-facing toward the previous room is disabled.
 - **Continuous Override**: Setting `continuous: false` on a cue breaks continuity to author an independent scene setup or flashback.
 

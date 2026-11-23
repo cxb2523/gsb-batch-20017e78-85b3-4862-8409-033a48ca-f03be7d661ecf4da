@@ -512,14 +512,25 @@ export function parseStageScore(
         }
       : undefined;
 
-  const warning =
-    missingStartShotIds.length > 0
-      ? `Shot "${missingStartShotIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" at root to auto-chain.`
-      : missingStartObserverShotIds.length > 0
-      ? `Observer shot "${missingStartObserverShotIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" to auto-chain.`
-      : missingStartBlockingCueIds.length > 0
-      ? `Blocking cue "${missingStartBlockingCueIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" to auto-chain.`
-      : null;
+  // Surface every timeline that has missing-start cues instead of masking the
+  // observer/blocking problems behind whichever category is checked first.
+  const warningParts: string[] = [];
+  if (missingStartShotIds.length > 0) {
+    warningParts.push(
+      `Shot "${missingStartShotIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" at root to auto-chain.`
+    );
+  }
+  if (missingStartObserverShotIds.length > 0) {
+    warningParts.push(
+      `Observer shot "${missingStartObserverShotIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" to auto-chain.`
+    );
+  }
+  if (missingStartBlockingCueIds.length > 0) {
+    warningParts.push(
+      `Blocking cue "${missingStartBlockingCueIds[0]}" omits "start" (defaulted to 0.0s). Add "start:" or declare "continuous: true" to auto-chain.`
+    );
+  }
+  const warning = warningParts.length > 0 ? warningParts.join(' ') : null;
 
   return {
     score: {

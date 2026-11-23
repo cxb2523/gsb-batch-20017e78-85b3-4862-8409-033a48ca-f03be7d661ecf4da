@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Strict End-to-End Continuous Chaining Across All Three Timelines (`src/core/scorePrimitives.ts`, `src/core/scoreParser.ts`, `tests/unit/scoreParser.test.ts`, `tests/unit/scorePrimitives.test.ts`, `tests/unit/cameraCueParser.test.ts`)**:
+  - Fixed `parseBlockingCues` continuous auto-chaining, which advanced from the historical maximum end (`Math.max(prevBlockEndSec, endSec)`) instead of the immediately preceding cue's end. A long earlier blocking beat could therefore inflate the chained `start` of a later short beat, desyncing blocking from the camera time windows. Both the multi-entity `entities:` beat branch and the single-entity (`entity`/`actor`) branch now set `prevBlockEndSec = endSec`, matching the adjacent-end semantics already used by `shots` (`scoreParser`) and `observer_shots` (`parseObserverShots`); explicit `start:` remains strictly respected and the `startSec + 0.016s` minimum-window clamp is unchanged.
+  - The three timelines (`shots`, `observer_shots`, `blocking`) each keep an independent previous-end cursor, so continuous chaining on one axis never influences another.
+  - Aggregated the missing-`start` parse warning so that every timeline category with omitted starts is reported (shot, observer shot, blocking cue) instead of only the first category, while preserving each category's original message wording.
+
 ## [1.3.0] - 2026-11-23
 
 ### Added

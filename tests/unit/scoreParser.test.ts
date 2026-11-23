@@ -739,4 +739,235 @@ shots:
       ).toBeUndefined();
     });
   });
+
+  describe('Continuous end-to-end chaining across shots, observer_shots and blocking', () => {
+    it('chains all three timelines strictly end-to-start while advancing each independently', () => {
+      const { score, error, warning } = parseStageScore(
+        makeScoreYaml(
+          `
+entities:
+  - id: "ruby"
+    kind: "character"
+    position: [0, 0, 0]
+shots:
+  - id: "shot-a"
+    end: 4.0
+  - id: "shot-b"
+    end: 9.0
+  - id: "shot-c"
+    start: 20.0
+    end: 24.0
+observer_shots:
+  - id: "obs-a"
+    end: 3.0
+  - id: "obs-b"
+    end: 7.0
+  - id: "obs-c"
+    start: 11.0
+    end: 13.0
+blocking:
+  - id: "block-a"
+    actor: "ruby"
+    start: 0.0
+    duration: 2.0
+  - id: "block-b"
+    actor: "ruby"
+    duration: 3.0
+  - id: "block-c"
+    actor: "ruby"
+    start: 8.0
+    end: 10.0
+`,
+          { id: 'three-axis-continuous', continuous: true }
+        )
+      );
+      expect(error).toBeNull();
+      expect(warning).toBeNull();
+
+      // Film shots: omitted starts inherit the immediately preceding end.
+      expect(score!.shots.map((s) => [s.startSec, s.endSec])).toEqual([
+        [0.0, 4.0],
+        [4.0, 9.0],
+        [20.0, 24.0],
+      ]);
+
+      // Observer timeline chains on its own previous end, not on film-shot ends.
+      expect(score!.observerShots!.map((s) => [s.startSec, s.endSec])).toEqual([
+        [0.0, 3.0],
+        [3.0, 7.0],
+        [11.0, 13.0],
+      ]);
+
+      // Blocking timeline likewise chains independently from its own prev end.
+      expect(score!.blocking!.map((b) => [b.startSec, b.endSec])).toEqual([
+        [0.0, 2.0],
+        [2.0, 5.0],
+        [8.0, 10.0],
+      ]);
+    });
+
+    it('does not lift a blocking chained start from an earlier long beat with non-monotonic ends', () => {
+      const score = parseValidScore(
+        makeScoreYaml(
+          `
+entities:
+  - id: "ruby"
+    kind: "character"
+    position: [0, 0, 0]
+blocking:
+  - id: "long-beat"
+    actor: "ruby"
+    start: 0.0
+    end: 12.0
+  - id: "short-beat"
+    actor: "ruby"
+    end: 6.0
+  - id: "follow-beat"
+    actor: "ruby"
+    duration: 1.0
+shots:
+  - id: "s1"
+    start: 0
+    end: 12
+`,
+          { id: 'blocking-non-monotonic', continuous: true }
+        )
+      );
+
+      const blocking = score.blocking!;
+      expect(blocking).toHaveLength(3);
+      expect(blocking[0].startSec).toBe(0.0);
+      expect(blocking[0].endSec).toBe(12.0);
+      // start chains from the long beat's end (12); end 6 clamps to 12 + min window.
+      expect(blocking[1].startSec).toBe(12.0);
+      expect(blocking[1].endSec).toBeCloseTo(12.016, 4);
+      // The next start must follow the *immediately preceding* clamped end,
+      // not be re-inflated by the historical 12.0 max.
+      expect(blocking[2].startSec).toBeCloseTo(12.016, 4);
+      expect(blocking[2].endSec).toBeCloseTo(13.016, 4);
+    });
+
+    it('keeps multi-entity beat blocking chained from the preceding beat with non-monotonic ends', () => {
+      const score = parseValidScore(
+        makeScoreYaml(
+          `
+entities:
+  - id: "ruby"
+    kind: "character"
+  - id: "evan"
+    kind: "character"
+blocking:
+  - id: "beat-long"
+    start: 0.0
+    end: 10.0
+    entities:
+      ruby: { position: [1, 0, 0] }
+      evan: { position: [-1, 0, 0] }
+  - id: "beat-short"
+    end: 4.0
+    entities:
+      ruby: { position: [2, 0, 0] }
+      evan: { position: [-2, 0, 0] }
+  - id: "beat-tail"
+    actor: "ruby"
+    duration: 2.0
+shots:
+  - id: "s1"
+    start: 0
+    end: 12
+`,
+          { id: 'blocking-multi-entity-non-monotonic', continuous: true }
+        )
+      );
+
+      const byId = new Map(score.blocking!.map((b) => [b.id, b]));
+      expect(byId.get('beat-short:ruby')!.startSec).toBe(10.0);
+      expect(byId.get('beat-short:ruby')!.endSec).toBeCloseTo(10.016, 4);
+      expect(byId.get('beat-short:evan')!.startSec).toBe(10.0);
+      expect(byId.get('beat-tail')!.startSec).toBeCloseTo(10.016, 4);
+      expect(byId.get('beat-tail')!.endSec).toBeCloseTo(12.016, 4);
+    });
+
+    it('aggregates missing-start warnings across every affected timeline category', () => {
+      const { score, error, warning } = parseStageScore(
+        makeScoreYaml(
+          `
+entities:
+  - id: "ruby"
+    kind: "character"
+shots:
+  - id: "shot-1"
+    start: 0.0
+    end: 5.0
+  - id: "shot-2"
+    end: 10.0
+observer_shots:
+  - id: "obs-1"
+    start: 0.0
+    end: 4.0
+  - id: "obs-2"
+    end: 8.0
+blocking:
+  - id: "block-1"
+    actor: "ruby"
+    start: 0.0
+    end: 3.0
+  - id: "block-2"
+    actor: "ruby"
+    end: 6.0
+`,
+          { id: 'all-axis-missing-start' }
+        )
+      );
+      expect(error).toBeNull();
+      expect(score).not.toBeNull();
+      expect(warning).not.toBeNull();
+      expect(warning).toContain('Shot "shot-2" omits "start"');
+      expect(warning).toContain('Observer shot "obs-2" omits "start"');
+      expect(warning).toContain('Blocking cue "block-2" omits "start"');
+
+      // Every omitted start still defaults to 0 outside continuous mode.
+      expect(score!.shots[1].startSec).toBe(0.0);
+      expect(score!.observerShots![1].startSec).toBe(0.0);
+      expect(score!.blocking![1].startSec).toBe(0.0);
+    });
+
+    it('reports both observer and blocking missing-start warnings when film shots are explicit', () => {
+      const { warning } = parseStageScore(
+        makeScoreYaml(
+          `
+entities:
+  - id: "ruby"
+    kind: "character"
+shots:
+  - id: "shot-1"
+    start: 0.0
+    end: 5.0
+  - id: "shot-2"
+    start: 5.0
+    end: 10.0
+observer_shots:
+  - id: "obs-1"
+    start: 0.0
+    end: 4.0
+  - id: "obs-2"
+    end: 8.0
+blocking:
+  - id: "block-1"
+    actor: "ruby"
+    start: 0.0
+    end: 3.0
+  - id: "block-2"
+    actor: "ruby"
+    end: 6.0
+`,
+          { id: 'two-axis-missing-start' }
+        )
+      );
+      expect(warning).not.toBeNull();
+      expect(warning).not.toContain('Shot ');
+      expect(warning).toContain('Observer shot "obs-2" omits "start"');
+      expect(warning).toContain('Blocking cue "block-2" omits "start"');
+    });
+  });
 });

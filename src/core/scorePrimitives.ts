@@ -431,6 +431,9 @@ export function parseBlockingCues(
 ): BlockingCueSpec[] | undefined {
   if (!Array.isArray(rawBlocking)) return undefined;
   const cues: BlockingCueSpec[] = [];
+  // End of the immediately preceding blocking entry. Continuous entries chain
+  // from this exact value (never the historical max end), so a long earlier
+  // beat cannot lift the start of a later short beat.
   let prevBlockEndSec = 0;
 
   rawBlocking.forEach((item, idx) => {
@@ -498,7 +501,9 @@ export function parseBlockingCues(
         endSec = startSec + 5.0;
       }
 
-      prevBlockEndSec = Math.max(prevBlockEndSec, endSec);
+      // Continuous chaining always advances from the immediately preceding
+      // cue's end. A long earlier beat must not lift later chained starts.
+      prevBlockEndSec = endSec;
 
       for (const [entKey, rawOv] of Object.entries(
         obj.entities as Record<string, unknown>
@@ -609,7 +614,9 @@ export function parseBlockingCues(
         endSec = startSec + 5.0;
       }
 
-      prevBlockEndSec = Math.max(prevBlockEndSec, endSec);
+      // Continuous chaining always advances from the immediately preceding
+      // cue's end. A long earlier beat must not lift later chained starts.
+      prevBlockEndSec = endSec;
 
       cues.push({
         id: baseId,

@@ -502,4 +502,61 @@ shots:
     expect(obsTarget.y).toBeCloseTo(1.5, 4);
     expect(obsTarget.z).toBeCloseTo(-1.0, 4);
   });
+
+  it('chains observer shots end-to-start from the adjacent cue in continuous mode', () => {
+    const missing: string[] = [];
+    const cues = parseObserverShots(
+      [
+        { id: 'obs-1', end: 4.0 },
+        { id: 'obs-2', end: 9.0 },
+        { id: 'obs-3', start: 12.0, end: 15.0 },
+        { id: 'obs-4', end: 20.0 },
+      ],
+      35,
+      true,
+      missing
+    )!;
+
+    expect(missing).toEqual([]);
+    expect(cues.map((c) => [c.startSec, c.endSec])).toEqual([
+      [0.0, 4.0],
+      [4.0, 9.0],
+      [12.0, 15.0],
+      [15.0, 20.0],
+    ]);
+  });
+
+  it('clamps an observer end earlier than its chained start to the minimum window', () => {
+    const cues = parseObserverShots(
+      [
+        { id: 'obs-1', start: 0.0, end: 10.0 },
+        { id: 'obs-2', end: 3.0 },
+        { id: 'obs-3', end: 12.0 },
+      ],
+      35,
+      true
+    )!;
+
+    expect(cues[1].startSec).toBe(10.0);
+    expect(cues[1].endSec).toBeCloseTo(10.1, 4);
+    // adjacent-end chaining, not historical max
+    expect(cues[2].startSec).toBeCloseTo(10.1, 4);
+    expect(cues[2].endSec).toBe(12.0);
+  });
+
+  it('defaults omitted observer starts to 0 and records missing ids outside continuous mode', () => {
+    const missing: string[] = [];
+    const cues = parseObserverShots(
+      [
+        { id: 'obs-1', start: 0.0, end: 4.0 },
+        { id: 'obs-2', end: 8.0 },
+      ],
+      35,
+      false,
+      missing
+    )!;
+
+    expect(cues[1].startSec).toBe(0.0);
+    expect(missing).toEqual(['obs-2']);
+  });
 });
