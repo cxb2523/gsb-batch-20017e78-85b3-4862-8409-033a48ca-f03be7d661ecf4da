@@ -160,8 +160,15 @@
   // 归零后的可撤回窗口（10 秒）。刻意不显示倒计时：只把「归零」按钮临时变成「撤回」。
   const CLEAR_UNDO_MS = 10000
   let clearUndoArmed = false
-  let clearUndoSnap = null    // { mode:'sand', snap } 或 { mode:'ink' }（墨的快照存在引擎里）
+  // 快照必须记住来源物态，撤回时只还原到匹配的画布：
+  //   { mode:'sand', snap }               —— 沙网格快照（SandSim）
+  //   { mode:'ink' } / { mode:'fine' } / { mode:'still' } —— 墨染料快照（存在引擎 _snap 里，三者共用同一水墨画布）
+  let clearUndoSnap = null
   let clearUndoTimer = 0
+
+  // 墨/精/静共用同一块水墨画布（同一个 Suminagashi 染料场），沙用独立的 SandSim 层。
+  // 撤回只在同一“画布家族”内有效；跨家族（墨 ↔ 沙）一律安全放弃，避免把沙贴到墨上或反之。
+  function canvasFamily(mode) { return mode === 'sand' ? 'sand' : 'ink' }
 
   // ── 坐标：屏幕像素 → 归一化 UV（y 翻转，因为 WebGL 原点在左下）──
   function toUV(e, r) {
@@ -478,6 +485,11 @@
     aiToggle.textContent = isOn ? I18N[state.lang].aiOn : I18N[state.lang].aiOff
   }
   function setMode(m) {
+    // 离开沙模式：立刻终止 AI 正在进行的连浇。否则 aiPour 会挂着旧坐标，
+    // 下次切回沙时 advanceAiPour 又从老位置继续倒沙。
+    if (state.mode === 'sand' && m !== 'sand') aiPour = null
+    // 任何物态切换都让 AI 的下一次行动重新计时：不能一进新画布就立刻落笔。
+    nextDropAt = performance.now() + state.aiPatience * 1000
     const params = MODE_PARAMS[m] || null
     const wasCustom = !!MODE_PARAMS[state.mode]
     if (params) {
@@ -725,22 +737,32 @@
     clearUndoTimer = setTimeout(cancelClearUndo, CLEAR_UNDO_MS)
   }
   function performClearUndo() {
-    if (!clearUndoArmed || !clearUndoSnap) { cancelClearUndo(); return }
-    if (clearUndoSnap.mode === 'sand' && sand) sand.restore(clearUndoSnap.snap)
-    else engine.restoreDye()
+    // 物态不匹配（例：墨归零后切到精/静，或沙归零后切到墨）→ 旧快照不属于当前画布，
+    // 安全放弃：不还原任何东西，只关闭窗口并恢复「归零」标签。
+    if (!clearUndoArmed || !clearUndoSnap ||
+        canvasFamily(clearUndoSnap.mode) !== canvasFamily(state.mode)) {
+      cancelClearUndo()
+      return
+    }
+    if (clearUndoSnap.mode === 'sand') {
+      if (sand) sand.restore(clearUndoSnap.snap)
+    } else {
+      // 墨 / 精 / 静共用同一块水墨画布，引擎里的染料快照对三者都有效
+      engine.restoreDye()
+    }
     cancelClearUndo()
   }
 
   on($('clear'), 'click', () => {
-    if (clearUndoArmed) { performClearUndo(); return }   // 第二次点 = 撤回
-    // 第一次点 = 归零：先留一份可撤回的快照，再清空
-    // （并取消沙模式下 AI 正在进行的连浇，让它成为一次真正的重置）
+    if (clearUndoArmed) { performClearUndo(); return }   // 第二次点 = 撤回（或物态不符时安全放弃）
+    // 第一次点 = 归零：先留一份带来源物态的可撤回快照，再清空
+    // （沙模式同时取消 AI 正在进行的连浇，让它成为一次真正的重置）
     if (state.mode === 'sand' && sand) {
       clearUndoSnap = { mode: 'sand', snap: sand.snapshot() }
       sand.clear(); aiPour = null
     } else {
       engine.snapshotDye()
-      clearUndoSnap = { mode: 'ink' }
+      clearUndoSnap = { mode: state.mode }   // 如实记录来源：ink / fine / still
       engine.clear()
     }
     armClearUndo()
@@ -877,7 +899,12 @@
   window.__ink = {
     engine, sand, state, aiTick, advanceAiPour, setMode,
     sound: window.Soundscape, movie: window.Movie,
-    clearUndoArmed: () => clearUndoArmed, performClearUndo, cancelClearUndo,
+    clearUndoArmed: () => clearUndoArmed,
+    clearUndoInfo: () => ({ armed: clearUndoArmed, mode: clearUndoSnap ? clearUndoSnap.mode : null }),
+    clearUndoMs: () => CLEAR_UNDO_MS,
+    performClearUndo, cancelClearUndo,
+    aiPourActive: () => !!aiPour,
+    nextDropAt: () => nextDropAt,
     wakeLockSupported: () => !!navigator.wakeLock,
   }
 

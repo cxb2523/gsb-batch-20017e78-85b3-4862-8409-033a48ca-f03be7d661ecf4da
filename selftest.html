@@ -38,6 +38,7 @@
       <button class="mode-btn active" data-mode="ink" role="tab" data-i18n-title="modeTipInk" aria-selected="true"><span data-i18n="modeInk">墨</span></button>
       <button class="mode-btn" data-mode="sand" role="tab" data-i18n-title="modeTipSand" aria-selected="false"><span data-i18n="modeSand">沙</span></button>
       <button class="mode-btn" data-mode="fine" role="tab" data-i18n-title="modeTipFine" aria-selected="false"><span data-i18n="modeFine">精</span></button>
+      <button class="mode-btn" data-mode="still" role="tab" data-i18n-title="modeTipStill" aria-selected="false"><span data-i18n="modeStill">静</span></button>
     </div>
     <div class="group" id="ink-group" data-i18n-aria="ariaInks" aria-label="你的墨色">
       <button class="ink" data-ink="sumi"   style="--c:#1a1a1f" data-i18n-title="inkSumi" title="松烟墨" aria-label="松烟墨"></button>
@@ -396,6 +397,228 @@
         check('归零后 10 秒内可撤回（沙：清空后能恢复颗粒）',
               sandBeforeUndo > 0 && sandAfterClear === 0 && sandAfterUndo === sandBeforeUndo,
               'before=' + sandBeforeUndo + ' cleared=' + sandAfterClear + ' undo=' + sandAfterUndo)
+
+        // ── g3) 撤回窗口与物态对齐（墨 / 沙 / 精 / 静 四态一致）──
+        const clearBtnX = document.getElementById('clear')
+        const clearLabel = () => clearBtnX.textContent
+        // 与 app.js 的 I18N 字典保持一致（自检不直接访问闭包内字典）
+        const LABEL_CLEAR = state.lang === 'en' ? 'Clear' : '归零'
+
+        // g3-1) 墨归零后切到「精」：撤回窗口必须关闭，按钮恢复「归零」；再点也不会动当前画布
+        hook.setMode('ink'); state.aiOn = false
+        engine.clear(); pump(2)
+        engine.strokeInk(0.5, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9); pump(10)
+        const g31Before = inkFraction()
+        clearBtnX.click()                                   // 墨画布归零（武装撤回，快照来源 = ink）
+        const g31ArmedInk = hook.clearUndoArmed()
+        const g31SnapMode = hook.clearUndoInfo().mode
+        pump(2)
+        const g31Cleared = inkFraction()
+        hook.setMode('fine')                                // 切物态 → 撤回窗口应立即关闭
+        const g31ClosedOnSwitch = hook.clearUndoArmed() === false
+        const g31LabelAfterSwitch = clearLabel()
+        const g31FineAtSwitch = inkFraction()
+        clearBtnX.click()                                   // 此刻按钮已是「归零」：按产品规约应再次归零，而不是撤回
+        pump(2)
+        const g31AfterClick = inkFraction()
+        check('墨归零后切精：切物态即关闭撤回窗口、按钮恢复「归零」',
+              g31ArmedInk && g31SnapMode === 'ink' && g31ClosedOnSwitch &&
+              g31LabelAfterSwitch.indexOf(LABEL_CLEAR) >= 0 && g31LabelAfterSwitch.indexOf('↩') < 0,
+              'armed=' + g31ArmedInk + ' snap=' + g31SnapMode + ' label="' + g31LabelAfterSwitch + '"')
+        check('墨归零后切精：再点按钮不会把旧墨快照贴到精画布（画面保持空白）',
+              g31Cleared < 0.02 && Math.abs(g31AfterClick - g31FineAtSwitch) < 0.003 && g31AfterClick < 0.02,
+              'cleared=' + g31Cleared.toFixed(4) + ' atSwitch=' + g31FineAtSwitch.toFixed(4) + ' after=' + g31AfterClick.toFixed(4) + ' before=' + g31Before.toFixed(4))
+
+        // g3-2) 沙归零后切回墨：撤回不得把沙快照贴到墨画布；窗口已关，点按钮只归零墨画布
+        hook.setMode('sand')
+        sand.clear(); sand.place(0.5, 0.5, 'sand', 6, 1)
+        for (let i = 0; i < 5; i++) sand.step(0.02)
+        const g32SandBefore = sand.countOf(S.SAND)
+        clearBtnX.click()                                   // 沙归零（快照来源 = sand）
+        const g32ArmedSand = hook.clearUndoArmed() && hook.clearUndoInfo().mode === 'sand'
+        const g32SandCleared = sand.countOf(S.SAND)
+        hook.setMode('ink')                                 // 沙 → 墨：窗口关闭
+        const g32Closed = hook.clearUndoArmed() === false
+        const g32InkAtSwitch = inkFraction()
+        clearBtnX.click()                                   // 墨画布归零（沙快照已丢弃，不可能被还原到墨上）
+        pump(2)
+        const g32InkAfter = inkFraction()
+        check('沙归零后切回墨：撤回窗口关闭且沙快照不会贴到墨画布',
+              g32ArmedSand && g32SandCleared === 0 && g32Closed &&
+              g32SandBefore > 0 && g32InkAfter < 0.02 && Math.abs(g32InkAfter - g32InkAtSwitch) < 0.003,
+              'sandBefore=' + g32SandBefore + ' inkAtSwitch=' + g32InkAtSwitch.toFixed(4) + ' inkAfter=' + g32InkAfter.toFixed(4))
+
+        // g3-3) 同物态内撤回仍然有效（精画布上归零 → 撤回，快照来源如实记为 fine）
+        hook.setMode('fine')
+        engine.clear(); pump(2)
+        engine.strokeInk(0.4, 0.5, window.INKS.shu, 2.0, 1, 0, 0.9); pump(10)
+        const g33Before = inkFraction()
+        clearBtnX.click()
+        const g33SnapMode = hook.clearUndoInfo().mode
+        pump(2)
+        const g33Cleared = inkFraction()
+        clearBtnX.click()                                   // 精 → 精：同族，正常撤回
+        pump(2)
+        const g33Undo = inkFraction()
+        check('精模式归零可撤回（快照记录来源物态 fine，同族还原）',
+              g33SnapMode === 'fine' && g33Cleared < 0.02 && g33Undo > g33Before * 0.8,
+              'snap=' + g33SnapMode + ' cleared=' + g33Cleared.toFixed(4) + ' undo=' + g33Undo.toFixed(4))
+
+        // g3-4) 静模式同态撤回（快照来源 = still）
+        hook.setMode('still')
+        engine.clear(); pump(2)
+        engine.strokeInk(0.6, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9); pump(6)
+        const g34Before = inkFraction()
+        clearBtnX.click()
+        const g34SnapMode = hook.clearUndoInfo().mode
+        pump(2)
+        const g34Cleared = inkFraction()
+        clearBtnX.click()
+        pump(2)
+        const g34Undo = inkFraction()
+        check('静模式归零可撤回（快照记录来源物态 still，同族还原）',
+              g34SnapMode === 'still' && g34Cleared < 0.02 && g34Undo > g34Before * 0.8,
+              'snap=' + g34SnapMode + ' cleared=' + g34Cleared.toFixed(4) + ' undo=' + g34Undo.toFixed(4))
+        hook.setMode('ink')
+
+        // g3-5) 墨归零 → 切静 → 切回墨：跨族保护路径下旧快照不会被还原（白盒验证 performClearUndo 守卫）
+        engine.clear(); pump(2)
+        engine.strokeInk(0.3, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9); pump(10)
+        const g35Before = inkFraction()
+        clearBtnX.click(); pump(2)                          // 归零并武装
+        hook.setMode('still'); hook.setMode('ink')          // 绕一圈回到墨画布（窗口在第一次切换时已关）
+        const g35GuardInfo = hook.clearUndoInfo()
+        check('切物态后撤回快照被丢弃（armed=false 且无残留 mode）',
+              g35GuardInfo.armed === false && g35GuardInfo.mode === null,
+              JSON.stringify(g35GuardInfo))
+        check('绕切一圈后原归零画面保持空白（旧快照无法盖回）',
+              inkFraction() < 0.002 && g35Before > inkFraction() + 0.003,
+              'now=' + inkFraction().toFixed(4) + ' before=' + g35Before.toFixed(4))
+
+        // g3-6) 用户重新落笔立即关闭撤回窗口（真实 pointerdown 路径，墨与沙各一次）
+        engine.clear(); pump(2)
+        engine.strokeInk(0.5, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9); pump(8)
+        clearBtnX.click()
+        const g36Armed = hook.clearUndoArmed()
+        document.getElementById('stage')
+          .dispatchEvent(new PointerEvent('pointerdown', { clientX: 300, clientY: 200, bubbles: true, cancelable: true }))
+        const g36ClosedByStroke = hook.clearUndoArmed() === false &&
+              clearLabel().indexOf(LABEL_CLEAR) >= 0
+        check('墨：归零后重新落笔立即关闭撤回窗口', g36Armed && g36ClosedByStroke,
+              'armedBefore=' + g36Armed + ' label="' + clearLabel() + '"')
+
+        hook.setMode('sand')
+        sand.clear(); sand.place(0.5, 0.5, 'sand', 6, 1)
+        clearBtnX.click()
+        const g36SandArmed = hook.clearUndoArmed()
+        document.getElementById('stage')
+          .dispatchEvent(new PointerEvent('pointerdown', { clientX: 300, clientY: 200, bubbles: true, cancelable: true }))
+        const g36SandClosed = hook.clearUndoArmed() === false
+        check('沙：归零后重新落笔立即关闭撤回窗口', g36SandArmed && g36SandClosed,
+              'armedBefore=' + g36SandArmed)
+        hook.setMode('ink')
+
+        // g3-7) 十秒超时：不操作自动关闭窗口并恢复「归零」标签（真实 setTimeout，等待超时值）
+        engine.clear(); pump(2)
+        engine.strokeInk(0.5, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9); pump(8)
+        clearBtnX.click()
+        const g37Armed = hook.clearUndoArmed()
+        const g37UndoMs = hook.clearUndoMs()
+        check('撤回窗口超时时长为 10 秒', g37UndoMs === 10000, 'ms=' + g37UndoMs)
+        await new Promise((resolve) => setTimeout(resolve, g37UndoMs + 250))
+        const g37TimedOut = hook.clearUndoArmed() === false &&
+              clearLabel().indexOf(LABEL_CLEAR) >= 0 && clearLabel().indexOf('↩') < 0
+        check('十秒内不操作：撤回窗口自动关闭、按钮恢复「归零」', g37Armed && g37TimedOut,
+              'armedBefore=' + g37Armed + ' label="' + clearLabel() + '"')
+
+        // g3-8) 沙归零同时终止 AI 连浇；切回沙后 AI 不在旧坐标继续落粒
+        hook.setMode('sand')
+        state.aiOn = true
+        sand.clear()
+        const tG38 = 3e12
+        state.lastUserActivity = tG38 - 60000
+        hook.aiTick(tG38)                                    // 启动一次连浇
+        const g38PourActiveAfterTick = hook.aiPourActive()
+        const g38PlaceSpy = (function () {
+          let n = 0
+          const o = sand.place.bind(sand)
+          sand.place = function () { n++; return o.apply(null, arguments) }
+          return { count: () => n, restore: () => { sand.place = o } }
+        })()
+        for (let i = 0; i < 3; i++) hook.advanceAiPour(tG38 + 16 * i)  // 连浇确实在落粒
+        const g38PoursBeforeClear = g38PlaceSpy.count()
+        clearBtnX.click()                                    // 归零：连浇必须被终止
+        const g38PourKilled = hook.aiPourActive() === false
+        for (let i = 0; i < 10; i++) hook.advanceAiPour(tG38 + 100 + 16 * i)
+        const g38NoPourAfterClear = g38PlaceSpy.count() === g38PoursBeforeClear
+        g38PlaceSpy.restore()
+        check('沙归零同时终止 AI 正在进行的连浇',
+              g38PourActiveAfterTick && g38PoursBeforeClear > 0 && g38PourKilled && g38NoPourAfterClear,
+              'pourAfterTick=' + g38PourActiveAfterTick + ' placesBefore=' + g38PoursBeforeClear + ' killed=' + g38PourKilled)
+
+        // 切走再切回：旧 aiPour 已销毁，且下一次行动重新计时，不会立刻落粒
+        // 先稳健地再起一次连浇（推进虚拟时间越过 nextDropAt，直到 aiPour 武装）
+        let g38OldSpot = false
+        for (let k = 1; k <= 8 && !hook.aiPourActive(); k++) {
+          hook.aiTick(tG38 + k * (state.aiPatience * 1000 + 500))
+        }
+        g38OldSpot = hook.aiPourActive()
+        hook.setMode('ink')
+        const g38PourClearedOnLeave = hook.aiPourActive() === false
+        const g38NextAtLeave = hook.nextDropAt()
+        hook.setMode('sand')
+        const g38PourClearedOnReturn = hook.aiPourActive() === false
+        const g38TimerReset = hook.nextDropAt() >= g38NextAtLeave
+        const g38Spy2 = (function () {
+          let n = 0
+          const o = sand.place.bind(sand)
+          sand.place = function () { n++; return o.apply(null, arguments) }
+          return { count: () => n, restore: () => { sand.place = o } }
+        })()
+        // 用“刚切回来”的时刻立刻推进若干帧：计时未到 + 无连浇 → 零落粒
+        const g38Now = performance.now()
+        hook.aiTick(g38Now)
+        for (let i = 0; i < 10; i++) hook.advanceAiPour(g38Now + 16 * i)
+        const g38NoOldSpotGrains = g38Spy2.count() === 0
+        g38Spy2.restore()
+        check('切回沙：旧连浇不复活、AI 时钟重新计时、不在旧坐标落粒',
+              g38OldSpot && g38PourClearedOnLeave && g38PourClearedOnReturn && g38TimerReset && g38NoOldSpotGrains,
+              'hadPour=' + g38OldSpot + ' leaveCleared=' + g38PourClearedOnLeave +
+              ' returnCleared=' + g38PourClearedOnReturn + ' timerReset=' + g38TimerReset + ' strayPlaces=' + g38Spy2.count())
+        state.aiOn = false
+        hook.setMode('ink')
+
+        // g3-9) AI 让位与物态切换对齐：进入精/静暂停，退出恢复“用户原先的开关”而非硬编码为开
+        state.aiOn = false                                    // 用户原先关着 AI
+        hook.setMode('fine')
+        const g39FineAiOff = state.aiOn === false
+        hook.setMode('ink')
+        const g39RestoredOff = state.aiOn === false
+        state.aiOn = true                                     // 用户原先开着 AI
+        hook.setMode('still')
+        const g39StillAiOff = state.aiOn === false
+        hook.setMode('ink')
+        const g39RestoredOn = state.aiOn === true
+        check('进精/静 AI 暂停，退出恢复用户原开关（关仍关、开仍开，不硬编码为开）',
+              g39FineAiOff && g39RestoredOff && g39StillAiOff && g39RestoredOn,
+              'fineOff=' + g39FineAiOff + ' backOff=' + g39RestoredOff + ' stillOff=' + g39StillAiOff + ' backOn=' + g39RestoredOn)
+
+        // g3-10) 切模式后 AI 下一次行动重新计时：立刻 aiTick 不会在新画布落笔
+        state.aiOn = true
+        state.lastUserActivity = performance.now() - 60000
+        engine.clear(); pump(2)
+        let g310Drops = 0
+        const g310Orig = engine.strokeInk.bind(engine)
+        engine.strokeInk = function () { g310Drops++; return g310Orig.apply(null, arguments) }
+        const g310SwitchAt = performance.now()
+        hook.setMode('ink')                                  // 切换会把 nextDropAt 推到一个完整耐心周期之后
+        hook.aiTick(g310SwitchAt + 50)                       // 紧接着 tick：计时未到，必须零落笔
+        engine.strokeInk = g310Orig
+        const g310TimerInFuture = hook.nextDropAt() > g310SwitchAt + 50
+        check('切模式后 AI 时钟重新计时（不会立刻在新画布落笔）',
+              g310Drops === 0 && g310TimerInFuture,
+              'drops=' + g310Drops + ' nextDropInFuture=' + g310TimerInFuture)
+        state.aiOn = false
 
         // h) 导出
         let surl = ''
