@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Background tabs now pause like offscreen canvases: drawing stops on `visibilitychange` while the page is hidden, and the first frame back advances the sky's clocks and transitions by the whole hidden interval in one step, so it returns exactly where uninterrupted drawing would have put it.
+- The light probe takes no measurements while hidden or out of view (no reads of stale or empty buffers). Its first measurement back is smoothed over the real elapsed interval, and taken without interpolation once the gap exceeds four smoothing time constants.
+- Reduced-motion still frames and `autoStart: false` `jump()` frames are repainted when the canvas re-enters the view or the tab becomes visible, so a cleared canvas is never left blank.
+- `dispose()` removes the `visibilitychange` listener and resolves pending `whenSettled()` calls with `false`; repeated `start()`/`stop()` no longer registers listeners more than once.
+
 ## 0.15.0 — 2026-11-20
 
 - Added optional world-space scenery: a lighthouse with a rotating beacon, two independently placed lights with water reflections, and two cloud banks with fixed centers.

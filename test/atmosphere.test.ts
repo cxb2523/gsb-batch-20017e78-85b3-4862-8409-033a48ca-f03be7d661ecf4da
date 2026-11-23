@@ -17,6 +17,7 @@ const { made, FakeRenderer, atStart } = vi.hoisted(() => {
     cumulonimbus = 'auto';
     render = vi.fn();
     prepare = vi.fn();
+    probe = vi.fn();
     dispose = vi.fn();
     // what isSettled answers: flipped by the tests as variants start and land
     linked = atStart.linked;
@@ -253,6 +254,25 @@ describe('out of view', () => {
     sky.dispose();
     expect(watching).toBe(false);
   });
+
+  it('repaints a still jump() frame on the way back, though no loop is running', () => {
+    const { sky, renderer } = mount({ autoStart: false }, inDocument());
+    sky.jump();
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+    view(false);
+    view(true);
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+  });
+
+  it('repaints a reduced-motion still frame on the way back', () => {
+    reduceMotion(true);
+    const { sky, renderer } = mount({}, inDocument());
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+    view(false);
+    view(true);
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+    expect(sky.state).toBeDefined();
+  });
 });
 
 describe('settling', () => {
@@ -366,3 +386,269 @@ describe('settling', () => {
     await expect(waiting).resolves.toBe(false);
   });
 });
+
+// A fake document for the visibilitychange listener, with the same capture
+// shape as the real one: Atmosphere adds and removes one listener.
+interface FakeDocument {
+  visibilityState: 'visible' | 'hidden';
+  addEventListener: (type: string, fn: () => void) => void;
+  removeEventListener: (type: string, fn: () => void) => void;
+  listeners: Record<string, (() => void)[]>;
+  hidden(): void;
+  shown(): void;
+}
+
+function fakeDocument(initial: 'visible' | 'hidden' = 'visible'): FakeDocument {
+  const doc: FakeDocument = {
+    visibilityState: initial,
+    listeners: {},
+    addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
+    removeEventListener(type, fn) {
+      this.listeners[type] = (this.listeners[type] ?? []).filter((f) => f !== fn);
+    },
+    hidden() { this.visibilityState = 'hidden'; this.listeners.visibilitychange?.forEach((f) => f()); },
+    shown() { this.visibilityState = 'visible'; this.listeners.visibilitychange?.forEach((f) => f()); },
+  };
+  return doc;
+}
+
+describe('a background tab', () => {
+  let tick: (t: number) => void;
+  let doc: FakeDocument;
+  let rafs: number;
+  let cancelled: number[];
+  let clock: number;
+
+  beforeEach(() => {
+    doc = fakeDocument();
+    vi.stubGlobal('document', doc);
+    rafs = 0;
+    cancelled = [];
+    clock = 0;
+    vi.stubGlobal('performance', { now: () => clock });
+    vi.stubGlobal('requestAnimationFrame', (f: (t: number) => void) => { tick = f; return ++rafs; });
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => { cancelled.push(id); });
+  });
+
+  it('stops the loop while hidden and draws one catch-up frame on return', () => {
+    const { renderer } = mount({ fps: 60 });
+    tick(100);
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+
+    clock = 500;
+    doc.hidden();
+    expect(cancelled).toContain(rafs);
+    // a hidden document gets no rAF callbacks at all, and nothing draws:
+    // the loop really is off
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+
+    clock = 2500;
+    doc.shown();
+    // immediately, without waiting for a tick
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+    // and the loop is running again afterwards
+    tick(2600);
+    expect(renderer.render).toHaveBeenCalledTimes(3);
+  });
+
+  it('makes the one frame on return cover the whole hidden interval', () => {
+    const { sky, renderer } = mount({ fps: 60 });
+    tick(100);
+    tick(200);
+    const before = sky.state;
+    const evoBefore = renderer.render.mock.calls.at(-1)![4] as number;
+
+    clock = 300;
+    doc.hidden();
+    clock = 5300;
+    doc.shown();
+    expect(renderer.render).toHaveBeenCalledTimes(3);
+
+    // the animator moved as much as it would have across five live seconds,
+    // not as across a single clamped 0.2s frame
+    const evoAfter = renderer.render.mock.calls.at(-1)![4] as number;
+    expect(evoAfter - evoBefore).toBeGreaterThan(0.2);
+    // a continuously-ticked sky over the same five seconds lands here too:
+    // the time-of-day target is fixed, so both follow it to the same place
+    expect(sky.state.timeOfDay).toBeCloseTo(before.timeOfDay, 10);
+  });
+
+  it('takes no measurements while hidden and measures again on the return frame', () => {
+    const { sky, renderer } = mount({ fps: 60, lightProbe: { rate: 10, smoothing: 0.3 } });
+    renderer.probe.mockReturnValue(measurement([0.5, 0.5, 0.5]));
+    tick(100);
+    expect(renderer.probe).toHaveBeenCalledTimes(1);
+
+    clock = 500;
+    doc.hidden();
+    expect(renderer.probe).toHaveBeenCalledTimes(1);
+
+    clock = 900;
+    doc.shown();
+    expect(renderer.probe).toHaveBeenCalledTimes(2);
+    expect(sky.light.frame).not.toBeNull();
+  });
+
+  it('does not start a loop when constructed hidden, and starts on show with the gap made up', () => {
+    const hiddenDoc = fakeDocument('hidden');
+    vi.stubGlobal('document', hiddenDoc);
+    const { renderer } = mount({ fps: 60 });
+    expect(rafs).toBe(0);
+    expect(renderer.render).not.toHaveBeenCalled();
+
+    // the whole hidden interval, including the time before the first frame:
+    // the integrated clocks must move by it on the catch-up frame, not start
+    // from zero (the animator begins on its target, so that movement shows up
+    // in the wind/evolution offsets rather than in timeOfDay)
+    clock = 4000;
+    hiddenDoc.shown();
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+    const evo = renderer.render.mock.calls[0][4] as number;
+    expect(evo).toBeGreaterThan(0.2);
+    tick(4100);
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+  });
+
+  it('repaints a still jump() frame when the tab comes back, though no loop runs', () => {
+    const { sky, renderer } = mount({ autoStart: false });
+    sky.jump();
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+
+    clock = 500;
+    doc.hidden();
+    clock = 1500;
+    doc.shown();
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+    // a still frame is the same moment: nothing advanced while away
+    const [first, again] = renderer.render.mock.calls;
+    expect(again[0]).toBe(first[0]);
+    expect(again[3]).toBe(first[3]);
+  });
+
+  it('repaints a reduced-motion still frame when the tab comes back', () => {
+    reduceMotion(true);
+    const { renderer } = mount({});
+    expect(renderer.render).toHaveBeenCalledTimes(1);
+    clock = 500;
+    doc.hidden();
+    clock = 1500;
+    doc.shown();
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+  });
+
+  it('does nothing on show when stopped, and does not register the listener twice over start/stop', () => {
+    const { sky, renderer } = mount({ fps: 60 });
+    expect(doc.listeners.visibilitychange).toHaveLength(1);
+    sky.stop();
+    sky.start();
+    sky.stop();
+    expect(doc.listeners.visibilitychange).toHaveLength(1);
+
+    clock = 500;
+    doc.hidden();
+    clock = 1500;
+    doc.shown();
+    expect(renderer.render).not.toHaveBeenCalled();
+  });
+
+  it('removes the visibility listener on dispose, after which visibility changes are harmless', () => {
+    const { sky } = mount({ fps: 60 });
+    expect(doc.listeners.visibilitychange).toHaveLength(1);
+    sky.dispose();
+    expect(doc.listeners.visibilitychange).toHaveLength(0);
+    expect(() => { doc.hidden(); doc.shown(); }).not.toThrow();
+  });
+
+  it('resolves a pending whenSettled() with false on dispose', async () => {
+    const { sky } = mount({ fps: 60 });
+    const waiting = sky.whenSettled();
+    sky.dispose();
+    await expect(waiting).resolves.toBe(false);
+  });
+});
+
+describe('the light probe across a pause', () => {
+  let tick: (t: number) => void;
+  let doc: FakeDocument;
+  let clock: number;
+  let seen: ((entries: { isIntersecting: boolean }[]) => void) | null;
+  const inDocument = () => ({ ...sized(640, 360), isConnected: true }) as HTMLCanvasElement;
+  const view = (isIntersecting: boolean) => seen?.([{ isIntersecting }]);
+
+  beforeEach(() => {
+    doc = fakeDocument();
+    vi.stubGlobal('document', doc);
+    seen = null;
+    clock = 0;
+    vi.stubGlobal('performance', { now: () => clock });
+    vi.stubGlobal('requestAnimationFrame', (f: (t: number) => void) => { tick = f; return 1; });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(f: typeof seen) { seen = f; }
+      observe() {}
+      disconnect() {}
+    });
+  });
+
+  const mountProbe = (smoothing: number) =>
+    mount({ fps: 60, lightProbe: { rate: 1000, smoothing } }, inDocument());
+
+  it('smooths the first measurement back over the real hidden interval', () => {
+    const { sky, renderer } = mountProbe(1);
+    // the pre-pause series: a black sky, on every frame up to the hide
+    renderer.probe.mockImplementation(() => measurement([0, 0, 0]));
+    tick(100);
+    tick(500);
+    expect(renderer.probe).toHaveBeenCalled();
+    expect(sky.light.frame!.average.linear[0]).toBe(0);
+
+    // hidden for 1s — one time constant: the new reading is weighted
+    // 1 - e^-1 ≈ 0.632, not treated as a frame's little step
+    doc.hidden();
+    clock = 1500;
+    renderer.probe.mockImplementationOnce(() => measurement([1, 1, 1]));
+    doc.shown();
+    expect(sky.light.frame!.average.linear[0]).toBeCloseTo(1 - Math.exp(-1), 10);
+  });
+
+  it('takes the new measurement whole once the gap runs past a few time constants', () => {
+    const { sky, renderer } = mountProbe(0.3);
+    renderer.probe.mockImplementation(() => measurement([0, 0, 0]));
+    tick(100);
+    tick(500);
+
+    // hidden for 5s — over 4× the 0.3s time constant, so no interpolation
+    // across the blank
+    doc.hidden();
+    clock = 5500;
+    renderer.probe.mockImplementationOnce(() => measurement([1, 1, 1]));
+    doc.shown();
+    expect(sky.light.frame!.average.linear[0]).toBe(1);
+  });
+
+  it('keeps measuring normally across an offscreen pause once it is back in view', () => {
+    const { sky, renderer } = mountProbe(0.3);
+    renderer.probe.mockReturnValue(measurement([0.2, 0.4, 0.6]));
+    tick(100);
+    const before = renderer.probe.mock.calls.length;
+
+    view(false);
+    clock = 200;
+    tick(200);
+    expect(renderer.probe).toHaveBeenCalledTimes(before);
+
+    clock = 300;
+    view(true);
+    expect(renderer.probe).toHaveBeenCalledTimes(before + 1);
+    expect(sky.light.frame!.average.linear[0]).toBeCloseTo(0.2, 10);
+  });
+});
+
+/** a valid-shaped probe result whose whole frame is one linear color */
+function measurement(linear: [number, number, number]) {
+  const sample = { srgb: linear, linear: [...linear] as [number, number, number], luminance: linear[1] };
+  return {
+    frame: { average: sample, grid: { cols: 1, rows: 1, cells: [sample] } },
+    environment: null,
+  } as unknown as import('../src/light.js').LightMeasurement;
+}

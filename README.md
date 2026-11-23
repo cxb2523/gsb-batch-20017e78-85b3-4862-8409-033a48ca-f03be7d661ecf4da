@@ -867,8 +867,15 @@ sky.reducedMotion;   // true while the sky is being held still
 
 A canvas scrolled out of the viewport or under `display: none` is not drawn,
 though its clocks, transitions and light probe go on, so it comes back as if it
-had been drawn all along. If something reads the canvas from out of view (a
-texture for another renderer, `captureStream()`), keep it drawing:
+had been drawn all along. A background tab is handled the same way: drawing
+stops on `visibilitychange` while the tab is hidden — browsers stop asking for
+frames there anyway — and the first frame back advances the sky's clocks and
+transitions by the whole hidden interval in one step, rather than replaying it.
+The light probe takes no readings while hidden or out of view, and its first
+reading back is smoothed over that real elapsed time, or taken whole once the
+gap runs past a few smoothing time constants. If something reads the canvas
+from out of view (a texture for another renderer, `captureStream()`), keep it
+drawing:
 
 ```ts
 const sky = new Atmosphere(canvas, { pauseOffscreen: false });

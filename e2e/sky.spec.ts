@@ -185,6 +185,44 @@ test.describe('a canvas out of view', () => {
   });
 });
 
+test.describe('a background tab', () => {
+  /** how many draws the page's WebGL has made so far (the counter from counting()) */
+  const draws = (page: Page) => page.evaluate(() => (window as unknown as { draws: number }).draws);
+
+  test('stops drawing while hidden and catches the whole interval up in one frame on return', async ({ page }) => {
+    await open(page, 'no-preference');
+    await page.evaluate(() => {
+      const w = window as unknown as { draws: number };
+      w.draws = 0;
+      const proto = WebGLRenderingContext.prototype, orig = proto.drawArrays;
+      proto.drawArrays = function (...a) { w.draws++; return orig.apply(this, a); };
+      window.sky = new window.Atmosphere(document.querySelector('canvas')!, { time: 14, weather: 'fair', resolutionScale: 1 });
+    });
+    await daylightOn(page, 'canvas');
+    await expect.poll(() => draws(page)).toBeGreaterThan(0);
+
+    // A synthetic visibilitychange: the browser's own rAF throttling only
+    // kicks in for a real OS-level tab switch, but the library's response —
+    // cancel its loop, draw nothing, catch the whole gap up on return — is
+    // exactly what this exercises.
+    await page.evaluate(() => Object.defineProperty(document, 'visibilityState', {
+      configurable: true, value: 'hidden',
+    }));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    const drawsAtHide = await draws(page);
+    await page.waitForTimeout(600);
+    expect(await draws(page)).toBe(drawsAtHide);
+
+    await page.evaluate(() => Object.defineProperty(document, 'visibilityState', {
+      configurable: true, value: 'visible',
+    }));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    // the catch-up frame lands at once, and the loop keeps going afterwards
+    await expect.poll(() => draws(page)).toBeGreaterThan(drawsAtHide);
+    await daylightOn(page, 'canvas');
+  });
+});
+
 test.describe('AtmosphereCanvas', () => {
   const cases: [string, AtmosphereCanvasProps, AtmosphereCanvasProps][] = [
     ['tone', { time: 14, weather: 'fair' }, { tone: { exposure: 1.5 } }],

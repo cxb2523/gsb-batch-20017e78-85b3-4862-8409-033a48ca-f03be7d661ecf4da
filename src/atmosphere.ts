@@ -179,6 +179,14 @@ export interface AtmosphereOptions extends Conditions {
 const DEFAULT_RESOLUTION_SCALE = () =>
   Math.min(typeof devicePixelRatio === 'number' ? devicePixelRatio : 1, 1.5) * 0.55;
 
+/**
+ * A measurement separated from the previous one by more than this many
+ * smoothing time constants is taken whole: the old value has effectively
+ * decayed away across the gap (a hidden tab, a canvas long out of view), so
+ * blending toward it would only hold up the new sky's light.
+ */
+const PROBE_RESET_TAUS = 4;
+
 export class Atmosphere {
   private readonly canvas: HTMLCanvasElement;
   private readonly renderer: AtmosphereRenderer;
@@ -193,6 +201,12 @@ export class Atmosphere {
   private observer: ResizeObserver | null = null;
   private viewObserver: IntersectionObserver | null = null;
   private inView = true;
+  // the page is on a background tab: rAF stops of its own there, but the
+  // explicit pause is what lets the probe stay idle and the catch-up happen
+  private hidden = false;
+  // performance.now() at the moment drawing was suspended for a hidden tab,
+  // so the recovery knows how much sky it has to make up
+  private hidAt = 0;
   private startedAt = 0;
   private last = 0;
   private lastDraw = 0;
@@ -236,6 +250,17 @@ export class Atmosphere {
       this.jump();               // settle any half-finished transition, draw once
     } else {
       this.startLoop();
+    }
+  };
+  // A background tab: let the GPU rest entirely, then make the one frame on
+  // return account for everything that passed while it was away.
+  private readonly onVisibilityChange = () => {
+    this.hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    if (this.hidden) {
+      this.hidAt = performance.now();
+      this.stopLoop();
+    } else {
+      this.resumeFromPause(performance.now());
     }
   };
 
@@ -296,14 +321,25 @@ export class Atmosphere {
       this.motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
       this.motionQuery.addEventListener('change', this.onMotionChange);
     }
+    // registered once, for the life of the instance: start()/stop() never
+    // touch it, so repeated starts cannot stack listeners
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      this.hidden = document.visibilityState === 'hidden';
+      // constructed already hidden: no visibilitychange will mark the start of
+      // the pause, so time it from here
+      if (this.hidden) this.hidAt = performance.now();
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+    }
     if (options.pauseOffscreen !== false && typeof IntersectionObserver !== 'undefined') {
       this.viewObserver = new IntersectionObserver((entries) => {
         const inView = entries[entries.length - 1].isIntersecting;
         const back = inView && !this.inView;
         this.inView = inView;
         // not left to the next tick, up to a frame interval off: what it left
-        // with is a moment long gone, and a new size has cleared the canvas of it
-        if (back && this.raf) this.draw(performance.now());
+        // with is a moment long gone, and a new size has cleared the canvas of
+        // it. If the tab is still hidden nothing here is visible, so wait for
+        // the visibility change to do the catch-up instead.
+        if (back) this.resumeFromPause(performance.now());
         // (a little ahead of the edge, for a slow scroll to bring in this moment's sky)
       }, { rootMargin: '64px' });
       this.viewObserver.observe(canvas);
@@ -315,6 +351,17 @@ export class Atmosphere {
 
   /** true when the environment asks for reduced motion (and the option honors it) */
   get reducedMotion(): boolean { return this.motionQuery?.matches ?? false; }
+
+  /**
+   * true while no frame should reach the canvas: the tab is in the background,
+   * or a canvas in the document has scrolled out of view. A canvas that is not
+   * in the document never intersects anything and is always drawn — whoever
+   * made it means to read it.
+   */
+  private get paused(): boolean {
+    return this.hidden || (this.opts.pauseOffscreen !== false
+      && !this.inView && this.canvas.isConnected);
+  }
 
   /** false in environments where WebGL isn't available, or once the shader has failed to compile */
   get available(): boolean { return this.renderer.available; }
@@ -599,6 +646,9 @@ export class Atmosphere {
       this.jump();
       return;
     }
+    // in a background tab the loop starts when the tab is shown again, with
+    // the hidden time made up in that first frame
+    if (this.hidden) return;
     this.startLoop();
   }
 
@@ -634,6 +684,40 @@ export class Atmosphere {
     this.raf = 0;
   }
 
+  /**
+   * Bring the sky back after time away (a background tab; also the entry
+   * point a visibility change shares with whatever suspended the drawing).
+   *
+   * The clocks and transitions have to land where they would have if every
+   * missed frame had been drawn. The animator's integration is exact over any
+   * interval — exponential following, offsets integrated from speed — so one
+   * step over the whole gap is the same as all the frames it spans; there is
+   * no per-frame nonlinearity to subdivide for. A still frame simply repaints
+   * its one moment, which has not moved.
+   */
+  private resumeFromPause(now: number): void {
+    if (this.paused) return;
+    if (this.raf) {
+      // back in view while the loop kept running (an offscreen canvas): the
+      // observer draws the catch-up frame itself
+      this.draw(now);
+      return;
+    }
+    if (this.wantStill || !this.wantRunning || this.reducedMotion) {
+      this.redrawStill();
+      return;
+    }
+    if (!this.startedAt) { this.startedAt = now; this.last = now; }
+    // the full elapsed time, deliberately not clamped to a frame's dt:
+    // this is the whole pause, not one janky frame
+    const missed = Math.max(0, (now - (this.hidAt || this.last)) / 1000);
+    this.animator.step(this.target, missed);
+    this.last = now;
+    this.startLoop();
+    // one frame now, rather than up to a frame interval later
+    this.draw(now);
+  }
+
   private draw(t: number): void {
     // jump() can be called before start(). Pin the reference time here
     if (!this.startedAt) { this.startedAt = t; this.last = t; }
@@ -645,11 +729,14 @@ export class Atmosphere {
     // loop draws a single still frame, so one caught mid-flight would sit there
     // as a scratch across the sky — suppress them rather than freeze them.
     if (this.reducedMotion) this.animator.current.celestial.meteors = 0;
-    if (this.opts.lightProbe) this.maybeProbe(t);
-    // Out of view, only a running loop's frames go undrawn: a still frame has no
-    // next tick to come back on. (A canvas outside the document never intersects
-    // anything, and whoever made it means to read it)
-    if (this.raf && !this.inView && this.canvas.isConnected) { this.checkSettled(true); return; }
+    // Out of view or in a background tab, no probe: its readback would find a
+    // frame that was never drawn (an empty or stale buffer). The clocks still
+    // advance, so the first measurement back belongs to this moment's sky.
+    if (this.opts.lightProbe && !this.paused) this.maybeProbe(t);
+    // While paused, only a running loop's frames go undrawn: a still frame has
+    // no next tick to come back on. (A canvas outside the document never
+    // intersects anything, and whoever made it means to read it)
+    if (this.raf && this.paused) { this.checkSettled(true); return; }
     // Resizing clears the drawing buffer. Apply the previous frames' GPU
     // measurements before drawing so the new buffer is filled before paint.
     if (this.governor) {
@@ -680,6 +767,12 @@ export class Atmosphere {
    * queued ahead of it, and the tiny probe is far cheaper to wait on than the
    * full frame. A still frame (reduced motion, jump()) always measures and
    * takes the result unsmoothed — there is no series for it to belong to.
+   *
+   * No measurements are made while paused (see {@link draw}), so the gap here
+   * spans the whole pause: the smoothing weights by that real elapsed time,
+   * not by a frame's. Past a few time constants the previous reading has
+   * decayed to nothing, so the new one is taken whole rather than blended
+   * across the blank.
    */
   private maybeProbe(t: number): void {
     const o = this.probeOptions;
@@ -689,9 +782,13 @@ export class Atmosphere {
     const m = this.probe(t, o);
     if (!m) return;
     const tau = Math.max(0, o.smoothing ?? 0.3);
-    // the gap since the last measurement, not this frame's dt: they are a probe interval apart
-    const gap = Math.min(1, (t - this.lastProbe) / 1000);
-    const k = still || !this.measured || tau === 0 ? 1 : 1 - Math.exp(-gap / tau);
+    // the gap since the last measurement, not this frame's dt: they are a probe
+    // interval apart — and across a pause, a whole pause apart
+    const gap = (t - this.lastProbe) / 1000;
+    // take the new reading whole: no series yet, no smoothing asked for, or the
+    // gap so long that any weight left on the old reading is negligible
+    const reset = !this.measured || tau === 0 || gap >= PROBE_RESET_TAUS * tau;
+    const k = still || reset ? 1 : 1 - Math.exp(-Math.min(1, gap) / tau);
     this.measured = this.measured ? mixMeasurement(this.measured, m, k) : m;
     this.lastProbe = t;
     this.opts.onLight?.(this.light);
@@ -710,10 +807,14 @@ export class Atmosphere {
     this.observer = null;
     this.viewObserver?.disconnect();
     this.viewObserver = null;
+    if (typeof document !== 'undefined' && this.onVisibilityChange) {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    }
     this.motionQuery?.removeEventListener('change', this.onMotionChange);
     this.motionQuery = null;
     this.renderer.dispose(options);
     this.settledSaid = false;
+    // anyone waiting for a sky that no longer exists gets a definite answer
     this.resolveSettled(false);
   }
 }
