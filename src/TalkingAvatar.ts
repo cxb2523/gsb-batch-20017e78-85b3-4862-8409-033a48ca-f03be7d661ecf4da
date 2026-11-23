@@ -90,6 +90,58 @@ function loadModel(url: string): Promise<VisemeModel> {
   return model;
 }
 
+/**
+ * One audio source's viseme timeline: the attached stream's, or one speak() clip's. Events are in "heard"
+ * audio-context time (ms). Each source owns its own instance, so stopping one source only drops its timeline and
+ * never clears events the other source is still animating from.
+ */
+class Timeline {
+  private events: VisemeEvent[] = [];
+  private versionCounter = 0;
+
+  /** Bumped on every mutation, so the merged render view can tell when to rebuild. */
+  get version(): number {
+    return this.versionCounter;
+  }
+
+  get isEmpty(): boolean {
+    return this.events.length === 0;
+  }
+
+  getEvents(): readonly VisemeEvent[] {
+    return this.events;
+  }
+
+  add(event: VisemeEvent, nowMs: number): void {
+    const { events } = this;
+    let i = events.length;
+    while (i > 0 && events[i - 1].ms > event.ms) i -= 1; // keep time order when clip and stream overlap
+    events.splice(i, 0, event);
+    // Drop history well behind the playhead, keeping the event still in effect.
+    const cutoff = nowMs - HISTORY_MS;
+    let drop = 0;
+    while (drop + 1 < events.length && events[drop + 1].ms < cutoff) drop += 1;
+    if (drop) events.splice(0, drop);
+    this.versionCounter += 1;
+  }
+}
+
+/** Merge two time-ordered timelines into one time-ordered event list for the current frame. */
+function mergeTimelines(a: Timeline | null, b: Timeline | null): VisemeEvent[] {
+  const ea = a && !a.isEmpty ? a.getEvents() : null;
+  const eb = b && !b.isEmpty ? b.getEvents() : null;
+  if (!ea) return eb ? [...eb] : [];
+  if (!eb) return [...ea];
+  const merged: VisemeEvent[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < ea.length || j < eb.length) {
+    if (j >= eb.length || (i < ea.length && ea[i].ms <= eb[j].ms)) merged.push(ea[i++]);
+    else merged.push(eb[j++]);
+  }
+  return merged;
+}
+
 type AttachedStream = {
   source: MediaStreamAudioSourceNode;
   delay: DelayNode;
@@ -97,6 +149,7 @@ type AttachedStream = {
   element: HTMLAudioElement;
   detector: VisemeDetector | null;
   expectedTime: number;
+  timeline: Timeline;
 };
 
 /**
@@ -113,23 +166,39 @@ export class TalkingAvatar {
   private readonly onError: (error: Error) => void;
   private context: AudioContext | null = null;
   private contextReady: Promise<AudioContext> | null = null;
-  private events: VisemeEvent[] = []; // in "heard" audio-context time, ms
-  private segments: Segment[] | null = null;
   private stream: AttachedStream | null = null;
   private speech: AudioBufferSourceNode | null = null;
+  /** Timeline of the clip currently speaking; dropped (with its residual events) when it ends or is stopped. */
+  private speechTimeline: Timeline | null = null;
   private streamToken = 0;
   private speechToken = 0;
   private status: AvatarStatus = "listening";
   private disposed = false;
 
+  // Cached merged view of the two timelines, rebuilt only when one of them changes identity or contents.
+  private cacheStream: Timeline | null = null;
+  private cacheSpeech: Timeline | null = null;
+  private cacheStreamVersion = -1;
+  private cacheSpeechVersion = -1;
+  private mergedEvents: VisemeEvent[] = [];
+  private mergedSegments: Segment[] = [];
+
   constructor(options: TalkingAvatarOptions) {
     this.modelUrl = options.modelUrl ?? DEFAULT_MODEL_URL;
     this.streamDelayS = (options.streamDelayMs ?? DEFAULT_STREAM_DELAY_MS) / 1000;
     this.onError = options.onError ?? ((error) => console.error(error));
-    this.renderer = new AvatarRenderer(options.container, () => this.frameNow());
+    this.renderer = this.createRenderer(options.container, () => this.frameNow());
     this.ready = this.setAvatar(options.avatarUrl ?? AVATARS.female, options.morphTargets);
     this.ready.catch(() => {}); // reported through onError; awaiting `ready` is optional
     loadModel(this.modelUrl).catch((error: Error) => this.onError(error)); // warm up
+  }
+
+  /** Construct the renderer. Overridable internally (e.g. tests) without changing the public API. */
+  protected createRenderer(
+    container: HTMLElement,
+    getFrame: () => { visemes: Record<string, number>; mode: Mode },
+  ): AvatarRenderer {
+    return new AvatarRenderer(container, getFrame);
   }
 
   /**
@@ -157,7 +226,8 @@ export class TalkingAvatar {
     if (!stream.getAudioTracks().length) throw new Error("talking-avatar: the stream has no audio track");
     const token = ++this.streamToken;
     const [context, model] = await Promise.all([this.audioContext(), loadModel(this.modelUrl)]);
-    if (token !== this.streamToken || this.disposed) return;
+    // A newer attachStream/detachStream (or dispose) won while we waited: never touch the audio graph.
+    if (this.disposed || token !== this.streamToken) return;
 
     // Chrome only feeds a remote (WebRTC) stream into Web Audio while a media element is playing it.
     const element = new Audio();
@@ -173,15 +243,18 @@ export class TalkingAvatar {
     });
     source.connect(capture);
 
-    const attached: AttachedStream = { source, delay, capture, element, detector: null, expectedTime: 0 };
+    const attached: AttachedStream = {
+      source, delay, capture, element, detector: null, expectedTime: 0, timeline: new Timeline(),
+    };
     capture.port.onmessage = ({ data }: MessageEvent<{ time: number; samples: Float32Array }>) => {
-      if (this.stream !== attached) return;
+      if (this.disposed || this.stream !== attached) return;
       try {
         // (Re)start the timeline when capture begins or after a gap (e.g. the context was suspended).
         if (!attached.detector || Math.abs(data.time - attached.expectedTime) > STREAM_GAP_S) {
           attached.detector?.flush();
           const heardAtMs = (data.time + this.streamDelayS) * 1000;
-          attached.detector = new VisemeDetector(model, context.sampleRate, heardAtMs, (event) => this.addEvent(event));
+          attached.detector = new VisemeDetector(model, context.sampleRate, heardAtMs,
+            (event) => attached.timeline.add(event, this.heardMs()));
         }
         attached.detector.push(data.samples);
         attached.expectedTime = data.time + data.samples.length / context.sampleRate;
@@ -192,9 +265,9 @@ export class TalkingAvatar {
     this.stream = attached;
   }
 
-  /** Stop playing and lip syncing the attached stream. */
+  /** Stop playing and lip syncing the attached stream. Its timeline is dropped; a speaking clip's is untouched. */
   detachStream(): void {
-    this.streamToken += 1;
+    this.streamToken += 1; // any attachStream still awaiting its context/model is now stale
     const attached = this.stream;
     if (!attached) return;
     this.stream = null;
@@ -203,8 +276,6 @@ export class TalkingAvatar {
     attached.delay.disconnect();
     attached.capture.disconnect();
     attached.element.srcObject = null;
-    this.events = [];
-    this.segments = null;
   }
 
   /**
@@ -214,6 +285,7 @@ export class TalkingAvatar {
   async speak(audio: string | ArrayBuffer | Blob): Promise<void> {
     this.stopSpeaking();
     const token = ++this.speechToken;
+    const stale = () => this.disposed || token !== this.speechToken;
     let bytes: ArrayBuffer;
     if (typeof audio === "string") {
       const res = await fetch(audio);
@@ -222,8 +294,11 @@ export class TalkingAvatar {
     } else {
       bytes = audio instanceof Blob ? await audio.arrayBuffer() : audio.slice(0); // decodeAudioData detaches it
     }
+    if (stale()) return; // stopSpeaking/new speak/dispose happened during fetch or Blob reading
     const [context, model] = await Promise.all([this.audioContext(), loadModel(this.modelUrl)]);
+    if (stale()) return;
     const buffer = await context.decodeAudioData(bytes);
+    if (stale()) return;
 
     const mono = new Float32Array(buffer.length);
     for (let c = 0; c < buffer.numberOfChannels; c += 1) {
@@ -236,32 +311,43 @@ export class TalkingAvatar {
     for (let i = 0; i < mono.length; i += chunk) {
       detector.push(mono.subarray(i, i + chunk));
       await new Promise((resolve) => setTimeout(resolve)); // yield between chunks
-      if (token !== this.speechToken || this.disposed) return;
+      if (stale()) return; // cancelled mid-analysis: no audio source is scheduled and no events are written
     }
     detector.flush();
+    if (stale()) return;
 
+    const timeline = new Timeline();
     const startAt = context.currentTime + SPEAK_START_MS / 1000;
-    for (const event of clipEvents) this.addEvent({ id: event.id, ms: startAt * 1000 + event.ms });
+    for (const event of clipEvents) timeline.add({ id: event.id, ms: startAt * 1000 + event.ms }, this.heardMs());
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(context.destination);
-    const ended = new Promise<void>((resolve) => { source.onended = () => resolve(); });
+    // Resolve on both natural end and stop(), but only mutate state for a still-current clip (stale calls were
+    // already cleaned up by stopSpeaking/dispose).
+    const ended = new Promise<void>((resolve) => {
+      source.onended = () => {
+        if (!stale()) {
+          this.speech = null;
+          this.speechTimeline = null;
+        }
+        resolve();
+      };
+    });
     source.start(startAt);
     this.speech = source;
+    this.speechTimeline = timeline;
     await ended;
-    if (this.speech === source) this.speech = null;
   }
 
-  /** Stop any clip started with speak(). */
+  /** Stop any clip started with speak(). Its residual events leave the merged view immediately; the stream's stay. */
   stopSpeaking(): void {
-    this.speechToken += 1;
+    this.speechToken += 1; // any speak() still fetching/analysing/scheduling is now stale
     const source = this.speech;
     if (!source) return;
     this.speech = null;
+    this.speechTimeline = null;
     source.stop();
     source.disconnect();
-    this.events = [];
-    this.segments = null;
   }
 
   /** Release the renderer, audio and model references. The instance can't be used afterwards. */
@@ -297,19 +383,6 @@ export class TalkingAvatar {
     return context;
   }
 
-  private addEvent(event: VisemeEvent): void {
-    const { events } = this;
-    let i = events.length;
-    while (i > 0 && events[i - 1].ms > event.ms) i -= 1; // keep time order when clip and stream overlap
-    events.splice(i, 0, event);
-    // Drop history well behind the playhead, keeping the event still in effect.
-    const cutoff = this.heardMs() - HISTORY_MS;
-    let drop = 0;
-    while (drop + 1 < events.length && events[drop + 1].ms < cutoff) drop += 1;
-    if (drop) events.splice(0, drop);
-    this.segments = null;
-  }
-
   /** The audio-context time (ms) currently coming out of the speakers. */
   private heardMs(): number {
     const { context } = this;
@@ -322,9 +395,24 @@ export class TalkingAvatar {
   }
 
   private frameNow(): { visemes: Record<string, number>; mode: Mode } {
-    if (!this.events.length) return { visemes: {}, mode: this.status };
+    const streamTimeline = this.stream?.timeline ?? null;
+    const speechTimeline = this.speechTimeline;
+    if (streamTimeline !== this.cacheStream
+      || speechTimeline !== this.cacheSpeech
+      || (streamTimeline?.version ?? 0) !== this.cacheStreamVersion
+      || (speechTimeline?.version ?? 0) !== this.cacheSpeechVersion) {
+      this.cacheStream = streamTimeline;
+      this.cacheSpeech = speechTimeline;
+      this.cacheStreamVersion = streamTimeline?.version ?? 0;
+      this.cacheSpeechVersion = speechTimeline?.version ?? 0;
+      this.mergedEvents = mergeTimelines(streamTimeline, speechTimeline);
+      this.mergedSegments = this.mergedEvents.length ? buildSegments(this.mergedEvents) : [];
+    }
+    if (!this.mergedEvents.length) return { visemes: {}, mode: this.status };
     const now = this.heardMs();
-    this.segments ??= buildSegments(this.events);
-    return { visemes: mouthAt(this.segments, now), mode: isSpeakingAt(this.events, now) ? "speaking" : this.status };
+    return {
+      visemes: mouthAt(this.mergedSegments, now),
+      mode: isSpeakingAt(this.mergedEvents, now) ? "speaking" : this.status,
+    };
   }
 }
