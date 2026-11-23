@@ -28,6 +28,13 @@
 // A column is recomputed only when the EVALs or the PAIR it is built from
 // change (by identity: the store replaces the object when a second one
 // arrives), so a new step costs one column, not the whole path.
+//
+// What a column *means* is the layout: the source (Alternatives or Layers),
+// the number of rows, the model in front and whether there are two. When any
+// of them changes, the cached identity of every column is dropped and the
+// whole grid is rebuilt for the new layout — a column of the old source can
+// otherwise look unchanged (same EVAL objects) while its heights mean
+// something else.
 
 import { PAIR_SAME_PICK, type PairFrame } from '../source/frames';
 import type { EvalData, Slot, Store } from '../store/store';
@@ -90,6 +97,17 @@ export class ReliefData {
   private known = 0; // columns whose seen* entries are valid
   private sig = '';
 
+  // Forgets which EVALs and PAIRs each column was built from, so that the
+  // next update recomputes every column (from column 0) even where the
+  // objects are unchanged. Needed when a column's meaning changes (another
+  // source, row count or model in front: update does it by itself) and when
+  // the GPU no longer holds the buffers: after the context comes back every
+  // column must be written and uploaded again, not only the ones that change
+  // from now on.
+  invalidate(): void {
+    this.known = 0;
+  }
+
   // Brings the grid up to date with the store. Returns true if any column
   // changed (see from / to) or the layout did (rows, capacity).
   update(store: Store, source: ReliefSource): boolean {
@@ -105,6 +123,10 @@ export class ReliefData {
     let relaid = false;
     const sig = `${src}:${rows}:${front}:${two}`;
     if (sig !== this.sig) {
+      // Another layout: a column of the old one means something else now,
+      // even where the same EVAL objects feed it. Every column is rebuilt,
+      // and a row count change also reallocates (the layout the uploader
+      // holds must be the one the values are written for).
       this.sig = sig;
       this.source = src;
       this.known = 0;
@@ -190,6 +212,36 @@ export class ReliefData {
 // Height 0..1 of a probability: its square root.
 export function height(p: number): number {
   return p > 0 ? Math.sqrt(Math.min(p, 1)) : 0;
+}
+
+// ------------------------------------------------- selected column & axis
+
+// The cut of the front surface at column `sel`, in grid units: one point per
+// row, x = sel + 0.5, y = its height (times `k`, the growth), z = the row.
+// `out` holds at least rows * 3 floats (Relief's profile buffer). Returns the
+// points written: 0 when the column cannot be drawn, so a caller can drop
+// the stale ones (setDrawRange(0, 0)) instead of leaving the old rows.
+export function fillProfile(out: Float32Array, front: Float32Array, rows: number, sel: number, cols: number, k = 1): number {
+  if (rows <= 0 || sel < 0 || sel >= cols || out.length < rows * 3) return 0;
+  const o = sel * rows;
+  for (let r = 0; r < rows; r++) {
+    out[r * 3] = sel + 0.5;
+    out[r * 3 + 1] = front[o + r] * k;
+    out[r * 3 + 2] = r;
+  }
+  return rows;
+}
+
+// What the two row labels at the back and the front of the left edge say.
+// Back of the box is -z: Alternatives put the most likely row at the back;
+// Layers put the first layer at the front and the last at the back.
+export interface AxisRows {
+  back: string;
+  front: string;
+}
+
+export function axisRows(source: ReliefSource): AxisRows {
+  return source === 'layers' ? { back: 'last layer', front: 'first layer' } : { back: 'most likely', front: 'less likely' };
 }
 
 // ------------------------------------------------- animation 4: growth

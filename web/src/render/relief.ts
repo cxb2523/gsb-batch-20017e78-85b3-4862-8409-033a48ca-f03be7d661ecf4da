@@ -19,7 +19,8 @@
 // the transform of one group, so the axis can compress as the path grows
 // without touching the buffers. Index buffers are fixed for the capacity and
 // `setDrawRange` shows the columns in use. Only the y of the changed columns
-// and their tones are uploaded.
+// and their tones are uploaded — and after the context is lost and comes back,
+// every column in use once (relief-upload.ts), since the GPU lost them all.
 //
 // Look: almost black by default, lit only where there is something to see.
 // Heights are sqrt(p) (relief-data.ts). Each vertex carries its model's
@@ -101,6 +102,8 @@ import { showWhitespace, tokenLabel } from '../store/text';
 import type { View } from '../store/view';
 import { ICONS } from './icons';
 import {
+  axisRows,
+  fillProfile,
   fitDistance,
   growDuration,
   growFactor,
@@ -109,6 +112,7 @@ import {
   reliefShape,
   type ReliefSource,
 } from './relief-data';
+import { ReliefUpload, planWrite } from './relief-upload';
 import { Pace } from './pace';
 import { COLOR, FONT, FONT_UI, MODEL_COLOR, rgba } from './theme';
 import { axisSpan } from './timeline';
@@ -412,7 +416,11 @@ export class Relief {
   private toneB = new Float32Array(0);
   private mark = new Float32Array(0); // shared by both surfaces
   private prof = new Float32Array(0);
+  private readonly upload = new ReliefUpload(); // which columns still owe the GPU a write
   private attrs: BufferAttribute[] = []; // posF, toneF, posB, toneB, mark
+  // The context came back: every column in use must reach the GPU again, on
+  // the next sync (see onRestored).
+  private reupload = false;
 
   private readonly tones = MODEL_COLOR.map((c) => new Color(c));
   private backTone = 1;
@@ -662,7 +670,7 @@ export class Relief {
   paint(now: number, dirty: boolean): void {
     const dt = this.lastNow > 0 ? Math.min(now - this.lastNow, 250) : 16;
     this.lastNow = now;
-    if (dirty) this.sync(); // CPU side only: safe while the context is lost
+    if (dirty || this.reupload) this.sync(); // CPU side only: safe while the context is lost
     if (this.growCol >= 0) this.stepGrowth(now);
     if (this.lost || this.w < 1 || this.h < 1) return;
     // Hidden (the other tab of the dock): nothing moves and nothing is
@@ -756,9 +764,16 @@ export class Relief {
     console.warn('Relief: the WebGL context was lost; the panel stays empty until it comes back.');
   };
 
-  // three.js uploads every buffer and texture again from its array.
+  // The GPU lost every buffer with the context: three.js creates them again
+  // from their arrays, but only for the attributes it is told are dirty. So
+  // every column in use is written and marked again, once, whatever the
+  // incremental writes before the loss — which is why the data cache is
+  // invalidated too: the columns that did not change since would keep their
+  // old values silently.
   private readonly onRestored = (): void => {
     this.lost = false;
+    this.reupload = true;
+    this.data.invalidate();
     this.needs = true;
   };
 
@@ -885,7 +900,9 @@ export class Relief {
     const source = this.source();
     const key = `${s.pathEpoch}:${s.path.length}:${s.framesApplied}:${s.front}:${s.twoModels}:${source}`;
     let moved = false;
-    if (key !== this.key) {
+    // After a restore the key is unchanged but every column must be sent
+    // again, so refresh runs for that too.
+    if (key !== this.key || this.reupload) {
       this.key = key;
       this.refresh(source);
       moved = true;
@@ -904,7 +921,8 @@ export class Relief {
     }
   }
 
-  // Heights from the store; uploads only the columns that changed.
+  // Heights from the store; uploads only the columns that changed, except
+  // for a new layout or a context restore, which send every column.
   private refresh(source: ReliefSource): void {
     const s = this.store;
     const d = this.data;
@@ -912,12 +930,20 @@ export class Relief {
     this.span = axisSpan(s.path.length, s.branches());
     this.backTone = s.other;
     this.backFirst = d.source === 'alternatives';
-    if (d.capacity !== this.cap || d.rows !== this.rows) {
+    const relaid = d.capacity !== this.cap || d.rows !== this.rows;
+    const restored = this.reupload;
+    this.reupload = false;
+    if (relaid) {
+      // A new layout, for a new source, row count or model in front: every
+      // column is written for it. The arrays are new, so three.js creates
+      // their buffers whole on this frame's draw — no range is needed.
       this.layout(d.capacity, d.rows);
-      this.write(0, d.cols);
-    } else if (d.to > d.from) {
-      this.write(d.from, d.to);
     }
+    // A layout or a restore writes every column in use; otherwise only those
+    // the data marked. (A restore that arrives with a new layout is satisfied
+    // by the new arrays' whole upload.)
+    const w = planWrite(relaid, restored, d.from, d.to, d.cols);
+    this.write(w.from, w.to, w.send);
 
     const cols = d.cols;
     const rows = d.rows;
@@ -985,6 +1011,10 @@ export class Relief {
     const mk = dyn(this.mark, 2);
     const triIndex = new BufferAttribute(tri, 1);
     this.attrs = [pf, tf, pb, tb, mk];
+    // New arrays: three.js makes each buffer whole on the next draw. The
+    // upload ranges start from an empty slate too, so nothing of the old
+    // layout can shrink a write of the new one.
+    this.upload.layout(this.attrs, cap, rows);
 
     const front = new BufferGeometry();
     front.setAttribute('position', pf);
@@ -1014,11 +1044,24 @@ export class Relief {
   }
 
   // Writes heights, tones and marks of columns [from, to) into the buffers.
-  private write(from: number, to: number): void {
+  // `send` says what of them must reach the GPU: nothing (the arrays of a new
+  // layout are uploaded whole on their first draw), their own range, or every
+  // column in use (a context restore).
+  private write(from: number, to: number, send: 'none' | 'columns' | 'all' = 'columns'): void {
     const d = this.data;
     const rows = this.rows;
     to = Math.min(to, d.cols, this.cap);
-    if (to <= from || rows === 0) return;
+    if (rows === 0) return;
+    if (send === 'all') {
+      // A restore: the whole grid, even when this frame writes no column
+      // (a path of zero length has nothing to draw, but its buffers must not
+      // keep the ranges of the lost frames).
+      this.upload.restore(d.cols);
+    }
+    if (to <= from) {
+      this.needs = true;
+      return;
+    }
     const bt = this.tones[this.backTone];
     for (let c = from; c < to; c++) {
       const k = c === this.growCol ? this.growK : 1;
@@ -1039,10 +1082,7 @@ export class Relief {
         this.mark[i * 2 + 1] = crest;
       }
     }
-    for (const a of this.attrs) {
-      a.addUpdateRange(from * rows * a.itemSize, (to - from) * rows * a.itemSize);
-      a.needsUpdate = true;
-    }
+    if (send === 'columns') this.upload.mark(from, to, d.cols);
     if (this.sel >= from && this.sel < to) this.writeProfile();
     this.needs = true;
   }
@@ -1089,22 +1129,26 @@ export class Relief {
     this.writeProfile();
   }
 
-  // The front surface's heights at the selected column, in grid units.
+  // The front surface's heights at the selected column, in grid units. A
+  // column that cannot be drawn leaves no point behind: the range is emptied,
+  // so no point of an older layout (another row count) survives the switch.
   private writeProfile(): void {
     const sel = this.sel;
     const d = this.data;
     const rows = this.rows;
-    if (sel < 0 || sel >= d.cols || this.prof.length < rows * 3) return;
-    const k = sel === this.growCol ? this.growK : 1;
-    const p = this.prof;
-    for (let r = 0; r < rows; r++) {
-      p[r * 3] = sel + 0.5;
-      p[r * 3 + 1] = d.front[sel * rows + r] * k;
-      p[r * 3 + 2] = r;
+    const attr = this.profile.geometry.getAttribute('position') as BufferAttribute | undefined;
+    if (!attr) return; // no layout yet
+    if (sel < 0 || sel >= d.cols || this.prof.length < rows * 3) {
+      // A column that cannot be drawn leaves no point behind: no point of an
+      // older layout (another row count) survives the switch.
+      this.profile.geometry.setDrawRange(0, 0);
+      attr.needsUpdate = true;
+      return;
     }
-    const a = this.profile.geometry.getAttribute('position') as BufferAttribute;
-    a.needsUpdate = true;
-    this.profile.geometry.setDrawRange(0, rows);
+    const k = sel === this.growCol ? this.growK : 1;
+    const n = fillProfile(this.prof, d.front, rows, sel, d.cols, k);
+    this.profile.geometry.setDrawRange(0, n);
+    attr.needsUpdate = true;
   }
 
   // The axis labels at the floor's corners: "position" and an arrow under
@@ -1119,10 +1163,10 @@ export class Relief {
         continue;
       }
       const which = AXIS_LABELS[k];
-      const layers = this.data.source === 'layers';
+      const rows = axisRows(this.data.source);
       // Back of the box is -z. Alternatives: the most likely row at the
       // back; Layers: the first layer in front, the last at the back.
-      const text = which === 'position' ? 'position' : which === 'back' ? (layers ? 'last layer' : 'most likely') : layers ? 'first layer' : 'less likely';
+      const text = which === 'position' ? 'position' : which === 'back' ? rows.back : rows.front;
       const t = this.axisText[k];
       if (t.textContent !== text) {
         t.textContent = text;

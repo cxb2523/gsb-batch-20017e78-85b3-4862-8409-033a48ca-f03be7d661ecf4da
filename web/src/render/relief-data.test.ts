@@ -3,9 +3,11 @@ import { decodeFrames, FRAME_PAIR, NONE, ORIGIN_MODEL, ORIGIN_PROMPT, PAIR_SAME_
 import { Store } from '../store/store';
 import { concat, config, configBody, cursor, evalFrame, hello, node, pair, vocab } from '../testing/encode';
 import {
+  axisRows,
   DIV_SAME_MAX,
   divergenceOf,
   doubtOf,
+  fillProfile,
   GROW_MAX_MS,
   GROW_MIN_MS,
   growDuration,
@@ -219,10 +221,142 @@ describe('ReliefData, Layers', () => {
     r.update(t, 'layers');
     expect([r.rows, r.source]).toEqual([4, 'alternatives']);
   });
+
+  // A four-layer lens: as many rows as n_raw, so a switch does not reallocate
+  // and the columns must still be rebuilt for the new meaning.
+  const lens4 = evalFrame(2, {
+    node: 1,
+    entries: [[2, 0.5], [3, 0.25], [4, 0.125], [5, 0.0625]],
+    lens: [
+      [3, 0.25, 0.125, 3],
+      [2, 0.375, 0.25, 2],
+      [2, 0.5, 0.4, 1],
+      [2, 0.6, 0.5, 0],
+    ],
+  });
+
+  it('rebuilds every column when the source changes, even at the same row count', () => {
+    const s = new Store();
+    feed(s, ...prompt(1, [0, 1, 3, 5]), lens4, ...step, cursor(2, 2));
+    const r = new ReliefData();
+    expect(r.update(s, 'alternatives')).toBe(true);
+    expect([r.rows, r.source, r.from, r.to]).toEqual([4, 'alternatives', 0, 3]);
+    expect(column(r.front, 4, 2)).toEqual(sq(0.5, 0.25, 0.125, 0.0625));
+
+    // Layers: same row count, different heights — and the changed columns are
+    // all of them, from zero, whatever the identity cache held.
+    expect(r.update(s, 'layers')).toBe(true);
+    expect([r.rows, r.source, r.from, r.to]).toEqual([4, 'layers', 0, 3]);
+    expect(column(r.front, 4, 2)).toEqual(sq(0.125, 0.25, 0.4, 0.5));
+    expect(column(r.front, 4, 0)).toEqual([0, 0, 0, 0]);
+    expect(column(r.back, 4, 2)).toEqual([0, 0, 0, 0]); // no other model in Layers
+
+    // And back: the Alternatives columns are rebuilt again.
+    expect(r.update(s, 'alternatives')).toBe(true);
+    expect([r.rows, r.source, r.from, r.to]).toEqual([4, 'alternatives', 0, 3]);
+    expect(column(r.front, 4, 2)).toEqual(sq(0.5, 0.25, 0.125, 0.0625));
+  });
+
+  it('rebuilds every column when the model in front changes', () => {
+    const s = new Store();
+    feed(
+      s,
+      ...prompt(2),
+      evalFrame(2, { node: 1, entries: [[2, 0.5], [3, 0.25]] }),
+      evalFrame(2, { node: 1, slot: 1, entries: [[3, 0.5], [2, 0.25]] }),
+      ...step,
+      cursor(2, 2, 2),
+    );
+    const r = new ReliefData();
+    r.update(s, 'alternatives');
+    expect(column(r.front, 4, 2)).toEqual(sq(0.5, 0.25, 0, 0));
+    expect(r.tone[2]).toBe(0);
+
+    s.setFront(1);
+    expect(r.update(s, 'alternatives')).toBe(true);
+    expect([r.from, r.to]).toEqual([0, 3]); // the whole grid, not just column 2
+    expect(column(r.front, 4, 2)).toEqual(sq(0.5, 0.25, 0, 0)); // B's rows: token 3 first
+    expect(r.tone[2]).toBe(1);
+  });
+
+  it('reports an empty span when nothing changed', () => {
+    const s = new Store();
+    feed(s, ...prompt(), evalFrame(2, { node: 1, entries: [[2, 0.5]] }), ...step, cursor(2, 2));
+    const r = new ReliefData();
+    r.update(s, 'alternatives');
+    expect(r.update(s, 'alternatives')).toBe(false);
+    expect(r.from).toBeGreaterThanOrEqual(r.to); // nothing to write
+    r.update(s, 'alternatives');
+    expect(r.from).toBeGreaterThanOrEqual(r.to);
+  });
+
+  it('rebuilds every column after invalidate(), even where nothing changed', () => {
+    const s = new Store();
+    feed(s, ...prompt(), evalFrame(2, { node: 1, entries: [[2, 0.5]] }), ...step, cursor(2, 2));
+    const r = new ReliefData();
+    r.update(s, 'alternatives');
+    expect(r.update(s, 'alternatives')).toBe(false);
+
+    // The GPU lost its buffers: whatever did not change must be written again.
+    r.invalidate();
+    expect(r.update(s, 'alternatives')).toBe(true);
+    expect([r.from, r.to]).toEqual([0, 3]);
+    expect(column(r.front, 4, 2)).toEqual(sq(0.5, 0, 0, 0));
+    // Once written, back to an empty span.
+    expect(r.update(s, 'alternatives')).toBe(false);
+    expect(r.from).toBeGreaterThanOrEqual(r.to);
+  });
+
+  it('gives the selected column a cut with one point per row of the new source', () => {
+    const s = new Store();
+    feed(s, ...prompt(1, [0, 1, 3]), lensStep, ...step, cursor(2, 2));
+    const r = new ReliefData();
+    r.update(s, 'layers');
+    const cut = new Float32Array(r.rows * 3);
+    expect(fillProfile(cut, r.front, r.rows, 2, r.cols)).toBe(3); // three layers
+    expect(cut[1]).toBeCloseTo(Math.sqrt(0.125), 5); // the first layer's answer_p
+
+    r.update(s, 'alternatives');
+    const alt = new Float32Array(r.rows * 3);
+    expect(fillProfile(alt, r.front, r.rows, 2, r.cols)).toBe(4); // n_raw rows
+    expect(alt[1]).toBeCloseTo(Math.sqrt(0.5), 5);
+    // No point of the old row count survives: the cut is exactly the new rows.
+    expect(alt.subarray(0, 12).length).toBe(12);
+  });
 });
 
-describe('height', () => {
-  it('is the square root of the probability, within 0..1', () => {
+describe('fillProfile (the selected column\'s cut)', () => {
+  const front = new Float32Array([0, 0, 0, 0, 0.5, 0.25, 0.125, 0]);
+  it('writes one point per row of the new layout', () => {
+    const out = new Float32Array(4 * 3);
+    expect(fillProfile(out, front, 4, 1, 2)).toBe(4);
+    expect([...out]).toEqual([1.5, 0.5, 0, 1.5, 0.25, 1, 1.5, 0.125, 2, 1.5, 0, 3]);
+  });
+
+  it('has no point for a column that cannot be drawn', () => {
+    const out = new Float32Array(9);
+    expect(fillProfile(out, front, 4, 5, 2)).toBe(0); // past the path
+    expect(fillProfile(out, front, 4, -1, 2)).toBe(0); // nothing selected
+    expect(fillProfile(out, front, 0, 0, 2)).toBe(0); // no layout
+    expect(fillProfile(new Float32Array(6), front, 4, 0, 2)).toBe(0); // buffer too small
+  });
+
+  it('scales with the growth of a new column', () => {
+    const out = new Float32Array(4 * 3);
+    fillProfile(out, front, 4, 1, 2, 0.5);
+    expect(out[1]).toBe(0.25); // half of 0.5
+    expect(out[4]).toBe(0.125);
+  });
+});
+
+describe('axisRows', () => {
+  it('names the rows of the current source', () => {
+    expect(axisRows('alternatives')).toEqual({ back: 'most likely', front: 'less likely' });
+    expect(axisRows('layers')).toEqual({ back: 'last layer', front: 'first layer' });
+  });
+});
+
+describe('height', () => {  it('is the square root of the probability, within 0..1', () => {
     expect(height(0)).toBe(0);
     expect(height(-1)).toBe(0);
     expect(height(0.25)).toBe(0.5);
