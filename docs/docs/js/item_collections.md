@@ -81,6 +81,30 @@ engine.onClick = (coords) => {
 
 An update refreshes hit geometry before the scheduled repaint, including for collections larger than 500 items. A point query or rectangle query immediately after `update()` therefore sees the new geometry. During a subscriber callback, other subscribers may not have received the current notification yet; query the engine after the mutation returns when current geometry is required.
 
+## Spatial Index Synchronization
+
+When you keep your own `SpatialIndex` for viewport queries outside the engine, `SpatialIndexSyncer` mirrors a collection into it without rebuilding on every change:
+
+```ts
+import { ItemCollection, SpatialIndex, SpatialIndexSyncer } from "@canvas-tile-engine/core";
+
+const markers = new ItemCollection(initialMarkers, { keyOf: (marker) => marker.id });
+const index = new SpatialIndex<(typeof initialMarkers)[number]>();
+const syncer = SpatialIndexSyncer.attach(markers, index);
+
+markers.insert(newMarker); // Appends one indexed occurrence.
+markers.update(newMarker.id, { x: 40 }); // Replaces that occurrence's box in place, keeping order.
+markers.remove(oldId); // Removes exactly that occurrence.
+
+const visible = index.query(minX, minY, maxX, maxY); // Current collection order, no stale or repeated items.
+console.log(syncer.getSyncCount()); // Subscription callbacks delivered so far (one per notification).
+syncer.dispose(); // Releases the subscription; later mutations no longer touch the index.
+```
+
+The first `attach` bulk-loads every current item in collection order and subscribes. Inserts append after existing occurrences, updates keep the same registration position, and removals delete one occurrence, so removal-driven index shifts never produce old ordering or duplicates. Changes merged by `batch` are applied within a single callback and increment `getSyncCount()` once.
+
+The collection object itself is the registration key: attaching the same collection again returns the same syncer and keeps one subscription, even when a different index is passed (that index is left untouched). `dispose()` is idempotent and fully releases the subscription; attaching again afterwards creates a fresh syncer that full-loads into the new index. The synced index keeps its last contents on disposal rather than being cleared. Ordinary arrays are not accepted - keep using `SpatialIndex.fromArray` or `load` for the full-rebuild path.
+
 ## React and React Native
 
 Keep the collection instance stable. Its updates repaint the canvas without a React render or draw re-registration:

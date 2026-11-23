@@ -37,6 +37,7 @@ export { Config, normalizeConfig } from "./modules/Config";
 export { ViewportState } from "./modules/ViewportState";
 export { CoordinateTransformer } from "./modules/CoordinateTransformer";
 export { SpatialIndex, type SpatialIndexToken } from "./modules/SpatialIndex";
+export { SpatialIndexSyncer } from "./modules/SpatialIndexSyncer";
 export {
     ItemCollection,
     isItemCollection,

@@ -92,3 +92,25 @@ accept collections. Core updates the stable registration array first, then
 delivers deltas. Cache updater state must be released with its handle/layer.
 Without this method, single-item/array draws still work and a collection
 draw throws before replacing an existing registration id.
+
+## Standalone Spatial Index Sync (core >= 0.12)
+
+`SpatialIndexSyncer.attach(collection, index)` mirrors a live collection into
+your own `SpatialIndex` for viewport queries outside the engine.
+
+- First attach bulk-loads current items in collection order and subscribes.
+  `insert` appends an occurrence; `update` replaces the occurrence's box in
+  place and keeps its registration order; `remove` deletes one occurrence.
+  Queries then always return current collection order with no stale or
+  repeated entries after index shifts.
+- Changes merged by one `batch` apply inside one subscription callback.
+  `getSyncCount()` increments once per delivered callback (not per change);
+  it stays at zero until the first notification.
+- The collection object is the registration key: repeat `attach` calls
+  return the same syncer and keep one subscription; the index passed to a
+  repeat call is never touched. Different collections sync independently.
+- `dispose()` is idempotent, unsubscribes once, and makes later mutations
+  leave the index (kept at its last contents) untouched. Re-attaching after
+  disposal starts a fresh full-load syncer.
+- Ordinary arrays are rejected with a TypeError; keep using
+  `SpatialIndex.fromArray` / `load` for their full-rebuild path.
