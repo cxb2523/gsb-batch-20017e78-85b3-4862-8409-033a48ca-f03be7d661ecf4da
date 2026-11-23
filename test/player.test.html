@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>canvas-player 本地验证页</title>
+<style>html,body{margin:0;height:100%;background:#222}</style>
+</head>
+<body>
+<script src="/node_modules/vue/dist/vue.js"></script>
+<script>
+  // 统计 canvas 绘制调用次数，用于检测是否存在多个绘制循环
+  window.__drawCount = 0;
+  (function() {
+    var orig = CanvasRenderingContext2D.prototype.drawImage;
+    CanvasRenderingContext2D.prototype.drawImage = function() {
+      window.__drawCount++;
+      return orig.apply(this, arguments);
+    };
+  })();
+</script>
+<script src="/lib/canvas-player.umd.js"></script>
+<script>
+  // 本地可控样例：4 个片段，playPoint 顺序拼接，含跨源与同源复用
+  window.__testData = {
+    logo: '',
+    list: [
+      { id: 1, name: 'red',    url: '/test/videos/v1.mp4', width: 320, height: 240,
+        logoPosition: { x: 'left',  y: 'top' },    playPoint: { start: '1.0', end: '3.0' }, index: 0 },
+      { id: 2, name: 'green',  url: '/test/videos/v2.mp4', width: 320, height: 240,
+        logoPosition: { x: 'right', y: 'top' },    playPoint: { start: '0.5', end: '4.5' }, index: 1 },
+      { id: 3, name: 'blue',   url: '/test/videos/v3.mp4', width: 320, height: 240,
+        logoPosition: { x: 'left',  y: 'bottom' }, playPoint: { start: '2.0', end: '5.0' }, index: 2 },
+      { id: 4, name: 'red-2',  url: '/test/videos/v1.mp4', width: 320, height: 240,
+        logoPosition: { x: 'right', y: 'bottom' }, playPoint: { start: '3.5', end: '5.5' }, index: 3 }
+    ]
+  };
+  // 片段时长 2/4/3/2，skipDict = [2, 6, 9, 11]，totalTime = 11
+  var plugin = window['canvas-player'];
+  if (plugin && plugin.default) { plugin = plugin.default; }
+  Vue.use(plugin);
+  window.p = Vue.prototype.$canvasVideoPlayer(window.__testData);
+</script>
+</body>
+</html>
