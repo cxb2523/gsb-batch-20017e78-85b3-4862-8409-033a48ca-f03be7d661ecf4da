@@ -3,7 +3,7 @@ import { parentFirst } from './boneorder';
 import { pruneFolders } from './folders';
 import { dropBonesFromSets } from './selsets';
 import { uniqueName } from './ids';
-import { remapDeformValues, vertexWorldPositions } from './mesh';
+import { deformLength, remapDeformValues, vertexWorldPositions } from './mesh';
 import type { BoneMats, VertexMap } from './mesh';
 import { constraintBoneIds } from './model';
 import type { Animation, Curve, Id, Key, MeshAttachment, RGB, SkeletonDoc, Timeline } from './model';
@@ -173,8 +173,11 @@ export function dropDeformTimeline(a: Animation, skinId: Id, slotId: Id, attName
 
 /**
  * Keeps the deform keys of a mesh of a skin (the default skin unless `skinId` says another) valid after the mesh changed from `before` to `after`
- * (vertices added / removed, influences changed). Keys follow their vertices when the layouts are compatible;
- * otherwise (bind / unbind, re-trace) the timelines are dropped. Returns true when timelines had to be dropped.
+ * (vertices added / removed, influences changed). Keys follow their vertices and, on weighted meshes, their bones when the
+ * layouts are compatible; otherwise (bind / unbind, re-trace, a map that does not fit) the timelines are dropped.
+ *
+ * Every remapped key is checked against `deformLength(after)`: a key that does not fit the mesh as it is now (the layout the
+ * runtime reads) is dropped instead of left to misalign the vertices. Returns true when timelines had to be dropped.
  */
 export function reconcileDeform(
   doc: SkeletonDoc,
@@ -190,6 +193,7 @@ export function reconcileDeform(
   if (!skinId) return false;
   const boneIds = new Set(doc.bones.map((b) => b.id));
   const hasBone = (id: Id) => boneIds.has(id);
+  const expected = deformLength(after, hasBone);
   let dropped = false;
   for (const a of doc.animations) {
     const keys = a.deform[skinId]?.[slotId]?.[attName];
@@ -198,7 +202,7 @@ export function reconcileDeform(
     if (map !== 'drop') {
       for (const k of keys) {
         const v = remapDeformValues(before, after, map, hasBone, k.value, hasBoneBefore);
-        if (!v) break;
+        if (!v || v.length !== expected) break;
         next.push(v);
       }
     }

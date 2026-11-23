@@ -10,6 +10,7 @@ import {
   autoWeights,
   bindMesh,
   generateMeshFromImage,
+  identityVertexMap,
   keepOutside,
   locateInMesh,
   meshFromRegion,
@@ -254,23 +255,30 @@ export function deleteMeshVertices(slotId: Id, name: string, indices: number[]) 
   const { mats, slotMat } = setupMats();
   const world = meshWorldPositions(mesh, slotMat(slotId), mats);
   const remove = new Set(indices);
-  const next = removeMeshVertices(mesh, remove, world);
+  // the core produces the vertex map: every surviving vertex keeps its deform values, the removed ones drop theirs
+  const vertexMap: number[] = [];
+  const next = removeMeshVertices(mesh, remove, world, vertexMap);
   if (next === mesh) {
     toast('A mesh outline needs at least 3 vertices');
     return;
   }
-  const kept = Array.from({ length: mesh.uvs.length / 2 }, (_, i) => i).filter((i) => !remove.has(i));
-  writeMesh(slotId, name, next, 'Delete vertices', kept);
+  writeMesh(slotId, name, next, 'Delete vertices', vertexMap);
   setSelection({ slot: slotId, attachment: name, bones: uiStore.get().selection.bones, vertices: [] });
 }
 
-/** Rebuilds the triangulation (Delaunay inside the outline). */
+/** Rebuilds the triangulation (Delaunay inside the outline). The vertices do not move or renumber, so the keys are kept with the identity map. */
 export function retriangulateMesh(slotId: Id, name: string) {
   const mesh = getShapeMesh(slotId, name);
   if (!mesh) return;
   const { mats, slotMat } = setupMats();
   const world = meshWorldPositions(mesh, slotMat(slotId), mats);
-  writeMesh(slotId, name, { ...mesh, triangles: triangulate(world, mesh.hull, mesh.edges ?? []) }, 'Retriangulate');
+  writeMesh(
+    slotId,
+    name,
+    { ...mesh, triangles: triangulate(world, mesh.hull, mesh.edges ?? []) },
+    'Retriangulate',
+    identityVertexMap(mesh.uvs.length / 2),
+  );
 }
 
 /**
@@ -295,7 +303,13 @@ export function toggleMeshEdge(slotId: Id, name: string, a: number, b: number): 
     }
     edges = [...old, a, b];
   }
-  writeMesh(slotId, name, { ...mesh, edges, triangles: triangulate(world, mesh.hull, edges) }, at >= 0 ? 'Delete edge' : 'Add edge');
+  writeMesh(
+    slotId,
+    name,
+    { ...mesh, edges, triangles: triangulate(world, mesh.hull, edges) },
+    at >= 0 ? 'Delete edge' : 'Add edge',
+    identityVertexMap(mesh.uvs.length / 2),
+  );
   return at < 0;
 }
 
@@ -308,7 +322,7 @@ export function moveMeshTriangle(slotId: Id, name: string, index: number, to: Tr
   if (!mesh) return index;
   const moved = moveTriangle(mesh.triangles, index, to);
   if (moved.index === index) return index;
-  writeMesh(slotId, name, { ...mesh, triangles: moved.triangles }, 'Triangle order');
+  writeMesh(slotId, name, { ...mesh, triangles: moved.triangles }, 'Triangle order', identityVertexMap(mesh.uvs.length / 2));
   return moved.index;
 }
 
@@ -318,7 +332,13 @@ export function clearMeshEdges(slotId: Id, name: string) {
   if (!mesh || !(mesh.edges ?? []).length) return;
   const { mats, slotMat } = setupMats();
   const world = meshWorldPositions(mesh, slotMat(slotId), mats);
-  writeMesh(slotId, name, { ...mesh, edges: [], triangles: triangulate(world, mesh.hull, []) }, 'Clear edges');
+  writeMesh(
+    slotId,
+    name,
+    { ...mesh, edges: [], triangles: triangulate(world, mesh.hull, []) },
+    'Clear edges',
+    identityVertexMap(mesh.uvs.length / 2),
+  );
 }
 
 export interface MeshRef {

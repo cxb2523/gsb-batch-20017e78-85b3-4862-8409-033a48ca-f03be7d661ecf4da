@@ -911,8 +911,20 @@ export function moveTriangle(triangles: readonly number[], index: number, to: Tr
   return { triangles: list.flat(), index: target };
 }
 
-/** Removes the given vertices (never dropping below a 3 vertex hull) and retriangulates in `positions` space. */
-export function removeMeshVertices(mesh: MeshAttachment, remove: Set<number>, positions: ArrayLike<number>): MeshAttachment {
+/**
+ * Removes the given vertices (never dropping below a 3 vertex hull) and retriangulates in `positions` space.
+ *
+ * The edit renumbers every surviving vertex, so the deform keys of the mesh have to follow it. `vertexMap`, when given, is
+ * filled with the mapping `remapDeformValues` expects: for every vertex of the NEW mesh the index of the vertex it came from
+ * (`newVertex[j] === oldVertex[vertexMap[j]]`). It is the same array `remapEdges` gets, which keeps the two in step.
+ * Returns the mesh unchanged (`=== mesh`, and `vertexMap` untouched) when the outline would lose too many vertices.
+ */
+export function removeMeshVertices(
+  mesh: MeshAttachment,
+  remove: Set<number>,
+  positions: ArrayLike<number>,
+  vertexMap?: number[],
+): MeshAttachment {
   const n = mesh.uvs.length / 2;
   const keep: number[] = [];
   let hull = 0;
@@ -933,6 +945,7 @@ export function removeMeshVertices(mesh: MeshAttachment, remove: Set<number>, po
     else vertices.push(mesh.vertices[i * 2], mesh.vertices[i * 2 + 1]);
   }
   const edges = remapEdges(mesh.edges ?? [], keep);
+  if (vertexMap) vertexMap.splice(0, vertexMap.length, ...keep);
   return { ...mesh, uvs, vertices, weights, hull, edges, triangles: triangulate(pos, hull, edges) };
 }
 
@@ -955,6 +968,15 @@ export function deformLength(mesh: MeshAttachment | PathAttachment, hasBone: (id
 /** For every vertex of an edited mesh, the index of the vertex it came from (-1 = new). `null` = same order and count. */
 export type VertexMap = ArrayLike<number> | null;
 
+/**
+ * The vertex map of an edit that keeps every vertex in place (a re-triangulation, a triangle reorder, a weight repaint):
+ * vertex `j` of the new mesh is vertex `j` of the old one. Keeping the deform keys amounts to the identity layout, but it is
+ * spelled out so every edit path passes a map and the caller never has to guess whether a `null` means "same" or "unknown".
+ */
+export function identityVertexMap(count: number): number[] {
+  return Array.from({ length: count }, (_, i) => i);
+}
+
 function influenceBones(mesh: MeshAttachment, vertex: number, hasBone: (id: Id) => boolean): Id[] {
   const out: Id[] = [];
   for (const inf of mesh.weights?.[vertex] ?? []) if (hasBone(inf[0])) out.push(inf[0]);
@@ -963,8 +985,14 @@ function influenceBones(mesh: MeshAttachment, vertex: number, hasBone: (id: Id) 
 
 /**
  * Re-lays out one deform key after the mesh changed from `before` to `after`.
- * Values follow their vertex (and, for weighted meshes, their bone); new vertices / influences start at zero.
- * Returns `null` when the old values cannot be carried over (bind / unbind, unknown history) — the caller drops the keys.
+ * Values follow their vertex (and, for weighted meshes, their bone identity, not the influence slot); new vertices /
+ * influences start at zero.
+ *
+ * Returns `null` — the caller then drops the keys, as there is no safe layout — when:
+ *  - the mesh switched between weighted and unweighted (`bind` / `unbind`),
+ *  - `values` is not `deformLength(before)` long,
+ *  - a map is needed (the vertex count changed) but is missing or does not describe the new mesh,
+ *  - an entry of `map` points outside the old mesh and is not the `-1` "this vertex is new" marker.
  */
 export function remapDeformValues(
   before: MeshAttachment,
@@ -979,7 +1007,16 @@ export function remapDeformValues(
   const nOld = before.uvs.length >> 1;
   const nNew = after.uvs.length >> 1;
   if (!map && nOld !== nNew) return null;
+  // A map that does not cover every new vertex, or that claims an old vertex the old mesh does not have, cannot be trusted:
+  // carrying the values over with it would put them on the wrong vertices. Refuse rather than misalign.
+  if (map && map.length !== nNew) return null;
   const from = (j: number) => (map ? map[j] : j);
+  if (map) {
+    for (let j = 0; j < nNew; j++) {
+      const s = map[j];
+      if (!Number.isInteger(s) || s < -1 || s >= nOld) return null;
+    }
+  }
   if (!after.weights) {
     const out = new Array<number>(nNew * 2).fill(0);
     for (let j = 0; j < nNew; j++) {
