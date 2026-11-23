@@ -77,45 +77,69 @@ export default class Audio extends EventTarget {
     this._muted = false;
     this._volume = 1;
     this._error = null;
+    // Bumped on every src change and on destroy(). Event closures registered with the runtime carry the generation
+    // they were registered for and drop events from any other one, so a late canplay/play/pause/ended/error from a
+    // previous source (or from a destroyed element) cannot rewrite the state of the current one.
+    this._gen = 0;
+    this._destroyed = false;
     this.preload = "auto";
     this.crossOrigin = null;
     for (const type of HANDLER_EVENTS) this["on" + type] = null;
 
-    // The event closures below are stored on _ctx, and _ctx is strongly held by the global InnerAudioContext registry
+    // The event closures are stored on _ctx, and _ctx is strongly held by the global InnerAudioContext registry
     // until destroy(). If those closures captured `this` strongly, the chain registry -> _ctx -> closure -> wrapper
     // would keep this wrapper reachable forever, and the FinalizationRegistry would never fire. Hold the wrapper via
     // WeakRef so the cycle is broken. (No WeakRef -- a very old runtime -- means a strong capture: GC-driven cleanup
     // is not available there anyway, so callers must destroy() explicitly.)
-    const ref = typeof WeakRef === "function" ? new WeakRef(this) : { deref: () => this };
-    const on = (register, handler) => {
-      if (typeof register === "function") register.call(this._ctx, (...args) => { const self = ref.deref(); if (self) handler(self, ...args); });
-    };
-    on(this._ctx.onCanplay, (self) => self._canplay());
-    on(this._ctx.onPlay, (self) => { self._ended = false; self._paused = false; self._fire("play"); self._fire("playing"); });
-    on(this._ctx.onPause, (self) => { self._paused = true; self._fire("pause"); });
-    // Playback that runs to its end pauses the element and then ends it (HTML Standard, "reaches the end").
-    on(this._ctx.onEnded, (self) => {
-      self._ended = true;
-      if (!self._paused) { self._paused = true; self._fire("pause"); }
-      self._fire("ended");
-    });
-    on(this._ctx.onTimeUpdate, (self) => self._fire("timeupdate"));
-    on(this._ctx.onSeeked, (self) => self._fire("seeked"));
-    on(this._ctx.onWaiting, (self) => self._fire("waiting"));
-    on(this._ctx.onError, (self, err) => {
-      self._paused = true;
-      self._error = { code: MEDIA_ERR_SRC_NOT_SUPPORTED, message: String((err && (err.errMsg || err.message)) || err || "") };
-      self._fire("error", { error: err });
-    });
+    this._ref = typeof WeakRef === "function" ? new WeakRef(this) : { deref: () => this };
+    this._attach();
 
-    // Release the native context when this wrapper is garbage-collected.
+    // Release the native context when this wrapper is garbage-collected. destroy() unregisters, so an explicitly
+    // destroyed wrapper is never released a second time here.
     if (_audioFinalizer) _audioFinalizer.register(this, this._ctx, this);
 
     if (src) this.src = src;
   }
 
-  // Fires to the `on<type>` property and the listeners, as a media element does.
+  // (Re)registers the runtime event callbacks, stamped with the current generation. Called again on every src
+  // change so callbacks the runtime still holds for the previous source are replaced; where a runtime stacks
+  // listeners instead of replacing them, the generation check inside each closure discards the stale deliveries.
+  _attach() {
+    const gen = this._gen;
+    const ref = this._ref;
+    const ctx = this._ctx;
+    const on = (register, handler) => {
+      if (typeof register === "function") {
+        register.call(ctx, (...args) => {
+          const self = ref.deref();
+          if (!self || self._destroyed || self._gen !== gen) return;
+          handler(self, ...args);
+        });
+      }
+    };
+    on(ctx.onCanplay, (self) => self._canplay());
+    on(ctx.onPlay, (self) => { self._ended = false; self._paused = false; self._fire("play"); self._fire("playing"); });
+    on(ctx.onPause, (self) => { self._paused = true; self._fire("pause"); });
+    // Playback that runs to its end pauses the element and then ends it (HTML Standard, "reaches the end").
+    on(ctx.onEnded, (self) => {
+      self._ended = true;
+      if (!self._paused) { self._paused = true; self._fire("pause"); }
+      self._fire("ended");
+    });
+    on(ctx.onTimeUpdate, (self) => self._fire("timeupdate"));
+    on(ctx.onSeeked, (self) => self._fire("seeked"));
+    on(ctx.onWaiting, (self) => self._fire("waiting"));
+    on(ctx.onError, (self, err) => {
+      self._paused = true;
+      self._error = { code: MEDIA_ERR_SRC_NOT_SUPPORTED, message: String((err && (err.errMsg || err.message)) || err || "") };
+      self._fire("error", { error: err });
+    });
+  }
+
+  // Fires to the `on<type>` property and the listeners, as a media element does. A destroyed element is terminal:
+  // it never dispatches again.
   _fire(type, extra) {
+    if (this._destroyed) return;
     const event = { type, target: this, currentTarget: this, defaultPrevented: false, preventDefault() {}, stopPropagation() {}, ...extra };
     const handler = this["on" + type];
     if (typeof handler === "function") {
@@ -131,11 +155,21 @@ export default class Audio extends EventTarget {
   }
 
   set src(v) {
+    if (this._destroyed) return; // a destroyed element is terminal: a new source does not revive it
+    // A new source supersedes everything the old one had in flight: the state resets, the old source's callbacks
+    // are invalidated (a late canplay/play/pause/ended/error from it must not rewrite the new element), and the
+    // load sequence starts over from loadstart.
+    this._gen++;
     this._readyState = 0;
     this._ended = false;
     this._error = null;
+    this._paused = true;
+    this._attach();
     this._ctx.src = withinPackage(v);
-    if (v) Promise.resolve().then(() => this._fire("loadstart"));
+    if (v) {
+      const gen = this._gen;
+      Promise.resolve().then(() => { if (!this._destroyed && this._gen === gen) this._fire("loadstart"); });
+    }
   }
   get src() { return this._ctx.src; }
   get currentSrc() { return this._ctx.src || ""; }
@@ -184,12 +218,14 @@ export default class Audio extends EventTarget {
   // HTMLMediaElement.play() returns a promise that settles when playback has started. InnerAudioContext reports the start
   // as an event, and a rejected play() (autoplay policy, bad source) as an error event.
   play() {
+    if (this._destroyed) return Promise.resolve(); // terminal: no-op, but keep the promise contract
     this._ended = false;
     this._paused = false;
     this._ctx.play();
     return Promise.resolve();
   }
   pause() {
+    if (this._destroyed) return;
     this._paused = true;
     this._ctx.pause();
   }
@@ -198,8 +234,13 @@ export default class Audio extends EventTarget {
   cloneNode() { return new Audio(this.src); }
 
   // Not a standard HTMLMediaElement method, but exposed so callers can release
-  // the native context deterministically instead of waiting for GC.
+  // the native context deterministically instead of waiting for GC. Idempotent
+  // and terminal: a second call does nothing, and afterwards the element
+  // ignores source changes, playback calls and runtime events.
   destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    this._gen++; // invalidate every callback the runtime may still deliver
     if (_audioFinalizer) _audioFinalizer.unregister(this);
     if (this._ctx && typeof this._ctx.destroy === "function") this._ctx.destroy();
   }
