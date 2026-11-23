@@ -4,6 +4,7 @@
  */
 
 import {zoom as d3Zoom} from 'd3-zoom'
+import {select as d3Select} from 'd3-selection'
 
 
 import {SeatMapCanvas} from "@/canvas.index";
@@ -51,6 +52,7 @@ export default class ZoomManager {
     public minZoom: number | null = null;
     public zoomLevel: ZoomLevel;
     private lastPointer: [number, number] | null = null;
+    private zoomEnabled: boolean = true;
 
 
     constructor(private _self: SeatMapCanvas) {
@@ -73,18 +75,44 @@ export default class ZoomManager {
         });
 
         this._self.eventManager.addEventListener(EventType.KEYDOWN_SVG, (e: any) => {
-            if (e.which == 17 || e.which === 91) {
-                this._self.eventManager.dispatch(EventType.MULTI_SELECT_ENABLE, e);
-                e?.preventDefault?.();
-                this.zoomDisable();
-            }
+            if (!this.isMultiSelectKey(e)) return;
+            e?.preventDefault?.();
+            // Keyboard auto-repeat fires KEYDOWN continuously: only the first
+            // keydown may open multi-select, otherwise the enable/disable pair
+            // would get out of sync with the zoom state.
+            if (this._self.global && this._self.global.multi_select) return;
+            this._self.eventManager.dispatch(EventType.MULTI_SELECT_ENABLE, e);
+            this.zoomDisable();
         });
         this._self.eventManager.addEventListener(EventType.KEYUP_SVG, (e: any) => {
-            this._self.eventManager.dispatch(EventType.MULTI_SELECT_DISABLE, e);
+            if (!this.isMultiSelectKey(e)) return;
             e?.preventDefault?.();
+            if (!this._self.global || !this._self.global.multi_select) return;
+            this._self.eventManager.dispatch(EventType.MULTI_SELECT_DISABLE, e);
             this.zoomEnable();
         });
 
+        // If the window loses focus while the modifier is held (alt-tab, dev
+        // tools, ...) the KEYUP never arrives. Restore the paired state so the
+        // stage does not stay stuck in multi-select with zoom disabled.
+        d3Select(window).on("blur.zoommulti", () => {
+            if (!this._self.global || !this._self.global.multi_select) return;
+            this._self.eventManager.dispatch(EventType.MULTI_SELECT_DISABLE, null);
+            this.zoomEnable();
+        });
+
+    }
+
+    /**
+     * Ctrl (17) or the Windows / macOS command key (91 / 93). Uses both the
+     * legacy `which`/`keyCode` fields and the modern `key` value so the
+     * modifier is recognized consistently across browsers.
+     */
+    private isMultiSelectKey(e: any): boolean {
+        if (!e) return false;
+        let code = typeof e.which !== "undefined" && e.which ? e.which : e.keyCode;
+        if (code === 17 || code === 91 || code === 93) return true;
+        return e.key === "Control" || e.key === "Meta";
     }
 
     zoomInit() {
@@ -106,6 +134,13 @@ export default class ZoomManager {
 
         this._self.svg.node.call(this.zoomTypes.normal);
         this._self.svg.node.on("dblclick.zoom", null);
+        // `zoomInit` is also called from `zoomToVenue`, which can happen while
+        // the user is holding the multi-select modifier. Re-applying the zoom
+        // behaviour here would silently re-enable zooming mid-selection, so
+        // keep the current enabled/disabled state authoritative.
+        if (!this.zoomEnabled) {
+            this._self.svg.node.on('.zoom', null);
+        }
     }
 
     zoomEnd(_self: this): any {
@@ -187,13 +222,10 @@ export default class ZoomManager {
         }
         let _levels = {
             seat: this._self.config.max_zoom - 0.2,
-            block: this.zoomLevels.BLOCK.k,
-            venue: this.zoomLevels.VENUE.k
+            block: this.zoomLevels.BLOCK.k
         };
 
-        let _zoomLevel: ZoomLevel | null = null;
-
-        let blocks_count = this._self.data.getBlocks().length;
+        let _zoomLevel: ZoomLevel;
 
         if (k >= _levels.seat) {
             _zoomLevel = ZoomLevel.SEAT;
@@ -201,12 +233,16 @@ export default class ZoomManager {
         } else if (k >= _levels.block) {
             _zoomLevel = ZoomLevel.BLOCK;
 
-        } else if (k >= _levels.venue && blocks_count > 1) {
+        } else {
+            // Below the block threshold the stage is always at venue scope.
+            // Falling through to `null` here used to leave the SVG without a
+            // zoom-level class, so masks / seat colours / block titles were
+            // never restored after zooming back out.
             _zoomLevel = ZoomLevel.VENUE;
         }
 
         if (_zoomLevel !== this.zoomLevel) {
-            this.zoomLevel = _zoomLevel as ZoomLevel;
+            this.zoomLevel = _zoomLevel;
             this.dispatchZoomEvent();
         }
     }
@@ -431,12 +467,15 @@ export default class ZoomManager {
 
 
     public zoomEnable(): this {
+        this.zoomEnabled = true;
+        this._self.svg.node.on('.zoom', null);
         this._self.svg.node.call(this.zoomTypes.normal);
-        //this._self.svg.node.on('.zoom', null);
+        this._self.svg.node.on("dblclick.zoom", null);
         return this;
     }
 
     public zoomDisable(): this {
+        this.zoomEnabled = false;
         this._self.svg.node.on('.zoom', null);
         return this;
     }

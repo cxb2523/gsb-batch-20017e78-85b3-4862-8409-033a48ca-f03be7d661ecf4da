@@ -45,28 +45,19 @@ export default class Block extends SvgBase {
         this.attr("opacity", 0);
 
         this.global.eventManager.addEventListener(EventType.ZOOM_LEVEL_CHANGE, (levelObject: any) => {
-            if (levelObject.level === ZoomLevel.VENUE) {
-                this.mask.blockLevelMask.show();
-                this.mask.seatLevelMask.show();
-                this.seats.resetSeatsColors(false);
-                this.infosToCenter();
-            } else if (levelObject.level === ZoomLevel.BLOCK) {
-                this.mask.blockLevelMask.hide();
-                this.mask.seatLevelMask.show();
-                this.infosToTop();
-            } else if (levelObject.level === ZoomLevel.SEAT) {
-                this.mask.blockLevelMask.hide();
-                this.mask.seatLevelMask.hide();
-                this.seats.resetSeatsColors(false);
-                this.infosToTop();
-            }
+            this.applyZoomLevel(levelObject.level);
         });
 
+        // Enabling / disabling multi-select changes which interactive layers
+        // are visible, so re-apply the current zoom presentation instead of
+        // only repainting seat colours. This is what keeps mask, seat colours
+        // and info title position consistent when the modifier is pressed or
+        // released.
         this.global.eventManager.addEventListener(EventType.MULTI_SELECT_ENABLE, () => {
-            this.seats.resetSeatsColors(false);
+            this.applyZoomLevel(this.getCurrentZoomLevel());
         });
         this.global.eventManager.addEventListener(EventType.MULTI_SELECT_DISABLE, () => {
-            this.seats.resetSeatsColors(false);
+            this.applyZoomLevel(this.getCurrentZoomLevel());
         });
 
 
@@ -175,8 +166,41 @@ export default class Block extends SvgBase {
         return this;
     }
 
+    /**
+     * Paint every zoom-level dependent piece of the block (region masks,
+     * seat colours, info title position) from a single place. Zoom level
+     * changes and multi-select toggles both funnel through here so the three
+     * presentations can never drift apart.
+     */
+    public applyZoomLevel(level: string | null | undefined) {
+        if (!this.mask || !this.mask.blockLevelMask || !this.mask.seatLevelMask) return;
+
+        if (level === ZoomLevel.VENUE) {
+            this.mask.blockLevelMask.show();
+            this.mask.seatLevelMask.show();
+            this.seats.resetSeatsColors(false);
+            this.infosToCenter();
+        } else if (level === ZoomLevel.BLOCK) {
+            this.mask.blockLevelMask.hide();
+            this.mask.seatLevelMask.show();
+            this.seats.resetSeatsColors(false);
+            this.infosToTop();
+        } else {
+            // SEAT (and any unknown level) shows real seat colours with no
+            // mask, the title pinned above the block.
+            this.mask.blockLevelMask.hide();
+            this.mask.seatLevelMask.hide();
+            this.seats.resetSeatsColors(false);
+            this.infosToTop();
+        }
+    }
+
+    private getCurrentZoomLevel(): string {
+        return this.global.zoomManager ? this.global.zoomManager.zoomLevel : ZoomLevel.VENUE;
+    }
+
     public infosToTop() {
-        if (this.info.node && this.top_position.x) {
+        if (this.info && this.info.node && this.info.title && this.info.title.node && this.top_position.x) {
             this.info.node
                 .interrupt()
                 .transition()
@@ -194,7 +218,7 @@ export default class Block extends SvgBase {
     }
 
     public infosToCenter() {
-        if (this.info.node && this.center_position.x) {
+        if (this.info && this.info.node && this.info.title && this.info.title.node && this.center_position.x) {
             this.info.node.interrupt()
                 .transition()
                 .duration(this.global.config.animation_speed)

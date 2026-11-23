@@ -9,6 +9,7 @@ import SvgBase from "@svg/svg.base";
 import {dom} from "@decorator/dom";
 import BlocksSearchCircle from "./blocks.search-circle";
 import StageBackground from "./stage.background";
+import MultiSelect from "./multi-select";
 
 
 
@@ -22,6 +23,7 @@ export default class Stage extends SvgBase {
     public blocks: Blocks;
     public searchCircle:BlocksSearchCircle;
     public background: StageBackground;
+    public multiSelect: MultiSelect;
 
     constructor(public parent: Svg) {
         super(parent);
@@ -40,6 +42,11 @@ export default class Stage extends SvgBase {
 
         this.searchCircle = new BlocksSearchCircle(this);
         this.addChild(this.searchCircle);
+
+        // Selection rectangle lives last so it paints on top of the blocks
+        // while still sharing the stage's zoom/pan transform.
+        this.multiSelect = new MultiSelect(this);
+        this.addChild(this.multiSelect);
 
 
         this.updateChilds();
