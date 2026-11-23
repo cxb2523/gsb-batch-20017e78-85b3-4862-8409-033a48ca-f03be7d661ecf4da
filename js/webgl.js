@@ -639,6 +639,7 @@ function webgl_collision({
 function webgl_context_lost(event){
     event.preventDefault();
     core_interval_pause_all();
+    core_audio_pause('webgl');
     webgl = 0;
 }
 
@@ -668,6 +669,7 @@ function webgl_context_restored(){
     }else{
         core_interval_resume_all();
     }
+    core_audio_resume('webgl');
 }
 
 function webgl_controls_keyboard(character){

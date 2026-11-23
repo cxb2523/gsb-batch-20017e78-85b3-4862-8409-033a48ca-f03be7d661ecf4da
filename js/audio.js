@@ -46,12 +46,16 @@ function audio_play({
 }
 
 function audio_start(id){
-    if(!core_storage_data.audio_enabled){
+    if(!core_storage_data.audio_enabled
+      || globalThis.core_audio_playing === false){
         return;
     }
 
     if(audio_context === 0){
         audio_context = new globalThis.AudioContext();
+        if(audio_context.state === 'suspended'){
+            audio_context.resume()?.catch(function(){});
+        }
 
     }else if(audio_context.state === 'suspended'){
         return;
@@ -70,6 +74,7 @@ function audio_start(id){
     oscillator.frequency.value = audio.frequency;
     oscillator.connect(gain);
 
+    let panner = false;
     if(audio.panner !== false){
         if(!audio_context.listener.forwardX){
             audio_context.listener.setOrientation(
@@ -84,7 +89,7 @@ function audio_start(id){
             audio_context.listener.forwardY.value = audio_listener.forwardY;
             audio_context.listener.forwardZ.value = audio_listener.forwardZ;
         }
-        const panner = new PannerNode(
+        panner = new PannerNode(
           audio_context,
           audio.panner
         );
@@ -93,6 +98,16 @@ function audio_start(id){
     }else{
         gain.connect(audio_context.destination);
     }
+
+    oscillator.onended = function(){
+        oscillator.disconnect();
+        gain.disconnect();
+
+        if(panner !== false){
+            panner.disconnect();
+        }
+        oscillator.onended = null;
+    };
 
     oscillator.start(start);
     oscillator.stop(duration);
@@ -143,13 +158,16 @@ function audio_state(id, state){
 }
 
 function audio_state_all(state){
-    if(audio_context !== 0){
+    if(audio_context !== 0
+      && audio_context.state !== 'closed'){
         if(state
           && core_storage_data.audio_enabled){
-            audio_context.resume();
+            if(audio_context.state !== 'running'){
+                audio_context.resume()?.catch(function(){});
+            }
 
-        }else{
-            audio_context.suspend();
+        }else if(audio_context.state !== 'suspended'){
+            audio_context.suspend()?.catch(function(){});
         }
     }
 

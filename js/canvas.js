@@ -3,6 +3,7 @@
 function canvas_context_lost(event){
     event.preventDefault();
     core_interval_pause_all();
+    core_audio_pause('canvas');
     canvas = 0;
 }
 
@@ -15,6 +16,7 @@ function canvas_context_restored(){
     if(!core_menu_open){
         core_interval_resume_all();
     }
+    core_audio_resume('canvas');
 }
 
 function canvas_draw(){

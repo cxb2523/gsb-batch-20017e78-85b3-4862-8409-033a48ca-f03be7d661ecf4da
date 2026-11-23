@@ -1,5 +1,25 @@
 'use strict';
 
+function core_audio_pause(reason){
+    core_audio_paused[reason] = true;
+    core_audio_update();
+}
+
+function core_audio_resume(reason){
+    delete core_audio_paused[reason];
+    core_audio_update();
+}
+
+function core_audio_update(){
+    const playing = Object.keys(core_audio_paused).length === 0;
+    if(playing === core_audio_playing){
+        return;
+    }
+
+    core_audio_playing = playing;
+    globalThis.audio_state_all?.(playing);
+}
+
 function core_digits_min({
   digits = 2,
   number,
@@ -32,6 +52,7 @@ function core_escape(force){
 
     if(core_menu_open){
         core_interval_pause_all();
+        core_audio_pause('menu');
         core_handle_blur();
         globalThis.scrollTo(0, 0);
         core_elements.core_ui.classList.add('open');
@@ -42,6 +63,7 @@ function core_escape(force){
         core_elements.core_menu.classList.add('hidden');
         core_elements.core_ui.classList.remove('open');
         core_interval_resume_all();
+        core_audio_resume('menu');
     }
 
     globalThis.repo_escape?.();
@@ -87,6 +109,23 @@ function core_getelement(id){
 
 function core_getpointerlock(){
     return document.pointerLockElement !== null;
+}
+
+function core_handle_audio_blur(){
+    core_audio_pause('focus');
+}
+
+function core_handle_audio_focus(){
+    core_audio_resume('focus');
+}
+
+function core_handle_audio_visibility(){
+    if(document.visibilityState === 'hidden'){
+        core_audio_pause('visibility');
+
+    }else{
+        core_audio_resume('visibility');
+    }
 }
 
 function core_handle_blur(event){
@@ -1224,6 +1263,8 @@ function core_ui_update({
     }
 }
 
+globalThis.core_audio_paused = {};
+globalThis.core_audio_playing = true;
 globalThis.core_elements = {};
 globalThis.core_events = {};
 globalThis.core_intervals = {};
@@ -1257,6 +1298,9 @@ globalThis.addEventListener('load', function(){
     };
 
     globalThis.addEventListener('blur', core_handle_blur);
+    globalThis.addEventListener('blur', core_handle_audio_blur);
+    globalThis.addEventListener('focus', core_handle_audio_focus);
+    document.addEventListener('visibilitychange', core_handle_audio_visibility);
     globalThis.addEventListener('keydown', core_handle_keydown);
     globalThis.addEventListener('keyup', core_handle_keyup);
 
