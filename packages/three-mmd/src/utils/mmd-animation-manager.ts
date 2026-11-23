@@ -39,9 +39,12 @@ export class MMDAnimationManager {
   private audioDelay = 0
   private audioDuration?: number
 
+  /** Time elapsed inside the current cycle, in [0, duration) when a duration is configured. */
   private audioElapsed = 0
-  private audioStarted = false
+  /** Whether the manager started the currently playing audio and may stop it again. */
   private audioStartedByManager = false
+  /** Whether the current cycle already triggered (or deliberately skipped) the audio. */
+  private audioTriggered = false
 
   private camera?: Camera
   private cameraMixer?: AnimationMixer
@@ -103,7 +106,9 @@ export class MMDAnimationManager {
       this.audioDelay = audioOptions.delayTime ?? 0
       this.audioDuration = object.buffer?.duration
       this.audioElapsed = 0
-      this.audioStarted = object.isPlaying
+      // Audio that was already playing when it was added is left alone: the
+      // manager only takes over once the source is silent.
+      this.audioTriggered = object.isPlaying
       this.audioStartedByManager = false
       return this
     }
@@ -130,8 +135,10 @@ export class MMDAnimationManager {
         return this
 
       mixer.stopAllAction()
-      object.updateAnimation()
+      // Forget the action state so the same model can be added again, and put
+      // the IK switches animation took over back to their pre-animation values.
       mixer.uncacheRoot(object.mesh)
+      object.resetAnimationState()
       this.models.delete(object)
       return this
     }
@@ -155,6 +162,8 @@ export class MMDAnimationManager {
       if (this.audio !== object)
         return this
 
+      // Only stop audio the manager itself started; externally started audio
+      // must keep playing after it is removed from the manager.
       if (this.audioStartedByManager && object.isPlaying)
         object.stop()
 
@@ -162,7 +171,7 @@ export class MMDAnimationManager {
       this.audioDelay = 0
       this.audioDuration = undefined
       this.audioElapsed = 0
-      this.audioStarted = false
+      this.audioTriggered = false
       this.audioStartedByManager = false
       return this
     }
@@ -193,28 +202,38 @@ export class MMDAnimationManager {
     if (this.audio == null)
       return
 
+    const audio = this.audio
     this.audioElapsed += delta
 
     if (this.duration != null) {
       while (this.audioElapsed >= this.duration) {
         this.audioElapsed -= this.duration
-        if (this.audio.isPlaying)
-          this.audio.stop()
-        this.audioStarted = false
+        // Start every cycle from silence so the next cycle can trigger the
+        // audio again at its own delayTime. Only stop audio the manager owns;
+        // audio started from outside must keep playing.
+        if (this.audioStartedByManager && audio.isPlaying)
+          audio.stop()
         this.audioStartedByManager = false
+        this.audioTriggered = false
       }
     }
 
+    // The playable window is [delayTime, delayTime + audio duration]. Audio
+    // shorter than the cycle therefore stays silent for the remainder of the
+    // cycle instead of being started early.
     const audioEnd = this.audioDuration == null
       ? Number.POSITIVE_INFINITY
       : this.audioDelay + this.audioDuration
 
-    if (!this.audioStarted && this.audioElapsed >= this.audioDelay && this.audioElapsed <= audioEnd) {
-      this.audioStarted = true
-      if (!this.audio.isPlaying) {
-        this.audio.play()
-        this.audioStartedByManager = true
-      }
+    if (this.audioTriggered || this.audioElapsed < this.audioDelay || this.audioElapsed > audioEnd)
+      return
+
+    // Mark the cycle as handled even for audio the manager did not start, so
+    // it never plays or stops a source it does not own.
+    this.audioTriggered = true
+    if (!audio.isPlaying) {
+      audio.play()
+      this.audioStartedByManager = true
     }
   }
 
@@ -241,6 +260,14 @@ export class MMDAnimationManager {
     finally {
       mixer.removeEventListener('loop', onLoop)
     }
+
+    // A new cycle starts from the state animation found when it took over:
+    // restore the IK switches to their pre-animation values and drop the
+    // fixed-axis bone cache so the first frame re-derives it from the freshly
+    // sampled animation pose instead of the previous cycle's output. The
+    // property track then re-applies the new cycle's states on top.
+    if (skeletalAnimationLooped)
+      mmd.resetAnimationState()
 
     mmd.updateAnimation(mixer)
     mmd.beforePhysics(options)

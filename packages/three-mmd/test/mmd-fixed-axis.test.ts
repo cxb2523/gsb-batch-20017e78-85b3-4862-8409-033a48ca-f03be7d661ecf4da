@@ -1,8 +1,19 @@
 import { PmxObject } from 'babylon-mmd/esm/Loader/Parser/pmxObject'
-import { Bone, BufferGeometry, MeshBasicMaterial, Quaternion, Skeleton, SkinnedMesh, Vector3 } from 'three'
+import {
+  AnimationClip,
+  Bone,
+  BufferGeometry,
+  MeshBasicMaterial,
+  Quaternion,
+  QuaternionKeyframeTrack,
+  Skeleton,
+  SkinnedMesh,
+  Vector3,
+} from 'three'
 import { describe, expect, it } from 'vitest'
 
 import { MMD } from '../src/utils/mmd'
+import { MMDAnimationManager } from '../src/utils/mmd-animation-manager'
 import { postParseProcessing } from '../src/utils/post-parse'
 
 interface BoneSpec {
@@ -161,6 +172,39 @@ describe('pMX fixed axis bones', () => {
     mmd.beforeUpdate()
 
     expectSameRotation(bones[0].quaternion, animated)
+  })
+
+  it('re-derives the projection from the animation pose on the first frame after a loop', () => {
+    const { bones, mmd } = createModel([{ axisLimit: [0, 0, 1] }])
+    // The pose at the start of the clip rotates +90 deg around X, which
+    // projects to +90 deg around Z.
+    const start = aroundAxis(1, 0, 0, Math.PI / 2)
+    const end = aroundAxis(0, 1, 0, Math.PI / 6)
+    const clip = new AnimationClip('axis', 1, [
+      new QuaternionKeyframeTrack('.bones[0].quaternion', [0, 1], [
+        start.x,
+        start.y,
+        start.z,
+        start.w,
+        end.x,
+        end.y,
+        end.z,
+        end.w,
+      ]),
+    ])
+    const manager = new MMDAnimationManager()
+    manager.add(mmd, { animation: clip })
+
+    // Advance to the second half of the cycle: the bone holds an interpolated
+    // pose that is not the first frame's projection.
+    manager.update(0.5, { physics: false })
+    expect(bones[0].quaternion.angleTo(aroundAxis(0, 0, 1, Math.PI / 2))).toBeGreaterThan(0.1)
+
+    // The second half crosses the loop and lands exactly on the new cycle's
+    // start. The first frame must project the freshly sampled start pose, not
+    // reuse the previous cycle's cached output.
+    manager.update(0.5, { physics: false })
+    expectSameRotation(bones[0].quaternion, aroundAxis(0, 0, 1, Math.PI / 2))
   })
 
   it('negates the axis in X and Y when converting to right-handed coordinates', () => {

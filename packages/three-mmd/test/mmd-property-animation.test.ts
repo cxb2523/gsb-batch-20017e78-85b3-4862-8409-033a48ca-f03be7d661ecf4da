@@ -12,6 +12,7 @@ import {
   MeshBasicMaterial,
   Skeleton,
   SkinnedMesh as ThreeSkinnedMesh,
+  VectorKeyframeTrack,
 } from 'three'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -294,6 +295,104 @@ describe('mmd property animation', () => {
     manager.remove(mmd)
 
     expect(mmd.ikSolver.isEnabled(0)).toBe(true)
+  })
+
+  it('restores the pre-animation IK state when a skeletal animation loops', () => {
+    const mmd = createIkMmd()
+    // The IK switch is enabled before animation so the property track's
+    // "disabled" frames are the only thing turning it off.
+    expect(mmd.ikSolver.isEnabled(0)).toBe(true)
+
+    const clip = new AnimationClip('property', 0.5, [
+      new VectorKeyframeTrack('.bones[0].position', [0, 0.5], [0, 0, 0, 1, 0, 0]),
+    ])
+    clip.userData = {
+      propertyTrack: {
+        frameNumbers: [0],
+        ikBoneNames: ['ik'],
+        ikStates: [[false]],
+      },
+    }
+    const manager = new MMDAnimationManager()
+    manager.add(mmd, { animation: clip })
+
+    manager.update(0.1, { grant: false, physics: false })
+    expect(mmd.ikSolver.isEnabled(0)).toBe(false)
+
+    // At the loop boundary the manager restores the pre-animation IK value
+    // before the new cycle's property track applies again, so the restore is
+    // observable as a call back to the baseline.
+    const setEnabled = vi.spyOn(mmd.ikSolver, 'setEnabled')
+    manager.update(0.5, { grant: false, physics: false })
+    expect(setEnabled).toHaveBeenCalledWith(0, true)
+    expect(mmd.ikSolver.isEnabled(0)).toBe(false)
+
+    // Once the property track stops driving IK, the restored state surfaces:
+    // it must be the pre-animation value, not a value left over from the loop.
+    const plainMixer = new AnimationMixer(mmd.mesh)
+    plainMixer.clipAction(new AnimationClip('plain', 1, [])).play()
+    mmd.updateWithMixer(0, plainMixer, { grant: false, physics: false })
+    expect(mmd.ikSolver.isEnabled(0)).toBe(true)
+  })
+
+  it('restores the pre-animation IK state captured before animation took control', () => {
+    const mmd = createIkMmd(['left', 'right'])
+    // Left starts enabled, right starts disabled; the property track flips both
+    // and a loop must bring each back to its own baseline.
+    mmd.ikSolver.setEnabled(3, false)
+
+    const clip = new AnimationClip('property', 0.5, [
+      new VectorKeyframeTrack('.bones[0].position', [0, 0.5], [0, 0, 0, 1, 0, 0]),
+    ])
+    clip.userData = {
+      propertyTrack: {
+        frameNumbers: [0],
+        ikBoneNames: ['left', 'right'],
+        ikStates: [[false], [true]],
+      },
+    }
+    const manager = new MMDAnimationManager()
+    manager.add(mmd, { animation: clip })
+
+    manager.update(0.1, { grant: false, physics: false })
+    expect(mmd.ikSolver.isEnabled(0)).toBe(false)
+    expect(mmd.ikSolver.isEnabled(3)).toBe(true)
+
+    manager.update(0.5, { grant: false, physics: false })
+    // The new cycle re-applies the property track on top of the restored values.
+    expect(mmd.ikSolver.isEnabled(0)).toBe(false)
+    expect(mmd.ikSolver.isEnabled(3)).toBe(true)
+  })
+
+  it('removing one MMD restores its IK without disturbing other registered MMDs', () => {
+    const first = createIkMmd()
+    const second = createIkMmd()
+    const clip = new AnimationClip('property', 1, [])
+    clip.userData = {
+      propertyTrack: {
+        frameNumbers: [0],
+        ikBoneNames: ['ik'],
+        ikStates: [[false]],
+      },
+    }
+    const manager = new MMDAnimationManager()
+    manager.add(first, { animation: clip })
+    manager.add(second, { animation: clip })
+
+    manager.update(0, { grant: false, physics: false })
+    expect(first.ikSolver.isEnabled(0)).toBe(false)
+    expect(second.ikSolver.isEnabled(0)).toBe(false)
+
+    manager.remove(first)
+
+    // Only the removed model is restored; the other keeps its animated state.
+    expect(first.ikSolver.isEnabled(0)).toBe(true)
+    expect(second.ikSolver.isEnabled(0)).toBe(false)
+
+    // The remaining model keeps advancing and stays under animation control.
+    manager.update(0.1, { grant: false, physics: false })
+    expect(first.ikSolver.isEnabled(0)).toBe(true)
+    expect(second.ikSolver.isEnabled(0)).toBe(false)
   })
 
   it('does not apply an IK property state before its first key', () => {

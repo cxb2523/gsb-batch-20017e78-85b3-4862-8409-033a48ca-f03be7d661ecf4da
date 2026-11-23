@@ -136,6 +136,50 @@ describe('mMDAnimationManager', () => {
     expect(events).toEqual(['reset', 'update', 'reset'])
   })
 
+  it('restores animation state alongside physics when a skeletal animation loops', () => {
+    const mmd = createMmd('state-loop')
+    const events: string[] = []
+    const physics = {
+      createHelper: <T>() => undefined as T,
+      reset: () => events.push('physics-reset'),
+      update: () => events.push('physics-update'),
+    }
+    mmd.setPhysics(() => physics)
+    const resetAnimationState = vi.spyOn(mmd, 'resetAnimationState')
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    manager.add(mmd, {
+      animation: new AnimationClip('skeletal animation', 1, [
+        new VectorKeyframeTrack('.bones[0].position', [0, 1], [0, 0, 0, 1, 0, 0]),
+      ]),
+    })
+
+    manager.update(1)
+    expect(resetAnimationState).not.toHaveBeenCalled()
+
+    // Crossing the cycle boundary resets both the animation state (IK,
+    // fixed-axis cache) and the physics service.
+    manager.update(1.5)
+    expect(resetAnimationState).toHaveBeenCalledOnce()
+    expect(events).toEqual(['physics-update', 'physics-reset', 'physics-update'])
+  })
+
+  it('does not reset animation state for a loop without skeletal tracks', () => {
+    const mmd = createMmd('property-loop')
+    const resetAnimationState = vi.spyOn(mmd, 'resetAnimationState')
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    manager.add(mmd, {
+      animation: new AnimationClip('property only', 1, [
+        new VectorKeyframeTrack('.position', [0, 1], [0, 0, 0, 1, 0, 0]),
+      ]),
+    })
+
+    manager.update(2.1)
+
+    expect(resetAnimationState).not.toHaveBeenCalled()
+  })
+
   it('passes MMD update options to every registered model', () => {
     const mmd = createMmd('options')
     const physicsUpdate = vi.fn()
@@ -313,5 +357,152 @@ describe('mMDAnimationManager', () => {
 
     manager.dispose()
     expect(camera.children).toHaveLength(0)
+  })
+
+  const createAudio = (duration?: number) => {
+    let playing = false
+    const play = vi.fn(() => {
+      playing = true
+    })
+    const stop = vi.fn(() => {
+      playing = false
+    })
+    const audio = {
+      buffer: duration === undefined ? undefined : { duration },
+      get isPlaying() {
+        return playing
+      },
+      play,
+      stop,
+      type: 'Audio',
+    } as unknown as import('three').Audio
+
+    return { audio, play, stop }
+  }
+
+  it('does not stop audio that was already playing when remove is called', () => {
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager()
+
+    // Started outside the manager: it owns playback, not the manager.
+    void audio.play()
+    manager.add(audio, { delayTime: 0 })
+    manager.update(1)
+    manager.remove(audio)
+
+    expect(play).toHaveBeenCalledOnce()
+    expect(stop).not.toHaveBeenCalled()
+  })
+
+  it('does not stop externally started audio at a cycle boundary', () => {
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    void audio.play()
+    manager.add(audio, { delayTime: 0 })
+    manager.update(0.5)
+    manager.update(2)
+
+    expect(play).toHaveBeenCalledOnce()
+    expect(stop).not.toHaveBeenCalled()
+  })
+
+  it('restarts audio at delayTime on every configured cycle', () => {
+    const { audio, play, stop } = createAudio(1)
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    manager.add(audio, { delayTime: 0.5 })
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    // Cycle boundary: manager-owned audio is stopped and the next cycle waits
+    // for its own delayTime before triggering again.
+    manager.update(1.9)
+    expect(stop).toHaveBeenCalledOnce()
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledTimes(2)
+
+    manager.update(1.5)
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledTimes(3)
+  })
+
+  it('never plays audio during a cycle where the delay window has already passed', () => {
+    const { audio, play } = createAudio(1)
+    const manager = new MMDAnimationManager({ duration: 10 })
+
+    manager.add(audio, { delayTime: 1 })
+    // The whole delay window is skipped in one large step.
+    manager.update(5)
+    expect(play).not.toHaveBeenCalled()
+
+    // The tail silence after delayTime + duration must not start audio either.
+    manager.update(4)
+    expect(play).not.toHaveBeenCalled()
+
+    // Just before the next delay, still silent.
+    manager.update(0.9)
+    expect(play).not.toHaveBeenCalled()
+
+    // Crossing into the next cycle and then into its delay window triggers
+    // exactly once.
+    manager.update(0.2)
+    expect(play).not.toHaveBeenCalled()
+    manager.update(1)
+    expect(play).toHaveBeenCalledOnce()
+  })
+
+  it('starts manager audio in the delay window and stops at the next cycle', () => {
+    const { audio, play, stop } = createAudio()
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    manager.add(audio, { delayTime: 1 })
+    manager.update(0.5)
+    expect(play).not.toHaveBeenCalled()
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(1)
+    expect(stop).toHaveBeenCalledOnce()
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledTimes(2)
+  })
+
+  it('can add the same objects again after dispose', () => {
+    const mmd = createMmd('reuse')
+    const camera = new PerspectiveCamera()
+    const { audio, play } = createAudio()
+    const animation = createClip('reuse animation')
+    const manager = new MMDAnimationManager({ duration: 2 })
+
+    manager.add(mmd, { animation })
+    manager.add(camera, { animation: createCameraClip() })
+    manager.add(audio, { delayTime: 0.5 })
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledOnce()
+
+    manager.dispose()
+
+    expect(() => {
+      manager.add(mmd, { animation: createClip('reuse again') })
+      manager.add(camera, { animation: createCameraClip() })
+      manager.add(audio, { delayTime: 0.5 })
+    }).not.toThrow()
+
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledTimes(2)
+    expect(camera.children).toHaveLength(1)
+
+    // The re-added audio also restarts across the configured cycles.
+    manager.update(1.5)
+    manager.update(0.5)
+    expect(play).toHaveBeenCalledTimes(3)
   })
 })

@@ -85,7 +85,8 @@ export class MMD {
   private readonly animationControlledIKBones = new Map<number, boolean>()
   private animationPose?: { position: Vector3, rotation: Quaternion }[]
   private readonly axisLimitedBones: AxisLimitedBone[]
-  private axisLimitsApplied = false
+  /** Whether `base` still holds the animated input of the current frame. */
+  private axisLimitInputValid = false
   private readonly boneOrder: number[]
   private readonly currentAnimationIKStates = new Map<number, boolean>()
   private readonly currentAnimationIKWeights = new Map<number, number>()
@@ -160,7 +161,7 @@ export class MMD {
       bone.position.copy(pose.position)
       bone.quaternion.copy(pose.rotation)
     })
-    this.axisLimitsApplied = false
+    this.invalidateAxisLimitInputs()
     this.grantSolver.reset()
     this.ikSolver.reset()
   }
@@ -169,6 +170,32 @@ export class MMD {
     this.physics?.dispose?.()
     this.physics = undefined
     this.animationPose = undefined
+  }
+
+  /**
+   * Restores the state animation took control of and invalidates the cached
+   * input of fixed axis bones.
+   *
+   * Call this when a skeletal animation loops: the first frame of the new
+   * cycle then starts from the freshly sampled animation pose instead of
+   * reusing the previous cycle's outputs.
+   */
+  public resetAnimationState() {
+    this.restoreAnimationControlledIKStates()
+    this.invalidateAxisLimitInputs()
+  }
+
+  /**
+   * Puts every IK switch controlled by a property track back to the value it
+   * had before the animation controlled it, then forgets that baseline so a
+   * fresh one is captured when the animation takes control again.
+   */
+  public restoreAnimationControlledIKStates() {
+    for (const [boneIndex, enabled] of this.animationControlledIKBones) {
+      if (this.ikSolver.isEnabled(boneIndex) !== enabled)
+        this.ikSolver.setEnabled(boneIndex, enabled)
+    }
+    this.animationControlledIKBones.clear()
   }
 
   public setPhysics(createPhysics: PhysicsFactory) {
@@ -281,7 +308,17 @@ export class MMD {
       limited.base.copy(rotation)
       projectOntoAxis(rotation, limited.axis)
     }
-    this.axisLimitsApplied = true
+    this.axisLimitInputValid = true
+  }
+
+  /**
+   * Drops the cached animated input of fixed-axis bones.
+   *
+   * The next evaluation then re-captures whatever the bone holds (the freshly
+   * sampled animation pose) instead of restoring a stale projection input.
+   */
+  private invalidateAxisLimitInputs() {
+    this.axisLimitInputValid = false
   }
 
   private recordAxisLimitOutputs() {
@@ -292,7 +329,7 @@ export class MMD {
 
   /** Without a mixer in between, bones still hold last frame's output; put the animated input back. */
   private restoreAxisLimitInputs() {
-    if (!this.axisLimitsApplied)
+    if (!this.axisLimitInputValid)
       return
 
     const bones = this.mesh.skeleton.bones
