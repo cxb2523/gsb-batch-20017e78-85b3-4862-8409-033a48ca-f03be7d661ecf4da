@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `@vue-player/vue`: switching `src` (or calling `retry()`) now runs a complete, repeatable load cycle — the old native/HLS adapter is destroyed and the `<video>` element cleared before playback state (time, duration, buffered, quality, error) is reset for the new source
+- `@vue-player/vue`: HLS callbacks (`MANIFEST_PARSED`, `LEVEL_SWITCHED`, `ERROR`) from a destroyed instance no longer write into the current state; a fatal error now leaves both the state and the instance clean and retryable instead of leaving a stale HLS instance behind
+- `@vue-player/vue`: the dynamic `hls.js` import and thumbnail VTT parses that resolve after a source switch are discarded instead of overwriting the new source's data
+- `@vue-player/vue`: subtitle cues from the previous track are no longer shown while a new source loads, and the current/default track is re-applied once the new source is ready
+
+### Tests
+
+- Added source-switch race and retry tests (engine, thumbnail loader, subtitle refresh) using a fake HLS adapter and locally built VTT fixtures
+
 ## [0.1.7] — 2026-10-29
 
 ### Fixed

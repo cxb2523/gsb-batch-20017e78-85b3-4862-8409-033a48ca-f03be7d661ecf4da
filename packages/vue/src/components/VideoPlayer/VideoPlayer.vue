@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import type { Chapter, Track, VideoSource } from '@vue-player/core'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { Chapter, ThumbnailCue, Track, VideoSource } from '@vue-player/core'
-import { isPiPSupported, parseThumbnailVtt } from '@vue-player/core'
+import { isPiPSupported } from '@vue-player/core'
+import { planSubtitleRefresh } from '../../composables/subtitles'
 import { usePlayer } from '../../composables/usePlayer'
+import { useThumbnailCues } from '../../composables/useThumbnailCues'
 import IcoPlay from '../icons/IcoPlay.vue'
 import IcoPause from '../icons/IcoPause.vue'
 import VpPlayButton from '../controls/VpPlayButton.vue'
@@ -73,7 +75,9 @@ const currentCues = ref<string[]>([])
 function syncSubtitles() {
   const video = videoRef.value
   const track = state.currentTrack
-  if (!video || !track) {
+  // Never surface cues while a new source is loading — the browser may still
+  // report activeCues from the previous track until the track mode is reset.
+  if (!video || !track || state.isLoading) {
     currentCues.value = []
     return
   }
@@ -99,14 +103,20 @@ onMounted(() => {
   if (props.autoplay && props.muted) scheduleHide()
 })
 
-// Apply the active (or default) track once canplay fires — at that point all browser
+// While a source is loading, drop any cues from the previous track so stale
+// activeCues cannot linger on screen. Once loading completes, re-apply the
+// current track (or the new source's default) — at that point all browser
 // async track-mode resets from video.load() are guaranteed to have completed.
 watch(
   () => state.isLoading,
   (loading) => {
-    if (loading) return
-    const track = state.currentTrack ?? props.tracks?.find((t) => t.default) ?? null
-    if (track) controls.setTrack(track)
+    const plan = planSubtitleRefresh(loading, props.tracks, state.currentTrack)
+    if (plan.clearCues) {
+      currentCues.value = []
+    }
+    if (plan.shouldApplyTrack) {
+      controls.setTrack(plan.track)
+    }
   },
 )
 
@@ -115,6 +125,9 @@ onBeforeUnmount(() => videoRef.value?.removeEventListener('timeupdate', syncSubt
 watch(
   () => props.src,
   (src) => {
+    // Drop rendered subtitles immediately — the loading-flag watcher alone is
+    // not enough when one loading source is swapped for another (true→true).
+    currentCues.value = []
     if (src) loadSource(src)
   },
 )
@@ -157,14 +170,10 @@ watch(
 )
 
 // ─── Thumbnails ───
-const thumbnailCues = ref<ThumbnailCue[]>([])
-
-watch(
-  () => props.thumbnails,
-  async (url) => {
-    thumbnailCues.value = url ? await parseThumbnailVtt(url) : []
-  },
-  { immediate: true },
+// useThumbnailCues holds the race-safe token: a VTT response that arrives
+// after a source switch is discarded instead of overwriting the new cues.
+const { cues: thumbnailCues } = useThumbnailCues(
+  computed(() => ({ src: props.src, thumbnails: props.thumbnails })),
 )
 
 // ─── Controls visibility ───

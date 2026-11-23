@@ -50,7 +50,17 @@ loadSource('https://example.com/video.mp4')
 loadSource('https://example.com/stream.m3u8')  // triggers hls.js
 ```
 
-Calling `loadSource` on an already-playing video will stop playback, destroy adapters, and start fresh.
+Calling `loadSource` on an already-playing video starts a complete, repeatable load cycle:
+
+1. The previous native/HLS adapter is destroyed and the `<video>` element is cleared.
+2. Playback state is reset (time, duration, buffered, quality, error, live flag).
+3. The new source is loaded through a fresh adapter.
+
+Any asynchronous result from the previous cycle — the dynamic `hls.js` import, a
+`MANIFEST_PARSED` / `LEVEL_SWITCHED` / `ERROR` callback from a destroyed instance
+— is ignored, so it can never write into the new source's state. On a fatal HLS
+error both the state and the instance are reset so `controls.retry()` can start a
+clean cycle.
 
 ## Basic Usage
 
@@ -85,3 +95,4 @@ onMounted(() => {
 - `usePlayer` attaches native `<video>` event listeners inside `onMounted` and cleans them up in `onUnmounted` — it must be called inside a component `setup`.
 - `VideoPlayer` uses `usePlayer` internally. You only need this composable when building a custom player shell.
 - The `state` object is `readonly` — never mutate it directly. Use `controls` methods instead.
+- Subtitles are re-applied after every source change: the previously selected track is restored if the new source provides it, otherwise the source's `default` track is used, otherwise subtitles are turned off. Cues from the previous track are cleared while the new source loads.
