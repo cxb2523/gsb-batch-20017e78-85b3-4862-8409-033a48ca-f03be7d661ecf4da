@@ -12,6 +12,8 @@ class ChunkWorkerPool {
    * @param {number} size Number of workers
    */
   constructor(scriptUrl, size) {
+    this._scriptUrl = scriptUrl;
+    this._size = size;
     this._workers = []; // {worker, tasks: number of tasks sent and not finished}
     this._callbacks = new Map(); // task id -> {task, onDone, slot}
     this._inlineQueue = []; // {task, onDone} waiting to run on the main thread
@@ -84,6 +86,30 @@ class ChunkWorkerPool {
   }
 
   /**
+   * Cancel every task that has not finished and recreate the workers, so a
+   * world reset does not leave old-world tasks occupying the pool or posting
+   * results back. The callbacks are dropped without being called.
+   */
+  reset() {
+    for (const slot of this._workers) slot.worker.terminate();
+
+    this._workers = [];
+    this._callbacks.clear();
+    this._inlineQueue.length = 0;
+
+    // Recreate the workers lazily through the same path as the first use, so
+    // an environment without workers keeps falling back to inline tasks.
+    const scriptUrl = this._scriptUrl;
+    const size = this._size;
+    try {
+      for (let i = 0; i < size; i++) this._workers.push(this._createWorker(scriptUrl));
+    } catch (error) {
+      console.warn('Chunk workers are unavailable, so chunks will load on the main thread', error);
+      this._workers = [];
+    }
+  }
+
+  /**
    * Create a worker and route its results to the tasks' callbacks
    * @param {string} scriptUrl Worker script
    * @returns {Object} Worker slot
@@ -94,6 +120,10 @@ class ChunkWorkerPool {
     slot.worker.onmessage = event => {
       const { id, result, error } = event.data;
       const callback = this._callbacks.get(id);
+      // A reset can terminate a worker while a result is already in flight;
+      // its callback was removed, so such a message is simply ignored.
+      if (callback == null) return;
+
       this._callbacks.delete(id);
       slot.tasks--;
       callback.onDone(error ?? null, result);

@@ -141,8 +141,11 @@ function finishTasks(cx, cz, r) {
     if (task.name === 'adopt') {
       frameBudget.run('adopt', () => adoptChunk(task, cx, cz, r));
     } else if (task.error) {
-      // Leave the chunk marked as meshing so it isn't retried every frame
+      // Release the meshing claim so the chunk is retried on a later frame
+      // instead of staying marked as meshing forever. The version guard means
+      // a failure for a superseded build does not disturb the newer one.
       console.error(`Meshing chunk ${task.chunk.x},${task.chunk.z} failed`, task.error);
+      frameBudget.run('upload', () => task.chunk.failMesh(task.version));
     } else {
       frameBudget.run('upload', () => task.chunk.setMesh(task.version, task.result));
     }
@@ -208,6 +211,10 @@ function resetChunkLoader() {
   failedChunks.clear();
   finishedTasks = [];
   loaderEpoch++;
+
+  // Drop work still running or queued for the old world so it can't occupy a
+  // worker and delay the new world; its results would be stale by epoch anyway.
+  if (chunkWorkers != null) chunkWorkers.reset();
 }
 /**
  * Get the chunk offsets within the render distance, reusing them while it stays the same

@@ -104,7 +104,11 @@ function remeshAround(x, z) {
   for (let xo = -1; xo <= 1; xo++) {
     for (let zo = -1; zo <= 1; zo++) {
       const chunk = getChunk(x + xo, z + zo);
-      if (chunk && (chunk.complete || chunk.calculating)) chunks.add(chunk);
+      // Decorated chunks take part even when their mesh was freed by the
+      // distance unloader: their blocks are still loaded, so an edit next to
+      // them must bring their mesh back. Undecorated chunks are meshed later
+      // by the chunk loader once their neighbors are ready.
+      if (chunk && chunk.decorated) chunks.add(chunk);
     }
   }
 

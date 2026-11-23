@@ -92,6 +92,19 @@ class Chunk {
   }
 
   /**
+   * Release the meshing claim after a build that started with this version
+   * failed, so the chunk can be retried. Results for a newer version leave
+   * the claim and version untouched.
+   * @param {number} version Version from startMesh that failed
+   */
+  failMesh(version) {
+    if (version !== this._meshVersion) return;
+
+    this.calculating = false;
+    this.complete = false;
+  }
+
+  /**
    * Rebuild the mesh on the main thread right away, for changes the player
    * should see immediately
    */
