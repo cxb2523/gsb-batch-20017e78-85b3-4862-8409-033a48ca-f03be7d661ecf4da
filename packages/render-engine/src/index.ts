@@ -10,3 +10,4 @@
 export * from "./scene";
 export * from "./audio";
 export * from "./decodeSchedule";
+export * from "./mediaPreparation";

@@ -2,11 +2,17 @@
 
 import type { FrameSource } from "@cutaway/export-engine";
 import type { MediaBlobStore } from "@cutaway/media-engine";
-import { planVideoDecodeSchedule, resolveScene, type Scene } from "@cutaway/render-engine";
-import type { ProjectDocument, Size } from "@cutaway/types";
+import {
+  planVideoDecodeSchedule,
+  prepareSceneMedia,
+  resolveScene,
+  type SceneMediaTargets,
+  type SceneNode,
+} from "@cutaway/render-engine";
+import type { Id, ProjectDocument, Size } from "@cutaway/types";
 import { MediaTextureCache } from "@/features/preview/MediaTextureCache";
 import { PixiSceneRenderer } from "@/features/preview/PixiSceneRenderer";
-import { ExactVideoDecoders } from "./ExactVideoDecoders";
+import { ExactVideoDecoders, type DecodedVideoFrame } from "./ExactVideoDecoders";
 
 /**
  * A FrameSource that renders export frames with the *same* compositor the
@@ -24,8 +30,23 @@ import { ExactVideoDecoders } from "./ExactVideoDecoders";
  * timeline position is precisely the frame the timeline asked for. Media the
  * decoder can't open falls back to element seeking, which is approximate but
  * keeps the export working.
+ *
+ * **Per-clip isolation.** Two clips can show one source on the same frame at
+ * different times — overlapping clips, or a transition's outgoing tail. The
+ * preview tolerates one texture per media because both clips show the same
+ * codec state; an export may not, because it prepares each clip's exact frame
+ * before the frame is drawn, so a shared per-media canvas would let the second
+ * clip's draw overwrite the first's and both would encode the same picture.
+ * This source therefore gives every video clip its own drawable target (see
+ * `MediaTextureCache.registerScopedVideo`) and the renderer looks textures up
+ * by clip (`scopeByClip`). Preview is untouched: it never registers scopes.
+ *
+ * The per-frame preparation itself lives in {@link prepareSceneMedia}, kept
+ * DOM-free so its isolation and frame-ownership rules are unit-tested.
  */
 export class PixiExportFrameSource implements FrameSource<VideoFrame> {
+  private disposed = false;
+
   private constructor(
     private readonly project: ProjectDocument,
     private readonly renderer: PixiSceneRenderer,
@@ -48,33 +69,39 @@ export class PixiExportFrameSource implements FrameSource<VideoFrame> {
     canvas.width = resolution.width;
     canvas.height = resolution.height;
 
-    const renderer = new PixiSceneRenderer(cache);
+    // Scoped by clip: each video node draws into its own target. Video elements
+    // are seeked by this class, so the renderer must not also nudge them.
+    const renderer = new PixiSceneRenderer(cache, {
+      scopeByClip: true,
+      driveVideoElements: false,
+    });
     // Pixel ratio 1: the backing store is exactly the requested output size.
-    await renderer.init(canvas, resolution.width, resolution.height, 1);
+    let decoders: ExactVideoDecoders | null = null;
+    try {
+      await renderer.init(canvas, resolution.width, resolution.height, 1);
 
-    // Every timestamp the export will need, planned before decoding starts —
-    // the decoders require the whole ordered list to walk each stream once.
-    const schedule = planVideoDecodeSchedule(project, startFrame, endFrame);
-    const decoders = await ExactVideoDecoders.create(project, store, schedule);
-
-    // Give each exactly-decoded video a canvas-backed texture, so the renderer's
-    // ordinary `cache.peek` lookup finds decoded frames without knowing it.
-    for (const mediaId of schedule.keys()) {
-      if (!decoders.has(mediaId)) continue;
-      const dimensions = project.entities.media[mediaId]?.metadata.dimensions;
-      cache.registerDecodedVideo(
-        mediaId,
-        dimensions?.width ?? resolution.width,
-        dimensions?.height ?? resolution.height,
-      );
+      // Every timestamp the export will need, planned before decoding starts —
+      // the decoders require the whole ordered list to walk each stream once.
+      const schedule = planVideoDecodeSchedule(project, startFrame, endFrame);
+      decoders = await ExactVideoDecoders.create(project, store, schedule);
+    } catch (error) {
+      // Don't strand a live WebGL context if setup fails; the caller gets the
+      // error, not a leaked renderer.
+      renderer.destroy();
+      throw error;
     }
 
     return new PixiExportFrameSource(project, renderer, cache, resolution, frameRate, decoders);
   }
 
   async renderFrame(frame: number): Promise<VideoFrame> {
+    if (this.disposed) throw new Error("Export frame source has been disposed.");
     const scene = resolveScene(this.project, frame);
-    await this.prepareMedia(scene);
+    await prepareSceneMedia(scene, {
+      decoder: this.decoders,
+      targets: this.targets(),
+      media: this.project.entities.media,
+    });
 
     // displayWidth === project width ⇒ scale 1, i.e. a full-resolution draw.
     this.renderer.render(scene, this.project.entities.media, this.resolution.width, false);
@@ -85,48 +112,69 @@ export class PixiExportFrameSource implements FrameSource<VideoFrame> {
   }
 
   async dispose(): Promise<void> {
-    await this.decoders.dispose();
+    if (this.disposed) return;
+    this.disposed = true;
+
+    // Fixed order, each step independently guarded so one failure cannot skip
+    // the rest:
+    //  1. Decoders — stop any in-flight decode touching a texture.
+    //  2. Textures — release GPU/canvas resources while the GL context is still
+    //     alive, so the destruction is a real free rather than a no-op on a dead
+    //     context.
+    //  3. Renderer — tear down the WebGL context and stage last.
+    // This is what makes a finished or cancelled export leave nothing behind,
+    // including each clip's scoped canvas.
+    try {
+      await this.decoders.dispose();
+    } catch {
+      // A decoder that refuses to close must not strand the rest.
+    }
+    try {
+      this.cache.destroy();
+    } catch {
+      // Texture teardown is best-effort once the export is ending.
+    }
     this.renderer.destroy();
   }
 
+  /** Binds the preparer's target operations to this export's cache and scene. */
+  private targets(): SceneMediaTargets<DecodedVideoFrame> {
+    return {
+      ensureTarget: (node, mediaId) => this.ensureScopedTarget(node, mediaId),
+      drawDecoded: (node, frame) => this.cache.drawDecodedFrame(node.clipId, frame),
+      load: async (mediaId, blobKey, kind) => {
+        await this.cache.load(mediaId, blobKey, kind);
+      },
+      seek: (mediaId, seconds) => this.seekVideo(mediaId, seconds),
+      drawFromElement: (node, mediaId) => this.cache.drawVideoElement(node.clipId, mediaId),
+    };
+  }
+
   /**
-   * Ensures every media node in the scene is ready to draw: textures decoded and
-   * each video advanced to its exact source time. Unlike the preview, this
-   * blocks until each frame's inputs are present, so no frame is captured with a
-   * stale or missing texture.
-   *
-   * Nodes are prepared sequentially rather than in parallel: the decoders hand
-   * back frames in the planned order, so two nodes racing for the same stream
-   * could take each other's frame.
+   * Registers this clip's own canvas-backed texture, sized to the source where
+   * known (falling back to the output resolution for media with no metadata).
    */
-  private async prepareMedia(scene: Scene): Promise<void> {
-    for (const node of scene.nodes) {
-      if (node.content.kind !== "media") continue;
-      const { mediaId, mediaKind, sourceTimeSeconds } = node.content;
+  private ensureScopedTarget(node: SceneNode, mediaId: Id): void {
+    if (node.content.kind !== "media") return;
+    if (this.cache.hasScopedTexture(node.clipId)) return;
 
-      if (mediaKind === "video" && this.decoders.has(mediaId)) {
-        const decoded = await this.decoders.next(mediaId, Math.max(0, sourceTimeSeconds));
-        // A null frame means the stream has nothing at this time (before its
-        // first frame, or past its end); leave the last frame in place.
-        if (decoded) this.cache.drawDecodedFrame(mediaId, decoded);
-        continue;
-      }
-
-      const asset = this.project.entities.media[mediaId];
-      if (!asset || asset.source.type !== "indexeddb") continue;
-
-      await this.cache.load(mediaId, asset.source.key, mediaKind);
-      if (mediaKind === "video") await this.seekVideo(mediaId, sourceTimeSeconds);
-    }
+    const dimensions = this.project.entities.media[mediaId]?.metadata.dimensions;
+    // Fall back to an already-loaded element's real size (the decoder-fallback
+    // path has one), then to the output size when nothing reports dimensions.
+    const element = this.cache.getVideoElement(mediaId);
+    const width = dimensions?.width || element?.videoWidth || this.resolution.width;
+    const height = dimensions?.height || element?.videoHeight || this.resolution.height;
+    this.cache.registerScopedVideo(node.clipId, width, height);
   }
 
   /**
    * Fallback for media the WebCodecs decoder couldn't open: seeks a cached
-   * video element to `seconds` and uploads that frame to its texture. Frame
-   * accuracy is bounded by `<video>` seeking, so this is approximate — it exists
-   * so an unusual container degrades in quality rather than failing the export.
+   * video element to `seconds` so its current frame can be copied to the clip.
+   * Frame accuracy is bounded by `<video>` seeking, so this is approximate — it
+   * exists so an unusual container degrades in quality rather than failing the
+   * export.
    */
-  private seekVideo(mediaId: string, seconds: number): Promise<void> {
+  private seekVideo(mediaId: Id, seconds: number): Promise<void> {
     const element = this.cache.getVideoElement(mediaId);
     if (!element) return Promise.resolve();
 
@@ -149,12 +197,6 @@ export class PixiExportFrameSource implements FrameSource<VideoFrame> {
       element.currentTime = target;
       // Safety net: never hang the whole export on a seek that never fires.
       setTimeout(finish, 1_000);
-    }).then(() => {
-      // With the preview ticker stopped, the video texture must be told to
-      // upload the newly-seeked frame before it is drawn.
-      const texture = this.cache.peek(mediaId);
-      const source = texture?.source as { update?: () => void } | undefined;
-      source?.update?.();
     });
   }
 }

@@ -88,7 +88,18 @@ export async function exportProjectToBlob(
     plan.startFrame,
     plan.endFrame,
   );
-  const videoWriter = WebCodecsVideoWriter.create(plan, container, videoConfig);
+
+  // `runVideoExport` owns disposal from here — including on cancel and on
+  // error. If the writer fails to construct, nothing else will dispose the
+  // frame source, so take care of it here rather than leaking a WebGL context,
+  // decoders, and textures.
+  let videoWriter: WebCodecsVideoWriter;
+  try {
+    videoWriter = WebCodecsVideoWriter.create(plan, container, videoConfig);
+  } catch (error) {
+    await frameSource.dispose();
+    throw error;
+  }
 
   const bytes = await runVideoExport({
     plan,

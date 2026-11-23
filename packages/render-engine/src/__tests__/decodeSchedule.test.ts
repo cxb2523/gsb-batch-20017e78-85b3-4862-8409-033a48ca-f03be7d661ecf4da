@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Clip, ProjectDocument, Track } from "@cutaway/types";
 import { staticValue } from "@cutaway/types";
 import { createClip, createProject, createTrack } from "@cutaway/utils";
-import { planVideoDecodeSchedule } from "../decodeSchedule";
+import { planVideoDecodeRequests, planVideoDecodeSchedule } from "../decodeSchedule";
 import { resolveScene } from "../scene";
 
 function videoContent(mediaId = "m1", speed = 1, sourceInFrame = 0) {
@@ -153,5 +153,73 @@ describe("planVideoDecodeSchedule", () => {
 
   it("is empty for a range with no video", () => {
     expect(planVideoDecodeSchedule(createProject(), 0, 10).size).toBe(0);
+  });
+});
+
+describe("planVideoDecodeRequests", () => {
+  it("records the clip as well as the media, so an overlap stays two requests", () => {
+    // Two clips of one source on the same frame ask for two different source
+    // times. Keying only by media would collapse them; the request list must
+    // not, because each clip is drawn to its own target.
+    const track = createTrack({ kind: "video", index: 0 });
+    const other = createTrack({ kind: "video", index: 1 });
+    const clips = [
+      createClip({
+        id: "clip-a",
+        trackId: track.id,
+        startFrame: 0,
+        durationFrames: 2,
+        content: videoContent("m1"),
+      }),
+      createClip({
+        id: "clip-b",
+        trackId: other.id,
+        startFrame: 0,
+        durationFrames: 2,
+        content: videoContent("m1", 1, 30),
+      }),
+    ];
+    const requests = planVideoDecodeRequests(projectWith([track, other], clips), 0, 2);
+
+    // Two clips × two frames, in frame-then-node order. Track 0 draws in front,
+    // so it comes last in each frame's node order.
+    expect(requests.map((r) => r.clipId)).toEqual(["clip-b", "clip-a", "clip-b", "clip-a"]);
+    // The first frame asks for source times 1s and 0s — two different pictures
+    // of one media, which is exactly why they cannot share a single target.
+    expect(requests.slice(0, 2).map((r) => [r.mediaId, r.sourceTimeSeconds])).toEqual([
+      ["m1", 1],
+      ["m1", 0],
+    ]);
+  });
+
+  it("mirrors resolveScene node order exactly", () => {
+    const project = singleVideoProject(4);
+    const expected: { clipId: string; mediaId: string; sourceTimeSeconds: number }[] = [];
+    for (let frame = 0; frame < 4; frame += 1) {
+      for (const node of resolveScene(project, frame).nodes) {
+        if (node.content.kind === "media" && node.content.mediaKind === "video") {
+          expected.push({
+            clipId: node.clipId,
+            mediaId: node.content.mediaId,
+            sourceTimeSeconds: Math.max(0, node.content.sourceTimeSeconds),
+          });
+        }
+      }
+    }
+
+    expect(planVideoDecodeRequests(project, 0, 4)).toEqual(expected);
+  });
+
+  it("clamps a negative source time to zero, matching playback", () => {
+    const track = createTrack({ kind: "video", index: 0 });
+    const clip = createClip({
+      trackId: track.id,
+      startFrame: 0,
+      durationFrames: 3,
+      content: videoContent("m1", 1, -30),
+    });
+    const requests = planVideoDecodeRequests(projectWith([track], [clip]), 0, 3);
+
+    expect(requests.every((r) => r.sourceTimeSeconds >= 0)).toBe(true);
   });
 });

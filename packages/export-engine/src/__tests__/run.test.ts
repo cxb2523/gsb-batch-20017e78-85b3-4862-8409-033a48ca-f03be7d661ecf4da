@@ -216,4 +216,75 @@ describe("runVideoExport", () => {
     expect(source.dispose).toHaveBeenCalledOnce();
     expect(writer.dispose).toHaveBeenCalledOnce();
   });
+
+  it("starts a fresh run after a cancelled one, with nothing carried over", async () => {
+    // The user-visible regression: cancel an export, then export again. The
+    // orchestrator must hold no per-run state (frame cursor, disposed flags,
+    // half-finalized writer) that a second run would inherit. Each run gets its
+    // own source and writer; this pins that a cancelled run fully releases the
+    // first pair and leaves nothing for the second to trip over.
+    const controller = new AbortController();
+    const firstSource: FrameSource<FakeFrame> = {
+      renderFrame: vi.fn(async (frame: number) => {
+        if (frame === 1) controller.abort();
+        return { frame, close: vi.fn() };
+      }),
+      dispose: vi.fn(),
+    };
+    const firstWriter = fakeWriter();
+
+    await expect(
+      runVideoExport({
+        plan: plan(5),
+        frameSource: firstSource,
+        videoWriter: firstWriter,
+        signal: controller.signal,
+      }),
+    ).rejects.toBeInstanceOf(ExportCancelledError);
+
+    // The cancelled run disposed its pair and never finalized.
+    expect(firstSource.dispose).toHaveBeenCalledOnce();
+    expect(firstWriter.dispose).toHaveBeenCalledOnce();
+    expect(firstWriter.finalize).not.toHaveBeenCalled();
+
+    // A second, independent run starts from the beginning and completes.
+    const secondSource = fakeSource();
+    const secondWriter = fakeWriter();
+    const bytes = await runVideoExport({
+      plan: plan(5),
+      frameSource: secondSource,
+      videoWriter: secondWriter,
+    });
+
+    expect(
+      (secondSource.renderFrame as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]),
+    ).toEqual([0, 1, 2, 3, 4]);
+    expect(secondWriter.frames.map((f) => f.frame)).toEqual([0, 1, 2, 3, 4]);
+    expect(secondWriter.finalize).toHaveBeenCalledOnce();
+    expect(secondWriter.dispose).toHaveBeenCalledOnce();
+    expect(bytes).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("does not render any frame of a run cancelled during preparation", async () => {
+    // Cancelling before the loop begins must leave the source with zero decode
+    // requests, so the next export starts without a dangling in-flight frame.
+    const controller = new AbortController();
+    const source = fakeSource();
+    const writer = fakeWriter();
+    const run = runVideoExport({
+      plan: plan(4),
+      frameSource: source,
+      videoWriter: writer,
+      signal: controller.signal,
+      onProgress: (p) => {
+        if (p.phase === "preparing" && p.completedFrames === 0) controller.abort();
+      },
+    });
+
+    await expect(run).rejects.toBeInstanceOf(ExportCancelledError);
+    expect(source.renderFrame).not.toHaveBeenCalled();
+    expect(writer.finalize).not.toHaveBeenCalled();
+    expect(source.dispose).toHaveBeenCalledOnce();
+    expect(writer.dispose).toHaveBeenCalledOnce();
+  });
 });

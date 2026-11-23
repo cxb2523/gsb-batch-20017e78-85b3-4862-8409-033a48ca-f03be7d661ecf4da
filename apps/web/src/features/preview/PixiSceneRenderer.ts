@@ -68,6 +68,26 @@ export class PixiSceneRenderer {
   private readonly filterKeys = new Map<Id, string>();
   private readonly cache: MediaTextureCache;
 
+  /**
+   * When set, media textures are looked up per *clip* rather than per media.
+   *
+   * Preview keys textures by media — one decoded `<video>` serves every clip of
+   * it, and that is correct because they show the same codec state. Export must
+   * not: it prepares each clip's exact frame before drawing, so two clips of one
+   * source on the same frame (an overlap, a transition tail) need their own
+   * texture or the second draw overwrites the first's pixels. Scoping by clip
+   * gives each node its own target without changing any preview call path.
+   */
+  private readonly scopeByClip: boolean;
+  /**
+   * Whether drawing should also nudge `<video>` elements to the playhead.
+   *
+   * Export prepares every element seek itself (and runs with the ticker
+   * stopped), so letting the renderer seek too would fight the prepared frame
+   * and could hand a later clip a freshly-seeked element it didn't ask for.
+   */
+  private readonly driveVideoElements: boolean;
+
   private initialized = false;
   private lastResolution = { width: 0, height: 0 };
   /** Media ids requested but not yet decoded, so we ask only once. */
@@ -79,8 +99,18 @@ export class PixiSceneRenderer {
   /** Always-on-top container for the caption overlay. */
   private captionContainer: Container | null = null;
 
-  constructor(cache: MediaTextureCache) {
+  constructor(
+    cache: MediaTextureCache,
+    options: { scopeByClip?: boolean; driveVideoElements?: boolean } = {},
+  ) {
     this.cache = cache;
+    this.scopeByClip = options.scopeByClip ?? false;
+    this.driveVideoElements = options.driveVideoElements ?? true;
+  }
+
+  /** The texture scope for a node: its clip when scoped, otherwise its media. */
+  private textureScope(node: SceneNode): Id | undefined {
+    return this.scopeByClip ? node.clipId : undefined;
   }
 
   /**
@@ -460,8 +490,8 @@ export class PixiSceneRenderer {
   private createDisplayObject(node: SceneNode, assets: Record<Id, MediaAsset>): Container | null {
     switch (node.content.kind) {
       case "media": {
-        const texture = this.cache.peek(node.content.mediaId);
-        this.requestTexture(node.content.mediaId, node.content.mediaKind, assets);
+        const texture = this.cache.peek(node.content.mediaId, this.textureScope(node));
+        this.requestTexture(node.content.mediaId, node.content.mediaKind, assets, node);
         // A placeholder sprite is created even before the texture resolves, so
         // the node participates in ordering and does not pop in out of order.
         return new Sprite(texture ?? undefined);
@@ -491,8 +521,9 @@ export class PixiSceneRenderer {
     mediaId: Id,
     kind: "video" | "image" | "gif",
     assets: Record<Id, MediaAsset>,
+    node: SceneNode,
   ): void {
-    if (this.requested.has(mediaId) || this.cache.peek(mediaId)) return;
+    if (this.requested.has(mediaId) || this.cache.peek(mediaId, this.textureScope(node))) return;
 
     const asset = assets[mediaId];
     if (!asset || asset.source.type !== "indexeddb") return;
@@ -558,12 +589,12 @@ export class PixiSceneRenderer {
       case "media": {
         if (!(container instanceof Sprite)) return;
 
-        const texture = this.cache.peek(node.content.mediaId);
+        const texture = this.cache.peek(node.content.mediaId, this.textureScope(node));
         if (texture && container.texture !== texture) container.texture = texture;
         else if (!texture)
-          this.requestTexture(node.content.mediaId, node.content.mediaKind, assets);
+          this.requestTexture(node.content.mediaId, node.content.mediaKind, assets, node);
 
-        if (node.content.mediaKind === "video") {
+        if (node.content.mediaKind === "video" && this.driveVideoElements) {
           this.syncVideoTime(node.content.mediaId, node.content.sourceTimeSeconds);
         }
         return;

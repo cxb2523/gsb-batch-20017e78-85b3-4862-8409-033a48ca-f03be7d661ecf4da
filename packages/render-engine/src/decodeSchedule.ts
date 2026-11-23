@@ -25,6 +25,53 @@ import { resolveScene } from "./scene";
 export type VideoDecodeSchedule = Map<Id, number[]>;
 
 /**
+ * One decode request the render loop will make: a single clip asking its source
+ * media for the frame at a source time.
+ *
+ * `clipId` matters as much as `mediaId`: two clips can show the *same* media at
+ * different source times on the same frame (an overlap, or a transition tail).
+ * Those are two separate requests, and each must be drawn to its own target —
+ * keying only by media would collapse them into one picture.
+ */
+export interface VideoDecodeRequest {
+  clipId: Id;
+  mediaId: Id;
+  /** Already clamped to >= 0, matching what the render loop asks for. */
+  sourceTimeSeconds: number;
+}
+
+/**
+ * Builds the ordered request list for the half-open range `[startFrame, endFrame)`.
+ *
+ * The order is exactly the order the render loop will make the requests in:
+ * frame by frame, then `resolveScene`'s node order within a frame. That is what
+ * lets a consumer pull one decoded frame per request and stay in lockstep.
+ */
+export function planVideoDecodeRequests(
+  project: ProjectDocument,
+  startFrame: Frame,
+  endFrame: Frame,
+): VideoDecodeRequest[] {
+  const requests: VideoDecodeRequest[] = [];
+
+  for (let frame = startFrame; frame < endFrame; frame += 1) {
+    for (const node of resolveScene(project, frame).nodes) {
+      if (node.content.kind !== "media" || node.content.mediaKind !== "video") continue;
+
+      requests.push({
+        clipId: node.clipId,
+        mediaId: node.content.mediaId,
+        // Never negative: a timestamp before the start of the stream is not a
+        // thing a decoder can seek to, and clamping matches what playback shows.
+        sourceTimeSeconds: Math.max(0, node.content.sourceTimeSeconds),
+      });
+    }
+  }
+
+  return requests;
+}
+
+/**
  * Builds the decode schedule for the half-open frame range `[startFrame, endFrame)`.
  *
  * A media that appears on several frames gets one entry per frame, and a media
@@ -39,17 +86,10 @@ export function planVideoDecodeSchedule(
 ): VideoDecodeSchedule {
   const schedule: VideoDecodeSchedule = new Map();
 
-  for (let frame = startFrame; frame < endFrame; frame += 1) {
-    for (const node of resolveScene(project, frame).nodes) {
-      if (node.content.kind !== "media" || node.content.mediaKind !== "video") continue;
-
-      const times = schedule.get(node.content.mediaId);
-      // Never negative: a timestamp before the start of the stream is not a
-      // thing a decoder can seek to, and clamping matches what playback shows.
-      const time = Math.max(0, node.content.sourceTimeSeconds);
-      if (times) times.push(time);
-      else schedule.set(node.content.mediaId, [time]);
-    }
+  for (const request of planVideoDecodeRequests(project, startFrame, endFrame)) {
+    const times = schedule.get(request.mediaId);
+    if (times) times.push(request.sourceTimeSeconds);
+    else schedule.set(request.mediaId, [request.sourceTimeSeconds]);
   }
 
   return schedule;

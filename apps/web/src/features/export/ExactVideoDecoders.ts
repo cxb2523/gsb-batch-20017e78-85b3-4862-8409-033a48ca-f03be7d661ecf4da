@@ -1,9 +1,22 @@
 "use client";
 
-import { ALL_FORMATS, BlobSource, CanvasSink, Input } from "mediabunny";
+import { ALL_FORMATS, BlobSource, Input, VideoSampleSink, type VideoSample } from "mediabunny";
 import type { MediaBlobStore } from "@cutaway/media-engine";
-import type { VideoDecodeSchedule } from "@cutaway/render-engine";
+import type { ClosableFrame, VideoDecodeSchedule } from "@cutaway/render-engine";
 import type { Id, ProjectDocument } from "@cutaway/types";
+import type { DrawableVideoFrame } from "@/features/preview/MediaTextureCache";
+
+/**
+ * A decoded frame handed to the exporter, which owns it until it closes it.
+ *
+ * The explicit `close()` is the point: a decoded frame pins a GPU/CPU buffer
+ * (usually a `VideoFrame`), and an export that renders thousands of them leaks
+ * the whole video's worth of memory if each is left to GC. The caller draws the
+ * frame and closes it immediately, in a `finally`. It satisfies both the
+ * render engine's `ClosableFrame` (so the preparation pass can close it) and the
+ * texture cache's {@link DrawableVideoFrame} (so the cache can draw it).
+ */
+export type DecodedVideoFrame = ClosableFrame & DrawableVideoFrame;
 
 /**
  * Frame-exact video decoding for export.
@@ -69,8 +82,11 @@ export class ExactVideoDecoders {
    * The next decoded frame for `mediaId`, which must be the one scheduled for
    * `expectedSeconds`. Returns null when the media isn't decoded here or the
    * stream has no frame at that time (before the first frame, or past the end).
+   *
+   * Ownership of a returned frame passes to the caller, which must `close()` it
+   * once drawn.
    */
-  next(mediaId: Id, expectedSeconds: number): Promise<CanvasImageSource | null> {
+  next(mediaId: Id, expectedSeconds: number): Promise<DecodedVideoFrame | null> {
     const track = this.tracks.get(mediaId);
     return track ? track.next(expectedSeconds) : Promise.resolve(null);
   }
@@ -87,33 +103,41 @@ class DecoderTrack {
 
   private constructor(
     private readonly input: Input,
-    private readonly sink: CanvasSink,
+    private readonly sink: VideoSampleSink,
     private readonly timestamps: readonly number[],
-    private iterator: AsyncGenerator<{ canvas: HTMLCanvasElement | OffscreenCanvas } | null> | null,
+    private iterator: AsyncGenerator<VideoSample | null> | null,
   ) {}
 
   static async open(blob: Blob, timestamps: number[]): Promise<DecoderTrack | null> {
+    let input: Input | null = null;
     try {
-      const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
+      input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
       const track = await input.getPrimaryVideoTrack();
       if (!track || !(await track.canDecode())) {
         await input.dispose();
         return null;
       }
 
-      // A small pool keeps VRAM flat across a long export instead of allocating
-      // a canvas per frame; `alpha` preserves transparent video for compositing.
-      const sink = new CanvasSink(track, { poolSize: 2, alpha: true });
-      const iterator = sink.canvasesAtTimestamps(timestamps);
+      // A sample sink yields the decoded frames themselves, so the caller can
+      // draw and then close each one — unlike a canvas sink, whose pooled
+      // canvases are reused out from under a frame that is still referenced.
+      const sink = new VideoSampleSink(track);
+      const iterator = sink.samplesAtTimestamps(timestamps);
 
       return new DecoderTrack(input, sink, timestamps, iterator);
     } catch {
       // Unreadable or unsupported — the caller falls back to element seeking.
+      // Dispose any half-open input so a failed attempt leaks no demuxer.
+      try {
+        await input?.dispose();
+      } catch {
+        // Best-effort: we are already on the failure path.
+      }
       return null;
     }
   }
 
-  async next(expectedSeconds: number): Promise<CanvasImageSource | null> {
+  async next(expectedSeconds: number): Promise<DecodedVideoFrame | null> {
     const scheduled = this.timestamps[this.cursor];
 
     // Out of step with the plan (or past its end): fetch this one directly
@@ -126,13 +150,13 @@ class DecoderTrack {
     this.cursor += 1;
     const result = await this.iterator?.next();
     if (!result || result.done) return null;
-    return result.value?.canvas ?? null;
+    return wrap(result.value);
   }
 
   /** Random access for the off-schedule case; re-decodes from a keyframe. */
-  private async fetchDirectly(seconds: number): Promise<CanvasImageSource | null> {
-    const wrapped = await this.sink.getCanvas(seconds);
-    return wrapped?.canvas ?? null;
+  private async fetchDirectly(seconds: number): Promise<DecodedVideoFrame | null> {
+    const sample = await this.sink.getSample(seconds);
+    return wrap(sample);
   }
 
   async dispose(): Promise<void> {
@@ -140,4 +164,24 @@ class DecoderTrack {
     this.iterator = null;
     await this.input.dispose();
   }
+}
+
+/**
+ * Wraps a mediabunny sample as a closable frame.
+ *
+ * The sample's `draw()` already applies rotation metadata and stretches to the
+ * destination box, matching the fit the compositor expects for a full-frame
+ * video sprite.
+ */
+function wrap(sample: VideoSample | null): DecodedVideoFrame | null {
+  if (!sample) return null;
+
+  return {
+    draw(context, width, height) {
+      sample.draw(context, 0, 0, width, height);
+    },
+    close() {
+      sample.close();
+    },
+  };
 }

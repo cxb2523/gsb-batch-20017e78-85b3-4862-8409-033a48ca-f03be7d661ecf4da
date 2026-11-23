@@ -30,7 +30,7 @@ interface ImageEntry {
  * A video whose frames arrive from an external decoder instead of a `<video>`
  * element. Export uses this so it can draw exactly-decoded frames through the
  * same texture lookup the preview uses — the renderer never learns the
- * difference.
+ * difference. Scoped entries only ever hold this kind.
  */
 interface CanvasVideoEntry {
   kind: "canvas-video";
@@ -39,18 +39,48 @@ interface CanvasVideoEntry {
   texture: Texture;
 }
 
-type CacheEntry = VideoEntry | ImageEntry | CanvasVideoEntry;
+type CacheEntry = VideoEntry | ImageEntry;
+
+/** A decoded frame that can paint itself and release its own GPU resources. */
+export interface DrawableVideoFrame {
+  draw(context: CanvasRenderingContext2D, width: number, height: number): void;
+  close(): void;
+}
 
 export class MediaTextureCache {
   private readonly entries = new Map<Id, CacheEntry>();
+  /**
+   * Export-only, scoped by clip rather than by media.
+   *
+   * Two clips can show the same source on the same frame — an overlap, or a
+   * transition tail — at *different* source times. Sharing one per-media canvas
+   * for those means the second clip's draw overwrites the first's, so both end
+   * up showing the same picture. A target per clip is what keeps them apart.
+   * The preview never populates this map, so its per-media lookup is unchanged.
+   */
+  private readonly scopedEntries = new Map<Id, CanvasVideoEntry>();
   /** Tracks in-flight loads so concurrent requests share one decode. */
   private readonly loading = new Map<Id, Promise<CacheEntry | null>>();
 
   constructor(private readonly store: MediaBlobStore) {}
 
-  /** Returns a texture if already loaded. Never triggers a load. */
-  peek(mediaId: Id): Texture | null {
+  /**
+   * Returns a texture if already loaded. Never triggers a load.
+   *
+   * When `scopeId` is supplied (export passes the clip id), a scoped target wins
+   * over the media-level texture, so each clip reads its own pixels.
+   */
+  peek(mediaId: Id, scopeId?: Id): Texture | null {
+    if (scopeId) {
+      const scoped = this.scopedEntries.get(scopeId);
+      if (scoped) return scoped.texture;
+    }
     return this.entries.get(mediaId)?.texture ?? null;
+  }
+
+  /** True when this scope (clip) has its own decoded-frame target. */
+  hasScopedTexture(scopeId: Id): boolean {
+    return this.scopedEntries.has(scopeId);
   }
 
   getVideoElement(mediaId: Id): HTMLVideoElement | null {
@@ -59,16 +89,67 @@ export class MediaTextureCache {
   }
 
   /**
-   * Registers a video whose frames come from a decoder rather than a `<video>`
-   * element, and returns its texture. Subsequent `load` calls for this id are
-   * no-ops, so no element is created for media the caller decodes itself.
+   * Registers a clip-scoped video whose frames come from a decoder (or from
+   * seeking a shared `<video>` element), and returns its texture.
    *
-   * Call {@link drawDecodedFrame} to publish each new frame.
+   * The target is keyed by the clip, not the media, so two clips of one source
+   * never share a canvas. Call {@link drawDecodedFrame} to publish each frame.
    */
-  registerDecodedVideo(mediaId: Id, width: number, height: number): Texture | null {
-    const existing = this.entries.get(mediaId);
+  registerScopedVideo(scopeId: Id, width: number, height: number): Texture | null {
+    const existing = this.scopedEntries.get(scopeId);
     if (existing) return existing.texture;
 
+    const entry = this.createCanvasEntry(width, height);
+    if (!entry) return null;
+    this.scopedEntries.set(scopeId, entry);
+    return entry.texture;
+  }
+
+  /**
+   * Publishes a decoded frame to a clip's own target.
+   *
+   * The frame is copied into the entry's canvas rather than swapped in, so the
+   * texture identity stays stable across frames (Pixi would otherwise have to
+   * rebuild the GPU resource). The caller owns `frame` — including closing it —
+   * because the cache only borrows the pixels for the duration of this call.
+   */
+  drawDecodedFrame(scopeId: Id, frame: DrawableVideoFrame): void {
+    const entry = this.scopedEntries.get(scopeId);
+    if (!entry) return;
+
+    const { canvas, context, texture } = entry;
+    // Clear first: a frame with transparency must not show the previous one
+    // through its transparent regions.
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    frame.draw(context, canvas.width, canvas.height);
+    texture.source.update();
+  }
+
+  /**
+   * Publishes the current frame of a media's `<video>` element to a clip's own
+   * target. This is the element-seeking export fallback: the element is shared
+   * (there is one decoder), but each clip gets its own copy of the pixels, so
+   * isolation holds on that path too.
+   */
+  drawVideoElement(scopeId: Id, mediaId: Id): void {
+    const source = this.entries.get(mediaId);
+    const target = this.scopedEntries.get(scopeId);
+    if (source?.kind !== "video" || !target) return;
+    if (source.element.readyState < 2) return; // no frame to copy yet
+
+    const { canvas, context, texture } = target;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    try {
+      context.drawImage(source.element, 0, 0, canvas.width, canvas.height);
+    } catch {
+      // An element without a decodable frame draws nothing; the previous frame
+      // (or transparency) stays, which is the documented degradation.
+      return;
+    }
+    texture.source.update();
+  }
+
+  private createCanvasEntry(width: number, height: number): CanvasVideoEntry | null {
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, width);
     canvas.height = Math.max(1, height);
@@ -77,29 +158,7 @@ export class MediaTextureCache {
     const context = canvas.getContext("2d", { alpha: true });
     if (!context) return null;
 
-    const texture = Texture.from(canvas);
-    this.entries.set(mediaId, { kind: "canvas-video", canvas, context, texture });
-    return texture;
-  }
-
-  /**
-   * Publishes a decoded frame as the current contents of a registered video.
-   *
-   * The frame is copied into the entry's own canvas rather than swapped in, so
-   * the texture identity stays stable across frames (Pixi would otherwise have
-   * to rebuild the GPU resource) and the decoder stays free to recycle its
-   * canvases. The texture is then marked dirty so the next draw re-uploads it.
-   */
-  drawDecodedFrame(mediaId: Id, frame: CanvasImageSource): void {
-    const entry = this.entries.get(mediaId);
-    if (entry?.kind !== "canvas-video") return;
-
-    const { canvas, context, texture } = entry;
-    // Clear first: a frame with transparency must not show the previous one
-    // through its transparent regions.
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(frame, 0, 0, canvas.width, canvas.height);
-    texture.source.update();
+    return { kind: "canvas-video", canvas, context, texture: Texture.from(canvas) };
   }
 
   /**
@@ -183,12 +242,20 @@ export class MediaTextureCache {
     } else if (entry.kind === "image") {
       URL.revokeObjectURL(entry.objectUrl);
     }
-    // A decoded-video entry owns only its canvas, which the texture just freed.
 
     this.entries.delete(mediaId);
   }
 
+  /** Releases one clip-scoped target's texture (and with it the canvas). */
+  releaseScoped(scopeId: Id): void {
+    const entry = this.scopedEntries.get(scopeId);
+    if (!entry) return;
+    entry.texture.destroy(true);
+    this.scopedEntries.delete(scopeId);
+  }
+
   destroy(): void {
     for (const mediaId of [...this.entries.keys()]) this.release(mediaId);
+    for (const scopeId of [...this.scopedEntries.keys()]) this.releaseScoped(scopeId);
   }
 }

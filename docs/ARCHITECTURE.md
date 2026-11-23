@@ -225,9 +225,28 @@ preview frame for frame.
   a lazy feed deadlocks), so `planVideoDecodeSchedule` walks the export's frame
   range first and records, per video, the source timestamps in request order.
   Both the schedule and the render loop derive from `resolveScene`, which is what
-  keeps them in lockstep. Decoded frames reach the compositor through a
-  canvas-backed texture in `MediaTextureCache`, so the renderer is unchanged.
-  Media the decoder can't open falls back to element seeking.
+  keeps them in lockstep. Media the decoder can't open falls back to element
+  seeking; the fallback still snapshots each clip's frame into its own target
+  before the shared `<video>` element is re-seeked, so isolation holds there too.
+- **A drawable target per clip, not per media.** Two clips can show one source on
+  the same frame at different times — overlapping clips, or a transition's
+  outgoing tail. The preview tolerates one texture per media because both clips
+  read the same decoder state, but an export prepares each clip's exact frame
+  _before_ the frame is drawn, so a shared per-media canvas would let the second
+  clip's draw overwrite the first's and both would encode the same picture.
+  `prepareSceneMedia` (in `render-engine`, DOM-free and unit-tested) draws each
+  clip's decoded frame into a canvas keyed by **clip id**
+  (`MediaTextureCache.registerScopedVideo`), and the renderer asks for textures by
+  clip (`PixiSceneRenderer`'s `scopeByClip`). Preview never registers a scope, so
+  its per-media lookup is untouched. The pure `planVideoDecodeRequests` exposes
+  the same request list with clip ids, so the two clips stay distinct all the way
+  from planning.
+- **Frame and resource ownership.** Every decoded `VideoFrame` is closed the
+  moment its pixels are copied into the clip's canvas, so a long export does not
+  accumulate frames. Disposing the frame source (always, including on cancel and
+  on encoder error) closes the decoders, destroys the renderer's WebGL context,
+  and releases every texture the cache holds — per-media and per-clip alike — so
+  a cancelled export leaves nothing that would block or corrupt the next one.
 
 ## Transitions
 
