@@ -337,14 +337,19 @@ export interface StudioEngineApi {
   allNotesOff(trackId?: string): void
 
   // Drums
-  /** Re-renders only the voices whose sound settings changed. */
+  /**
+   * Apply a kit. Voices whose sound is unchanged keep their buffer; changed
+   * voices swap to (or share) a cached buffer for the new sound, and buffers no
+   * pad references any more are released.
+   */
   setKit(kit: DrumKit): void
   /**
    * Register (or with null, forget) the decoded audio for a sample path. Kit
-   * voices whose `sample.path` matches play it; until it arrives they fall
-   * back to their synthesized model.
+   * voices whose `sample.path` matches play it; until it arrives (or if it
+   * fails) they fall back to their synthesized model.
    */
   setDrumSample(path: string, buffer: AudioBuffer | null): void
+  /** Play the pad's current sound. A pending render is completed for this hit, never a stale one. */
   triggerDrum(id: DrumVoiceId, velocity?: number, when?: number): void
 
   // Chops

@@ -958,6 +958,9 @@ export const factoryPatches = SYNTH_PRESETS
 // ---------- Drum kit design ----------
 
 export function updateDrumVoice(id: DrumVoiceId, patch: Partial<DrumVoice>): void {
+  // Any change to a pad's sound supersedes a sample load still in flight, so a
+  // slow decode can never overwrite a newer model pick or a clear.
+  if ('sample' in patch) bumpSampleSelection(id)
   const kit = cloneKit(get().kit)
   kit.voices[id] = { ...kit.voices[id], ...patch }
   studio.setKit(kit)
@@ -973,6 +976,8 @@ export function updateKitBus(patch: Partial<Pick<DrumKit, 'punch' | 'crunch' | '
 
 export function loadKit(kit: DrumKit): void {
   const next = cloneKit(kit)
+  // A kit load supersedes any single-pad sample pick still decoding.
+  for (const id of DRUM_VOICES) bumpSampleSelection(id)
   studio.setKit(next)
   set({ kit: next })
   loadKitSamples(next)
@@ -983,6 +988,17 @@ export function loadKit(kit: DrumKit): void {
 /** Paths whose audio the engine already holds, and decodes in flight (so a path is only read once). */
 const decodedSamples = new Set<string>()
 const pendingSamples = new Map<string, Promise<boolean>>()
+
+/**
+ * Bumped whenever a pad's sound is intentionally changed. A sample load records
+ * the value before its decode and only applies when it is unchanged on arrival,
+ * so a decode that finishes after the user has moved on cannot win.
+ */
+const drumSelectionToken = new Map<DrumVoiceId, number>()
+
+function bumpSampleSelection(id: DrumVoiceId): void {
+  drumSelectionToken.set(id, (drumSelectionToken.get(id) ?? 0) + 1)
+}
 
 function ensureSample(path: string): Promise<boolean> {
   if (decodedSamples.has(path)) return Promise.resolve(true)
@@ -1041,10 +1057,15 @@ export async function loadDrumSample(id: DrumVoiceId, path: string): Promise<voi
     showToast(`${name} isn't an audio file — drop a WAV, AIFF, MP3, FLAC, OGG or M4A`)
     return
   }
+  // Claim the pad now so a later pick supersedes this one; a slow decode that
+  // arrives after the user has chosen something else is dropped.
+  drumSelectionToken.set(id, (drumSelectionToken.get(id) ?? 0) + 1)
+  const token = drumSelectionToken.get(id)
   if (!(await ensureSample(path))) {
     showToast(`Couldn't load ${name}`)
     return
   }
+  if (drumSelectionToken.get(id) !== token) return
   const voice = get().kit.voices[id]
   // A fresh sample starts neutral — the pad's synth settings (a short decay, a dark tone) would
   // otherwise cut it off or muffle it. They are kept with the sample and come back when it is removed.

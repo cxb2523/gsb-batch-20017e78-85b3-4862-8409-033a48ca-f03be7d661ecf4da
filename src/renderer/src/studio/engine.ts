@@ -19,6 +19,7 @@ import {
   type SynthPatch
 } from './types'
 import { DEFAULT_PATCH } from './patch'
+import { DrumSoundBank } from './drumBuffers'
 import { renderDrum } from './drumsynth'
 import { SynthInstrument } from './synth'
 
@@ -180,9 +181,8 @@ export class StudioEngine implements StudioEngineApi {
 
   private readonly patches = new Map<string, SynthPatch>()
   private kit: DrumKit = structuredClone(DEFAULT_KIT)
-  private readonly drumBuffers = new Map<DrumVoiceId, AudioBuffer>()
-  private readonly drumBufferSignatures = new Map<DrumVoiceId, string>()
-  private readonly drumBufferSamples = new Map<DrumVoiceId, boolean>()
+  /** Reference-counted cache of drum sounds shared by every pad. Created in `init`. */
+  private drumBank: DrumSoundBank<AudioBuffer> | null = null
   private readonly drumSamples = new Map<string, RegisteredDrumSample>()
   private drumInput: GainNode | null = null
   private drumCompressor: DynamicsCompressorNode | null = null
@@ -266,8 +266,18 @@ export class StudioEngine implements StudioEngineApi {
     this.drumBus = this.createTrackBus()
     this.chopBus = this.createTrackBus()
     this.createDrumMixBus()
-    for (const sample of this.drumSamples.values()) {
+    this.drumBank = new DrumSoundBank<AudioBuffer>({
+      sampleRate: ctx.sampleRate,
+      render: renderDrum,
+      createBuffer: (data, sampleRate) => {
+        const buffer = ctx.createBuffer(1, Math.max(1, data.length), sampleRate)
+        buffer.getChannelData(0).set(data)
+        return buffer
+      }
+    })
+    for (const [path, sample] of this.drumSamples) {
       if (!sample.prepared) sample.prepared = this.prepareDrumSample(sample.source)
+      this.drumBank.setSample(path, sample.prepared ?? null)
     }
     this.resolveDrumBuffers()
     this.applyDrumBus()
@@ -393,38 +403,34 @@ export class StudioEngine implements StudioEngineApi {
     this.applyDrumBus()
   }
 
+  /**
+   * Point every pad at the sound its voice currently asks for. The bank shares
+   * one buffer between pads (and repeated triggers) that want the same sound,
+   * swaps entries when a model or render parameter changes, and releases the
+   * old buffer once no pad references it.
+   */
   private resolveDrumBuffers(ids: readonly DrumVoiceId[] = DRUM_VOICES): void {
-    const ctx = this.ctx
-    if (!ctx) return
+    const bank = this.drumBank
+    if (!bank) return
     for (const id of ids) {
       const voice = this.kit.voices[id] ?? { ...DEFAULT_DRUM, model: DRUM_MODELS[id][0] }
-      const path = voice.sample?.path
-      const registered = path ? this.drumSamples.get(path) : undefined
-      const sample = registered?.prepared
-      const signature = sample
-        ? `sample:${path}`
-        : `synth:${path ?? ''}:${voice.model}:${voice.tune}:${voice.decay}:${voice.tone}:${voice.drive}`
-      if (this.drumBufferSignatures.get(id) === signature) continue
-      if (sample) {
-        this.drumBuffers.set(id, sample)
-        this.drumBufferSamples.set(id, true)
-      } else {
-        const rendered = renderDrum(id, voice, ctx.sampleRate)
-        const buffer = ctx.createBuffer(1, rendered.length, ctx.sampleRate)
-        buffer.getChannelData(0).set(rendered)
-        this.drumBuffers.set(id, buffer)
-        this.drumBufferSamples.set(id, false)
-      }
-      this.drumBufferSignatures.set(id, signature)
+      // A pad with a missing/failed sample falls back to its synth model inside resolve().
+      bank.resolve(id, voice, voice.sample?.path ?? null)
     }
   }
 
   setDrumSample(path: string, buffer: AudioBuffer | null): void {
-    if (buffer === null) this.drumSamples.delete(path)
-    else this.drumSamples.set(path, { source: buffer, prepared: this.ctx ? this.prepareDrumSample(buffer) : null })
-    const affected = DRUM_VOICES.filter((id) => this.kit.voices[id]?.sample?.path === path)
-    for (const id of affected) this.drumBufferSignatures.delete(id)
-    this.resolveDrumBuffers(affected)
+    if (buffer === null) {
+      this.drumSamples.delete(path)
+      this.drumBank?.setSample(path, null)
+      return
+    }
+    // Until the AudioContext exists the buffer is kept un-prepared; `init`
+    // prepares registered samples before the bank is built. Exposing it as null
+    // meanwhile keeps pads on their synth fallback rather than a stale buffer.
+    const prepared = this.ctx ? this.prepareDrumSample(buffer) : null
+    this.drumSamples.set(path, { source: buffer, prepared })
+    if (prepared) this.drumBank?.setSample(path, prepared)
   }
 
   private prepareDrumSample(source: AudioBuffer): AudioBuffer {
@@ -465,9 +471,14 @@ export class StudioEngine implements StudioEngineApi {
   triggerDrum(id: DrumVoiceId, velocity = 1, when?: number): void {
     const ctx = this.ctx
     const bus = this.drumBus
-    const buffer = this.drumBuffers.get(id)
-    if (!ctx || !bus || !buffer || !this.drumInput || !this.drumRoomInput) return
+    if (!ctx || !bus || !this.drumInput || !this.drumRoomInput || !this.drumBank) return
     const voice = this.kit.voices[id] ?? { ...DEFAULT_DRUM, model: DRUM_MODELS[id][0] }
+    // Only the pad's *current* sound is played: a render still pending from an
+    // earlier switch is completed here (never a stale one), and a sample that
+    // failed to load arrives as its synthesized fallback.
+    const sound = this.drumBank.resolve(id, voice, voice.sample?.path ?? null) ?? this.drumBank.ensure(id)
+    if (!sound) return
+    const buffer = sound.buffer
     const time = Math.max(when ?? ctx.currentTime, ctx.currentTime)
     if (id === 'hat') this.chokeOpenHat(time)
     if (id === 'bass808') this.choke808(time)
@@ -480,7 +491,7 @@ export class StudioEngine implements StudioEngineApi {
     panner.pan.value = clamp(voice.pan, -1, 1)
     const nodes: AudioNode[] = [source, output, panner]
     let tail: AudioNode = source
-    const isSample = this.drumBufferSamples.get(id) === true
+    const isSample = sound.kind === 'sample'
     let playbackRate = 1
     if (isSample) {
       playbackRate = 2 ** (clamp(voice.tune, -24, 24) / 12)
