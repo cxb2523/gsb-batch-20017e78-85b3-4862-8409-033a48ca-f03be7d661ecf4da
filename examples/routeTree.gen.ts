@@ -19,6 +19,7 @@ import { Route as ExampleContextBridgeRouteImport } from './routes/example/conte
 import { Route as ExampleDemandRenderingRouteImport } from './routes/example/demand-rendering'
 import { Route as ExampleEventCostRouteImport } from './routes/example/event-cost'
 import { Route as ExampleSharedTextureRouteImport } from './routes/example/shared-texture'
+import { Route as ExampleTextureResizeRouteImport } from './routes/example/texture-resize'
 import { Route as ExampleThreePointerCaptureRouteImport } from './routes/example/three-pointer-capture'
 import { Route as ExampleThreeRenderTextureRouteImport } from './routes/example/three-render-texture'
 import { Route as ExampleUnmountContextRouteImport } from './routes/example/unmount-context'
@@ -74,6 +75,11 @@ const ExampleSharedTextureRoute = ExampleSharedTextureRouteImport.update({
   path: '/shared-texture',
   getParentRoute: () => ExampleRoute,
 } as any)
+const ExampleTextureResizeRoute = ExampleTextureResizeRouteImport.update({
+  id: '/texture-resize',
+  path: '/texture-resize',
+  getParentRoute: () => ExampleRoute,
+} as any)
 const ExampleThreePointerCaptureRoute =
   ExampleThreePointerCaptureRouteImport.update({
     id: '/three-pointer-capture',
@@ -107,6 +113,7 @@ export interface FileRoutesByFullPath {
   '/example/demand-rendering': typeof ExampleDemandRenderingRoute
   '/example/event-cost': typeof ExampleEventCostRoute
   '/example/shared-texture': typeof ExampleSharedTextureRoute
+  '/example/texture-resize': typeof ExampleTextureResizeRoute
   '/example/three-pointer-capture': typeof ExampleThreePointerCaptureRoute
   '/example/three-render-texture': typeof ExampleThreeRenderTextureRoute
   '/example/unmount-context': typeof ExampleUnmountContextRoute
@@ -122,6 +129,7 @@ export interface FileRoutesByTo {
   '/example/demand-rendering': typeof ExampleDemandRenderingRoute
   '/example/event-cost': typeof ExampleEventCostRoute
   '/example/shared-texture': typeof ExampleSharedTextureRoute
+  '/example/texture-resize': typeof ExampleTextureResizeRoute
   '/example/three-pointer-capture': typeof ExampleThreePointerCaptureRoute
   '/example/three-render-texture': typeof ExampleThreeRenderTextureRoute
   '/example/unmount-context': typeof ExampleUnmountContextRoute
@@ -139,6 +147,7 @@ export interface FileRoutesById {
   '/example/demand-rendering': typeof ExampleDemandRenderingRoute
   '/example/event-cost': typeof ExampleEventCostRoute
   '/example/shared-texture': typeof ExampleSharedTextureRoute
+  '/example/texture-resize': typeof ExampleTextureResizeRoute
   '/example/three-pointer-capture': typeof ExampleThreePointerCaptureRoute
   '/example/three-render-texture': typeof ExampleThreeRenderTextureRoute
   '/example/unmount-context': typeof ExampleUnmountContextRoute
@@ -157,6 +166,7 @@ export interface FileRouteTypes {
     | '/example/demand-rendering'
     | '/example/event-cost'
     | '/example/shared-texture'
+    | '/example/texture-resize'
     | '/example/three-pointer-capture'
     | '/example/three-render-texture'
     | '/example/unmount-context'
@@ -172,6 +182,7 @@ export interface FileRouteTypes {
     | '/example/demand-rendering'
     | '/example/event-cost'
     | '/example/shared-texture'
+    | '/example/texture-resize'
     | '/example/three-pointer-capture'
     | '/example/three-render-texture'
     | '/example/unmount-context'
@@ -188,6 +199,7 @@ export interface FileRouteTypes {
     | '/example/demand-rendering'
     | '/example/event-cost'
     | '/example/shared-texture'
+    | '/example/texture-resize'
     | '/example/three-pointer-capture'
     | '/example/three-render-texture'
     | '/example/unmount-context'
@@ -273,6 +285,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ExampleSharedTextureRouteImport
       parentRoute: typeof ExampleRoute
     }
+    '/example/texture-resize': {
+      id: '/example/texture-resize'
+      path: '/texture-resize'
+      fullPath: '/example/texture-resize'
+      preLoaderRoute: typeof ExampleTextureResizeRouteImport
+      parentRoute: typeof ExampleRoute
+    }
     '/example/three-pointer-capture': {
       id: '/example/three-pointer-capture'
       path: '/three-pointer-capture'
@@ -311,6 +330,7 @@ interface ExampleRouteChildren {
   ExampleDemandRenderingRoute: typeof ExampleDemandRenderingRoute
   ExampleEventCostRoute: typeof ExampleEventCostRoute
   ExampleSharedTextureRoute: typeof ExampleSharedTextureRoute
+  ExampleTextureResizeRoute: typeof ExampleTextureResizeRoute
   ExampleThreePointerCaptureRoute: typeof ExampleThreePointerCaptureRoute
   ExampleThreeRenderTextureRoute: typeof ExampleThreeRenderTextureRoute
   ExampleUnmountContextRoute: typeof ExampleUnmountContextRoute
@@ -325,6 +345,7 @@ const ExampleRouteChildren: ExampleRouteChildren = {
   ExampleDemandRenderingRoute: ExampleDemandRenderingRoute,
   ExampleEventCostRoute: ExampleEventCostRoute,
   ExampleSharedTextureRoute: ExampleSharedTextureRoute,
+  ExampleTextureResizeRoute: ExampleTextureResizeRoute,
   ExampleThreePointerCaptureRoute: ExampleThreePointerCaptureRoute,
   ExampleThreeRenderTextureRoute: ExampleThreeRenderTextureRoute,
   ExampleUnmountContextRoute: ExampleUnmountContextRoute,

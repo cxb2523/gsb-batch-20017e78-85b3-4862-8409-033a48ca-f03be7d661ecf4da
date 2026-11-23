@@ -54,6 +54,11 @@ export const EXAMPLES: readonly ExampleMeta[] = [
     description: "One Pixi texture with events across many meshes",
   },
   {
+    label: "Texture Resize",
+    to: "/example/texture-resize",
+    description: "Resize and unmount a PixiTexture at runtime",
+  },
+  {
     label: "Unmount Context",
     to: "/example/unmount-context",
     description: "Unmount the <RenderContext>",

@@ -322,25 +322,55 @@ function PixiTextureInternal({
 
   useImperativeHandle(containerRefProp, () => containerRef.current);
 
-  useEffect(
-    () => () => {
-      pixiTextureRef.current.source.destroy();
-      pixiTextureRef.current.destroy();
-    },
-    [pixiTextureRef],
-  );
-
+  // r3f portals capture event compute closures beyond the render that
+  // created them; route bounds through a ref so stale closures still map
+  // coordinates with the current size
+  const boundsRef = useRef({ width, height });
   useLayoutEffect(() => {
-    pixiTextureRef.current.destroy();
-    pixiTextureRef.current = new RenderTexture({
+    boundsRef.current = { width, height };
+  }, [width, height]);
+
+  // Sole owner of the render texture and its external texture: each cleanup
+  // releases exactly what its own setup created, so StrictMode/Activity
+  // remounts destroy and recreate within one commit without double-destroying
+  useLayoutEffect(() => {
+    const renderTexture = new RenderTexture({
       source: new TextureSource({ width, height, autoGarbageCollect: false }),
     });
     const gpuTexture = (
       app.app.renderer.texture as GpuTextureSystem
-    ).getGpuSource(pixiTextureRef.current._source);
-    textureRef.current.value.dispose();
-    textureRef.current.value = new ExternalTexture(gpuTexture);
-  }, [app.app.renderer.texture, height, pixiTextureRef, textureRef, width]);
+    ).getGpuSource(renderTexture._source);
+    const externalTexture = new ExternalTexture(gpuTexture);
+
+    // Swap before releasing so no consumer sees a destroyed texture
+    const staleRenderTexture = pixiTextureRef.current;
+    const staleValue = textureRef.current.value;
+    pixiTextureRef.current = renderTexture;
+    textureRef.current.value = externalTexture;
+    // Earlier generations are released by their own cleanups; only the
+    // first-mount placeholders have no owner
+    if (!(staleValue instanceof ExternalTexture)) {
+      staleValue.dispose();
+    }
+    if (!staleRenderTexture.destroyed) {
+      staleRenderTexture.destroy(true);
+    }
+
+    // Demand frameloop: fill the new texture on the next tick
+    invalidate();
+
+    return () => {
+      externalTexture.dispose();
+      renderTexture.destroy(true);
+    };
+  }, [
+    app.app.renderer.texture,
+    height,
+    invalidate,
+    pixiTextureRef,
+    textureRef,
+    width,
+  ]);
 
   const localEventBoundaryRef = useLazyRef(() => new EventBoundary());
   function hitTest(x: number, y: number) {
@@ -349,14 +379,12 @@ function PixiTextureInternal({
     return boundary.hitTest(x, y);
   }
 
-  const bounds = { width, height };
-
   function mapUvToPixi(uv: Vector2, out?: Point) {
-    return mapUvToPixiUtil(uv, bounds, out);
+    return mapUvToPixiUtil(uv, boundsRef.current, out);
   }
 
   function mapPixiToParentUv(point: Point, out?: Vector2) {
-    return mapPixiToUvUtil(point, bounds, out);
+    return mapPixiToUvUtil(point, boundsRef.current, out);
   }
 
   const _uv = new Vector2();
