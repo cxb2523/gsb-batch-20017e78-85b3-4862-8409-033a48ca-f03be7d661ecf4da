@@ -163,3 +163,131 @@ describe("MediaPipeProvider wasm source", () => {
     );
   });
 });
+
+describe("MediaPipeProvider stop/restart lifecycle", () => {
+  const liveVideo = { videoWidth: 640, videoHeight: 480 } as HTMLVideoElement;
+
+  /**
+   * rAF mock that stores callbacks so tests can pump frames manually. Each
+   * `pump` runs one scheduled callback (mirroring a real rAF tick). The clock
+   * starts at 0 and advances 100ms per pump, clearing the 16ms throttle.
+   */
+  const pumpableRaf = () => {
+    const queue: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      queue.push(cb);
+      return 1;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {
+      queue.length = 0;
+    });
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    let t = 0;
+    const pump = () => {
+      t += 100;
+      clock.mockReturnValue(t);
+      queue.shift()?.(t);
+    };
+    return { pump };
+  };
+
+  const handModelThatDetects = () => {
+    vi.mocked(HandLandmarker.createFromOptions).mockResolvedValue({
+      detectForVideo: vi.fn(() => ({ landmarks: [], handednesses: [] })),
+      close: vi.fn(),
+    } as unknown as HandLandmarker);
+  };
+
+  it("dispatches no frames after stopDetection", async () => {
+    handModelThatDetects();
+    const { pump } = pumpableRaf();
+    const provider = new MediaPipeProvider({
+      tasks: ["hands"],
+      useGpu: false,
+    });
+    await provider.initialize(liveVideo);
+    const frames = vi.fn();
+    provider.onDetection(frames);
+
+    provider.startDetection();
+    pump();
+    expect(frames).toHaveBeenCalledOnce();
+
+    provider.stopDetection();
+    pump();
+    pump();
+
+    expect(frames).toHaveBeenCalledOnce();
+  });
+
+  it("resumes dispatching after startDetection is called again", async () => {
+    handModelThatDetects();
+    const { pump } = pumpableRaf();
+    const provider = new MediaPipeProvider({
+      tasks: ["hands"],
+      useGpu: false,
+    });
+    await provider.initialize(liveVideo);
+    const frames = vi.fn();
+    provider.onDetection(frames);
+
+    provider.startDetection();
+    pump();
+    provider.stopDetection();
+    expect(frames).toHaveBeenCalledOnce();
+
+    // Resuming runs a frame inline immediately, then continues per tick
+    provider.startDetection();
+    expect(frames).toHaveBeenCalledTimes(2);
+    pump();
+    expect(frames).toHaveBeenCalledTimes(3);
+  });
+
+  it("never calls back after dispose, even from a queued frame", async () => {
+    handModelThatDetects();
+    const { pump } = pumpableRaf();
+    const provider = new MediaPipeProvider({
+      tasks: ["hands"],
+      useGpu: false,
+    });
+    await provider.initialize(liveVideo);
+    const frames = vi.fn();
+    provider.onDetection(frames);
+
+    provider.startDetection();
+    pump();
+    provider.dispose();
+    pump();
+    pump();
+
+    expect(frames).toHaveBeenCalledOnce();
+  });
+
+  it("releases models that finish loading after dispose", async () => {
+    // Re-establish every mock inside the test: the vitest config's mockReset
+    // clears implementations shared via the file-level beforeEach.
+    vi.mocked(FilesetResolver.forVisionTasks).mockResolvedValue(
+      {} as Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>,
+    );
+    const close = vi.fn();
+    let resolveModel: (model: HandLandmarker) => void = () => {};
+    vi.mocked(HandLandmarker.createFromOptions).mockReturnValue(
+      new Promise<HandLandmarker>((resolve) => {
+        resolveModel = resolve;
+      }),
+    );
+
+    const provider = new MediaPipeProvider({
+      tasks: ["hands"],
+      useGpu: false,
+    });
+    const init = provider.initialize(liveVideo);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    provider.dispose();
+    resolveModel({ close } as unknown as HandLandmarker);
+    await init;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(close).toHaveBeenCalled();
+  });
+});

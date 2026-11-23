@@ -35,6 +35,14 @@ class MediaPipeProvider implements VisionProvider {
   private isInitialized = false;
   private isProcessing = false;
   private isDisposed = false;
+  /**
+   * Resumable pause flag: `stopDetection` sets it, `startDetection` clears it.
+   * While set, the frame loop exits without scheduling and no frame — even one
+   * already being computed — is dispatched.
+   */
+  private isStopped = false;
+  /** A fatal runtime trap has stopped detection for good */
+  private hasFailed = false;
   private videoElement: HTMLVideoElement | null = null;
   private animationId: number | null = null;
   private lastProcessTime = 0;
@@ -52,9 +60,15 @@ class MediaPipeProvider implements VisionProvider {
     const { FilesetResolver, HandLandmarker, FaceLandmarker, PoseLandmarker } =
       await import("@mediapipe/tasks-vision");
 
+    // A dispose during the dynamic import or model downloads must not leave
+    // a half-built provider behind.
+    if (this.isDisposed) return;
+
     const vision = await FilesetResolver.forVisionTasks(
       this.options.mediapipe?.wasmBasePath ?? DEFAULT_WASM_BASE_PATH,
     );
+
+    if (this.isDisposed) return;
 
     const delegate = (this.options.useGpu ?? true) ? "GPU" : "CPU";
 
@@ -84,7 +98,7 @@ class MediaPipeProvider implements VisionProvider {
         total: steps.length,
         label: "hand landmarker",
       });
-      this.models.handLandmarker = await createWithFallback((d) =>
+      const handLandmarker = await createWithFallback((d) =>
         HandLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath:
@@ -98,6 +112,11 @@ class MediaPipeProvider implements VisionProvider {
           minTrackingConfidence: 0.5,
         }),
       );
+      if (this.isDisposed) {
+        this.closeQuietly(handLandmarker);
+        return;
+      }
+      this.models.handLandmarker = handLandmarker;
     }
 
     if (tasks.has("faces")) {
@@ -106,7 +125,7 @@ class MediaPipeProvider implements VisionProvider {
         total: steps.length,
         label: "face landmarker",
       });
-      this.models.faceLandmarker = await createWithFallback((d) =>
+      const faceLandmarker = await createWithFallback((d) =>
         FaceLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath:
@@ -122,6 +141,11 @@ class MediaPipeProvider implements VisionProvider {
           outputFacialTransformationMatrixes: false,
         }),
       );
+      if (this.isDisposed) {
+        this.closeQuietly(faceLandmarker);
+        return;
+      }
+      this.models.faceLandmarker = faceLandmarker;
     }
 
     if (tasks.has("poses")) {
@@ -130,7 +154,7 @@ class MediaPipeProvider implements VisionProvider {
         total: steps.length,
         label: "pose landmarker",
       });
-      this.models.poseLandmarker = await createWithFallback((d) =>
+      const poseLandmarker = await createWithFallback((d) =>
         PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath:
@@ -145,6 +169,11 @@ class MediaPipeProvider implements VisionProvider {
           outputSegmentationMasks: this.options.segmentation ?? false,
         }),
       );
+      if (this.isDisposed) {
+        this.closeQuietly(poseLandmarker);
+        return;
+      }
+      this.models.poseLandmarker = poseLandmarker;
     }
 
     this.isInitialized = true;
@@ -152,13 +181,26 @@ class MediaPipeProvider implements VisionProvider {
   }
 
   startDetection(): void {
-    if (!this.isInitialized || !this.videoElement || this.isProcessing) return;
+    if (this.isDisposed || this.hasFailed) return;
+    if (!this.isInitialized || !this.videoElement) return;
+    // A frame loop is already running; nothing to resume
+    if (this.isProcessing) return;
 
+    this.isStopped = false;
+    // The first frame of a resumed session must not lose to the throttle
+    // timestamp left by the frame that ran just before the pause
+    this.lastProcessTime = 0;
     this.isProcessing = true;
     this.processFrame();
   }
 
+  /**
+   * Resumable pause: stop the frame loop so no new frames run and any frame
+   * whose inference is still finishing is discarded. Calling
+   * `startDetection` afterwards resumes detection.
+   */
   stopDetection(): void {
+    this.isStopped = true;
     this.isProcessing = false;
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);
@@ -189,11 +231,7 @@ class MediaPipeProvider implements VisionProvider {
     this.stopDetection();
 
     for (const model of Object.values(this.models)) {
-      try {
-        model?.close();
-      } catch {
-        // a model whose runtime already trapped throws on close; nothing is left to release
-      }
+      this.closeQuietly(model);
     }
     this.models = {};
 
@@ -204,8 +242,25 @@ class MediaPipeProvider implements VisionProvider {
     this.isProcessing = false;
   }
 
+  /** Close a model without throwing (a trapped runtime rejects close) */
+  private closeQuietly(model: Models[keyof Models]): void {
+    try {
+      model?.close();
+    } catch {
+      // a model whose runtime already trapped throws on close; nothing is left to release
+    }
+  }
+
   private processFrame = () => {
-    if (!this.isProcessing || !this.videoElement || this.isDisposed) return;
+    if (
+      !this.isProcessing ||
+      this.isStopped ||
+      this.hasFailed ||
+      !this.videoElement ||
+      this.isDisposed
+    ) {
+      return;
+    }
 
     const now = performance.now();
     const throttle = this.options.throttle ?? 16;
@@ -347,6 +402,9 @@ class MediaPipeProvider implements VisionProvider {
    * Stop detection for good and notify error subscribers.
    */
   private fail(cause: unknown): void {
+    if (this.hasFailed || this.isDisposed) return;
+
+    this.hasFailed = true;
     this.stopDetection();
     console.error("Vision processing stopped:", cause);
 
@@ -359,6 +417,10 @@ class MediaPipeProvider implements VisionProvider {
   }
 
   private handleResult(result: VisionFrame): void {
+    // A paused, failed or disposed session never dispatches a frame, even if
+    // inference for it finished just after stopDetection/dispose.
+    if (this.isStopped || this.hasFailed || this.isDisposed) return;
+
     const minConfidence = this.options.minConfidence ?? 0.7;
     const maxResults = this.options.maxResults ?? 2;
 
