@@ -31,12 +31,19 @@
                    '#7E9BD5','#B5C76E'];
 
   // ---------- Module state ----------
+  // `selected` is the SINGLE source of truth for every Mode B view/panel.
+  // Candidate switching, mode switching (A↔B), language switching and window
+  // resizing all redraw from `state.selected` — never from a stale closure or
+  // from "row 0". `selectedIndex` is kept in sync for the Top-10 highlight so
+  // an i18n re-render cannot silently move the highlight to another row.
   const state = {
     candidates: [],     // Top 10 computed container setups
-    selected: null,     // currently selected candidate
+    selected: null,     // currently selected candidate (authoritative)
+    selectedIndex: -1,  // index of `selected` inside `candidates`
     scenes: null,       // {carton:{...}, pallet:{...}}
     bActive: false,     // Mode B currently visible (drives render loop)
-    rafId: null         // active requestAnimationFrame handle (null = no loop running)
+    rafId: null,        // active requestAnimationFrame handle (null = no loop running)
+    pendingDraw: false  // a draw was requested before THREE was ready
   };
 
   // ---------- i18n bridge (reuse app.js global t/I18N/LANG) ----------
@@ -118,55 +125,95 @@
   // 堆叠模式枚举：
   //   column   列阵 (0°/90° 规则阵列)
   //   interlock交错 (Interlocking) — 相邻行错位 L/2，提升稳定性与边角填充
-  //   pinwheel 风车 (Pinwheel)     — 行内交替 L/W 朝向，适配 L≠W 箱体
+  //   pinwheel 风车 (Pinwheel)     — 4 箱一组绕中心交错旋转（每组边长 L+W），
+  //                                  几何上严格落在托盘 span 内，不会有悬空箱
   // overhang: 允许纸箱边缘溢出托盘(mm, 0~20)；等效可用托盘尺寸 +2*overhang
-  function perLayerColumn(oL, oW, pL, pW, oh) {
-    return Math.floor((pL + 2 * oh) / oL) * Math.floor((pW + 2 * oh) / oW);
-  }
-  function perLayerInterlock(oL, oW, pL, pW, oh) {
-    const spanL = pL + 2 * oh, spanW = pW + 2 * oh;
+  //
+  // 关键设计：每层排布只在这里生成一次「cells 布局」，perLayer 直接取
+  // cells.length。3D 视图完全按同一份 cells 绘制，因此视图箱数/层数/朝向
+  // 与摘要、Top10 永远不会出现两套算法各算一套的偏差。
+  //
+  // cell = { x, z, w, d, rot }，单位 mm，坐标系原点在 span 左下角，
+  //   x/z 为最小角，w/d 为沿 spanX/spanZ 的尺寸，rot=true 表示 90° 朝向。
+  function cellsColumn(oL, oW, spanL, spanW) {
+    const cols = Math.floor(spanL / oL);
     const rows = Math.floor(spanW / oW);
-    let total = 0;
+    const cells = [];
+    if (cols <= 0 || rows <= 0) return cells;
+    const ox = (spanL - cols * oL) / 2;
+    const oz = (spanW - rows * oW) / 2;
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++)
+        cells.push({ x: ox + c * oL, z: oz + r * oW, w: oL, d: oW, rot: false, row: r, col: c });
+    return cells;
+  }
+
+  function cellsInterlock(oL, oW, spanL, spanW) {
+    const rows = Math.floor(spanW / oW);
+    const cells = [];
+    if (rows <= 0) return cells;
+    const oz = (spanW - rows * oW) / 2;
     for (let r = 0; r < rows; r++) {
-      const shift = (r % 2) ? oL / 2 : 0; // 错位半箱
-      let x = shift, n = 0;
-      while (x + oL <= spanL + 0.001) { n++; x += oL; }
-      total += n;
+      const shift = (r % 2) ? oL / 2 : 0; // 奇数行错位半箱
+      let n = 0;
+      while (shift + (n + 1) * oL <= spanL + 0.001) n++;
+      if (n <= 0) continue;
+      // 整行（含错位量）在 span 内居中，保证任何错位行都不越过边界
+      const ox = (spanL - (shift + n * oL)) / 2;
+      for (let c = 0; c < n; c++)
+        cells.push({ x: ox + shift + c * oL, z: oz + r * oW, w: oL, d: oW, rot: false, row: r, col: c });
     }
-    return total;
+    return cells;
   }
-  function perLayerPinwheel(oL, oW, pL, pW, oh) {
-    const spanL = pL + 2 * oh, spanW = pW + 2 * oh;
-    const rows = Math.floor(spanW / oW);
-    let total = 0;
-    for (let r = 0; r < rows; r++) {
-      let x = 0, n = 0;
-      while (x < spanL - 0.001) {
-        const useL = (n % 2 === 0) ? oL : oW; // 行内交替朝向
-        if (x + useL <= spanL + 0.001) { n++; x += useL; } else break;
+
+  function cellsPinwheel(oL, oW, spanL, spanW) {
+    const cells = [];
+    // 风车组几何以「长边沿 X」推导（oL 为长边）；若当前朝向短边在 X，
+    // 交给 90° 朝向（另一 foot）去生成，避免组内自相重叠。
+    if (oL < oW) return cells;
+    const side = oL + oW;
+    const nb = Math.floor(spanL / side);
+    const mb = Math.floor(spanW / side);
+    if (nb <= 0 || mb <= 0) return cells;
+    const ox0 = (spanL - nb * side) / 2;
+    const oz0 = (spanW - mb * side) / 2;
+    for (let a = 0; a < mb; a++) {
+      for (let b = 0; b < nb; b++) {
+        const bx = ox0 + b * side, bz = oz0 + a * side;
+        // 经典 4 箱风车：长边/短边交替绕中心旋转，组内无重叠、无悬空
+        cells.push({ x: bx,       z: bz,       w: oL, d: oW, rot: false, row: a, col: b });
+        cells.push({ x: bx + oL,  z: bz,       w: oW, d: oL, rot: true,  row: a, col: b });
+        cells.push({ x: bx + oW,  z: bz + oL,  w: oL, d: oW, rot: false, row: a, col: b });
+        cells.push({ x: bx,       z: bz + oW,  w: oW, d: oL, rot: true,  row: a, col: b });
       }
-      total += n;
     }
-    return total;
+    return cells;
+  }
+
+  function patternCells(kind, oL, oW, spanL, spanW) {
+    if (kind === 'interlock') return cellsInterlock(oL, oW, spanL, spanW);
+    if (kind === 'pinwheel')  return cellsPinwheel(oL, oW, spanL, spanW);
+    return cellsColumn(oL, oW, spanL, spanW);
   }
 
   function patternPerLayer(foot, pL, pW, oh, kind) {
     const [oL, oW] = foot;
-    if (kind === 'column')    return perLayerColumn(oL, oW, pL, pW, oh);
-    if (kind === 'interlock') return perLayerInterlock(oL, oW, pL, pW, oh);
-    if (kind === 'pinwheel')  return perLayerPinwheel(oL, oW, pL, pW, oh);
-    // auto: 取三种最大
+    const spanL = pL + 2 * oh, spanW = pW + 2 * oh;
+    if (kind === 'column' || kind === 'interlock' || kind === 'pinwheel')
+      return patternCells(kind, oL, oW, spanL, spanW).length;
+    // auto: 取三种最大（数量相同则保持原偏好顺序）
     return Math.max(
-      perLayerColumn(oL, oW, pL, pW, oh),
-      perLayerInterlock(oL, oW, pL, pW, oh),
-      perLayerPinwheel(oL, oW, pL, pW, oh)
+      patternCells('column',    oL, oW, spanL, spanW).length,
+      patternCells('interlock', oL, oW, spanL, spanW).length,
+      patternCells('pinwheel',  oL, oW, spanL, spanW).length
     );
   }
   function bestPatternKind(foot, pL, pW, oh) {
     const [oL, oW] = foot;
-    const c = perLayerColumn(oL, oW, pL, pW, oh);
-    const i = perLayerInterlock(oL, oW, pL, pW, oh);
-    const p = perLayerPinwheel(oL, oW, pL, pW, oh);
+    const spanL = pL + 2 * oh, spanW = pW + 2 * oh;
+    const c = patternCells('column',    oL, oW, spanL, spanW).length;
+    const i = patternCells('interlock', oL, oW, spanL, spanW).length;
+    const p = patternCells('pinwheel',  oL, oW, spanL, spanW).length;
     if (p >= c && p >= i) return 'pinwheel';
     if (i >= c) return 'interlock';
     return 'column';
@@ -174,34 +221,33 @@
 
   function evalPallet(carton, pallet, containerInteriorH, opt) {
     opt = opt || {};
-    const oh = (opt.overhang || 0);          // mm
+    const oh = Math.max(0, opt.overhang || 0);  // mm，允许的托盘边缘溢出量
     const maxStack = (opt.cartonMaxStack && opt.cartonMaxStack >= 1) ? opt.cartonMaxStack : Infinity;
-    const kindSel = opt.pattern || 'auto';   // auto | column | interlock | pinwheel
+    const kindSel = opt.pattern || 'auto';      // auto | column | interlock | pinwheel
     const L = carton.outer.l, W = carton.outer.w, H = carton.outer.h;
+    const spanL = pallet.L + 2 * oh, spanW = pallet.W + 2 * oh;
 
-    // 两种基础朝向：0°(L沿托盘长) 与 90°(W沿托盘长)
+    // 两种基础朝向：0°(L 沿托盘长) 与 90°(W 沿托盘长)
     const feet = [[L, W], [W, L]];
     let best = null;
     for (const foot of feet) {
       const [oL, oW] = foot;
-      const perLayerAll = (kindSel === 'auto')
-        ? patternPerLayer(foot, pallet.L, pallet.W, oh, 'auto')
-        : patternPerLayer(foot, pallet.L, pallet.W, oh, kindSel);
-      const kind = (kindSel === 'auto')
-        ? bestPatternKind(foot, pallet.L, pallet.W, oh)
-        : kindSel;
-      if (perLayerAll > 0 && (!best || perLayerAll > best.perLayer)) {
-        // 落地的列/行数（用于 3D 可视化）
-        const cols = Math.floor((pallet.L + 2 * oh) / oL);
-        const rows = Math.floor((pallet.W + 2 * oh) / oW);
+      const kind = (kindSel === 'auto') ? bestPatternKind(foot, pallet.L, pallet.W, oh) : kindSel;
+      const cells = patternCells(kind, oL, oW, spanL, spanW);
+      if (cells.length > 0 && (!best || cells.length > best.perLayer)) {
         best = {
-          oL, oW, perLayer: perLayerAll, kind,
-          cols, rows,
+          oL, oW, perLayer: cells.length, kind, cells,
           rot90: (foot[0] === W) // 90° 朝向
         };
       }
     }
-    if (!best) return { perLayer: 0, layers: 0, perPallet: 0, palletHeight: pallet.baseH, palletWeight: 0, pattern: '—', patternType: 'column', oL: L, oW: W, cols: 0, rows: 0 };
+    if (!best) {
+      return {
+        perLayer: 0, layers: 0, perPallet: 0, palletHeight: pallet.baseH, palletWeight: 0,
+        pattern: '—', patternType: 'column', rot90: false,
+        oL: L, oW: W, cols: 0, rows: 0, cells: [], spanX: spanL, spanZ: spanW
+      };
+    }
 
     const availH = containerInteriorH - pallet.baseH;
     let layers = Math.max(1, Math.floor(availH / H));
@@ -214,7 +260,10 @@
     return {
       perLayer: best.perLayer, layers, perPallet, palletHeight, palletWeight,
       pattern: patternLabel, patternType: best.kind,
-      oL: best.oL, oW: best.oW, cols: best.cols, rows: best.rows
+      rot90: best.rot90, orientation: (best.rot90 ? '90°' : '0°'),
+      cells: best.cells, spanX: spanL, spanZ: spanW,
+      oL: best.oL, oW: best.oW,
+      cols: Math.floor(spanL / best.oL), rows: Math.floor(spanW / best.oW)
     };
   }
 
@@ -337,7 +386,7 @@
   }
 
   function setHighlightB(view, mesh) {
-    if (view.hlEdge) { view.group.remove(view.hlEdge); view.hlEdge.geometry.dispose(); view.hlEdge.material.dispose(); view.hlEdge = null; }
+    resetHighlightB(view);
     if (!mesh) return;
     const g = new THREE.EdgesGeometry(mesh.geometry);
     const m = new THREE.LineBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.95 });
@@ -414,11 +463,50 @@
     view.indicator.add(label);
   }
 
-  function clearGroup(g) { while (g.children.length) g.remove(g.children[0]); }
+  // Dispose every renderable under a group. `clearGroup` alone only detaches
+  // meshes — their BufferGeometry/Material stay on the GPU as leaked objects,
+  // which is exactly what made old candidate geometry linger across switches.
+  function disposeObj(obj) {
+    if (!obj) return;
+    if (obj.geometry && typeof obj.geometry.dispose === 'function') obj.geometry.dispose();
+    if (obj.material) {
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      mats.forEach(m => {
+        if (!m) return;
+        if (m.map && typeof m.map.dispose === 'function') m.map.dispose();
+        if (typeof m.dispose === 'function') m.dispose();
+      });
+    }
+  }
+  function clearGroup(g) {
+    while (g.children.length) {
+      const child = g.children[0];
+      // children may be nested Groups (container/stack wrappers)
+      if (child.children && child.children.length)
+        child.traverse(o => { if (o !== child) disposeObj(o); });
+      disposeObj(child);
+      g.remove(child);
+    }
+  }
+
+  // Drop hover highlight + hover state before redrawing, so a highlight ring
+  // belonging to the previous candidate can never survive a selection switch.
+  function resetHighlightB(view) {
+    if (!view) return;
+    if (view.hlEdge) {
+      if (view.hlEdge.parent) view.hlEdge.parent.remove(view.hlEdge);
+      disposeObj(view.hlEdge);
+      view.hlEdge = null;
+    }
+  }
 
   // Ground grid (matches Mode A's mesh floor/wireframe look) — sized to the object.
   function setGroundGrid(view, span, baseY) {
-    if (view.grid) { view.scene.remove(view.grid); view.grid.geometry.dispose(); view.grid.material.dispose(); view.grid = null; }
+    if (view.grid) {
+      if (view.grid.parent) view.grid.parent.remove(view.grid);
+      disposeObj(view.grid);
+      view.grid = null;
+    }
     const size = Math.max(span, 1) * 1.25;
     const grid = new THREE.GridHelper(size, Math.max(4, Math.round(size / 2)), 0x888888, 0xcccccc);
     grid.position.y = baseY;
@@ -427,6 +515,7 @@
   }
 
   function drawCarton(view, cand) {
+    resetHighlightB(view);            // stale hover ring from previous candidate
     const g = view.group; clearGroup(g);
     const o = cand.carton.outer, inner = cand.carton.inner;
     const ox = o.l * S, oy = o.h * S, oz = o.w * S; // scene Y = height
@@ -481,8 +570,10 @@
     view.renderer.render(view.scene, view.camera);
   }
 
-  function drawPallet(view, cand) {
-    const g = view.group; clearGroup(g);
+  // Draw ONE unit load (pallet + cartons) into a fresh Group positioned at y.
+  // Every box position comes from `pl.cells` — the very same layout the
+  // algorithm counted — so the view can never disagree with perLayer/rows/cols.
+  function buildUnitLoad(cand, g) {
     const p = cand.pallet, pl = cand.palletLoad;
     const baseX = p.L * S, baseY = p.baseH * S, baseZ = p.W * S;
     // wooden base
@@ -498,67 +589,67 @@
     );
     slats.position.y = baseY + baseY * 0.18;
     g.add(slats);
-    // carton stacking — 显式 cols×rows 计算后精确居中，箱子永不溢出托盘
+
     const L = cand.carton.outer.l, W = cand.carton.outer.w, H = cand.carton.outer.h;
     const oh = (cand.overhang || 0);
-    const spanX = p.L + 2 * oh, spanZ = p.W + 2 * oh;
-    const kind = pl.patternType || 'column';
-    const L_along_X = (pl.pattern === '0°');  // 0°=外箱 L 沿托盘 X
-    const bOL = L_along_X ? L : W;             // 基础朝向：X 方向尺寸 (mm)
-    const bOW = L_along_X ? W : L;             // 基础朝向：Z 方向尺寸 (mm)
-    const bXStep = bOL * S, bZStep = bOW * S;
-    const bCols = Math.max(0, Math.floor(spanX / bOL));
-    const bRows = Math.max(0, Math.floor(spanZ / bOW));
-    const bStartX = bCols > 0 ? -bCols * bXStep / 2 + bXStep / 2 : 0;
-    const bStartZ = bRows > 0 ? -bRows * bZStep / 2 + bZStep / 2 : 0;
-    const halfSpanXS = spanX * S / 2;
+    // span 以托盘中心为原点；cells 坐标原点在 span 左下角，故减去半 span。
+    const spanX = (pl.spanX != null ? pl.spanX : p.L + 2 * oh) * S;
+    const spanZ = (pl.spanZ != null ? pl.spanZ : p.W + 2 * oh) * S;
+    const originX = -spanX / 2, originZ = -spanZ / 2;
     const cy = H * S;
-    for (let ly = 0; ly < pl.layers; ly++) {
-      for (let r = 0; r < bRows; r++) {
-        // 默认基础朝向；pinwheel 奇数行 90° 旋转
-        let rowXStep = bXStep, rowZStep = bZStep, rowCols = bCols, rowStartX = bStartX;
-        if (kind === 'pinwheel' && (r % 2)) {
-          const altOL = bOW;
-          const altXStep = altOL * S;
-          const altCols = Math.max(0, Math.floor(spanX / altOL));
-          if (altCols <= 0) continue;
-          rowXStep = altXStep;
-          rowZStep = bOL * S;
-          rowCols = altCols;
-          rowStartX = -altCols * altXStep / 2 + altXStep / 2;
-        }
-        // interlock 偶数行错位半箱
-        const rowShift = (kind === 'interlock' && (r % 2)) ? rowXStep / 2 : 0;
-        let x = rowStartX + rowShift;
-        for (let c = 0; c < rowCols; c++) {
-          // 右边界检查防止错位后溢出
-          if (x + rowXStep / 2 > halfSpanXS + 0.001) break;
-          const col3 = PALETTE[(ly * 31 + r * 17 + c * 7) % PALETTE.length];
-          const m = new THREE.Mesh(
-            new THREE.BoxGeometry(rowXStep * 0.96, cy * 0.96, rowZStep * 0.96),
-            new THREE.MeshLambertMaterial({ color: col3 })
-          );
-          const z = bStartZ + r * bZStep;
-          m.position.set(x, baseY + cy / 2 + ly * cy, z);
-          m.userData = {
-            pickable: true,
-            z: baseY + ly * cy,
-            name: '外箱', dims: [L, W, H],
-            weight: cand.carton.boxWeight,
-            layer: ly + 1, row: r + 1, col: c + 1,
-            boxColor: col3
-          };
-          g.add(m);
-          x += rowXStep;
-        }
-      }
+    const cells = pl.cells || [];
+    const layerCount = pl.layers;
+    for (let ly = 0; ly < layerCount; ly++) {
+      cells.forEach((cell, ci) => {
+        const w = cell.w * S, d = cell.d * S;
+        const col3 = PALETTE[(ly * 31 + ci * 7) % PALETTE.length];
+        const m = new THREE.Mesh(
+          new THREE.BoxGeometry(w * 0.96, cy * 0.96, d * 0.96),
+          new THREE.MeshLambertMaterial({ color: col3 })
+        );
+        m.position.set(
+          originX + (cell.x + cell.w / 2) * S,
+          baseY + cy / 2 + ly * cy,
+          originZ + (cell.z + cell.d / 2) * S
+        );
+        m.userData = {
+          pickable: true,
+          z: baseY + ly * cy,
+          name: '外箱',
+          dims: [cell.rot ? W : L, cell.rot ? L : W, H],
+          weight: cand.carton.boxWeight,
+          layer: ly + 1, row: (cell.row != null ? cell.row : 0) + 1,
+          col: (cell.col != null ? cell.col : ci) + 1,
+          boxColor: col3
+        };
+        g.add(m);
+      });
     }
-    const totalH = baseY + pl.layers * cy;
-    g.position.y = -totalH / 2; // center vertically
-    view.userData.size = { dx: baseX, dy: totalH, dz: baseZ };
-    frameCamera(view, Math.max(baseX, baseZ, totalH));
-    updateIndicator(view, baseX / 2, totalH / 2, baseZ / 2);
-    setGroundGrid(view, Math.max(baseX, baseZ), -totalH / 2);
+    return baseY + layerCount * cy; // unit height (base + cartons)
+  }
+
+  function drawPallet(view, cand) {
+    resetHighlightB(view);            // drop any stale hover ring first
+    const g = view.group; clearGroup(g);
+    const pl = cand.palletLoad;
+    const ct = cand.cont || { stack: 1 };
+    const stack = Math.max(1, Math.min(2, ct.stack || 1));
+    const unitH = buildUnitLoad(cand, g);
+
+    // Double-stacked pallets: render the upper unit as a second full unit load
+    // sitting directly on top of the first, offset vertically by the unit height.
+    if (stack === 2) {
+      const upper = new THREE.Group();
+      upper.position.y = unitH;
+      g.add(upper);
+      buildUnitLoad(cand, upper);
+    }
+    const totalH = unitH * stack;
+    g.position.y = -totalH / 2; // center the whole stack vertically
+    view.userData.size = { dx: (cand.pallet.L + 2 * (cand.overhang || 0)) * S, dy: totalH, dz: (cand.pallet.W + 2 * (cand.overhang || 0)) * S };
+    frameCamera(view, Math.max(view.userData.size.dx, view.userData.size.dz, totalH));
+    updateIndicator(view, view.userData.size.dx / 2, totalH / 2, view.userData.size.dz / 2);
+    setGroundGrid(view, Math.max(view.userData.size.dx, view.userData.size.dz), -totalH / 2);
     view.renderer.render(view.scene, view.camera);
   }
 
@@ -571,17 +662,18 @@
   }
 
   function ensureScenes() {
-    if (state.scenes) return;
+    if (state.scenes) return true;
     if (!window.THREE) {            // Three.js not loaded yet / failed
-      console.warn('[PalletOptimizer] THREE not available — 3D disabled');
-      return;
+      return false;
     }
     const cartonCanvas = document.getElementById('carton3dCanvas');
     const palletCanvas = document.getElementById('pallet3dCanvas');
+    if (!cartonCanvas || !palletCanvas) return false;
     state.scenes = {
       carton: makeScene(cartonCanvas),
       pallet: makeScene(palletCanvas)
     };
+    return true;
   }
 
   // Continuous render loop — REQUIRED so OrbitControls drag actually repaints
@@ -613,6 +705,36 @@
     if (state.rafId != null) { cancelAnimationFrame(state.rafId); state.rafId = null; }
   }
 
+  // Draw the currently selected candidate into BOTH viewports.
+  // Returns false (and arms pendingDraw) when scenes aren't ready yet, so a
+  // mode/candidate switch during Three.js boot can never paint an empty scene
+  // or keep the previous candidate's geometry on screen.
+  function drawSelected() {
+    if (!state.selected) return false;
+    if (!state.scenes) { state.pendingDraw = true; return false; }
+    drawCarton(state.scenes.carton, state.selected);
+    drawPallet(state.scenes.pallet, state.selected);
+    state.pendingDraw = false;
+    return true;
+  }
+
+  // Ensure scenes exist; if THREE isn't ready, defer drawing until 'three-ready'.
+  function scheduleDraw() {
+    if (!state.selected) return;
+    if (ensureScenes()) { drawSelected(); return; }
+    state.pendingDraw = true;
+    if (!state.readyListener) {
+      state.readyListener = () => {
+        state.readyListener = null;
+        if (!ensureScenes()) return;
+        resizeScenes();
+        drawSelected();
+        if (state.bActive) startLoop();
+      };
+      window.addEventListener('three-ready', state.readyListener, { once: true });
+    }
+  }
+
   function resizeScenes() {
     if (!state.scenes) return;
     ['carton', 'pallet'].forEach(k => {
@@ -624,14 +746,25 @@
       v.renderer.setSize(w, h, false);
     });
     if (state.selected) {
-      drawCarton(state.scenes.carton, state.selected);
-      drawPallet(state.scenes.pallet, state.selected);
+      // Preserve the user's current orbit across a window resize: redraw the
+      // geometry from the selected candidate, then put the camera back.
+      const cams = ['carton', 'pallet'].map(k => {
+        const c = state.scenes[k].camera;
+        return { pos: c.position.clone(), tgt: state.scenes[k].controls.target.clone() };
+      });
+      drawSelected();
+      ['carton', 'pallet'].forEach((k, i) => {
+        const v = state.scenes[k];
+        v.camera.position.copy(cams[i].pos);
+        v.controls.target.copy(cams[i].tgt);
+        v.controls.update();
+      });
     }
   }
 
   // Reset a single Mode B viewport camera to its framed default (mirrors Mode A resetView)
   function resetViewB(which) {
-    if (!state.scenes) return;
+    if (!state.scenes) return scheduleDraw();
     if (!state.selected) return;
     if (which === 'carton') drawCarton(state.scenes.carton, state.selected);
     else if (which === 'pallet') drawPallet(state.scenes.pallet, state.selected);
@@ -675,17 +808,18 @@
     }
     const fillCls = ct.fill >= 0.7 ? 'good' : (ct.fill >= 0.5 ? '' : 'warn');
     const patternName = p.patternType==='interlock'?_t('bPatternInterlock'):p.patternType==='pinwheel'?_t('bPatternPinwheel'):_t('bPatternColumn');
+    const orient = (p.orientation || (p.rot90 ? '90°' : '0°'));
     el.innerHTML = `
       <h4>${_t('bBestPlan')} · ${co.name} / ${pl.name}</h4>
       <div class="result-row"><span>${_t('bOuterDim')}</span><span class="val">${Math.round(c.outer.l)}×${Math.round(c.outer.w)}×${Math.round(c.outer.h)} mm</span></div>
-      <div class="result-row"><span>${_t('bOuterLayout')}</span><span class="val">${c.nx}×${c.ny}×${c.nz} (内 ${Math.round(c.inner.l)}×${Math.round(c.inner.w)}×${Math.round(c.inner.h)})</span></div>
+      <div class="result-row"><span>${_t('bOuterLayout')}</span><span class="val">${c.nx}×${c.ny}×${c.nz} (${_t('bInnerTag')} ${Math.round(c.inner.l)}×${Math.round(c.inner.w)}×${Math.round(c.inner.h)})</span></div>
       <div class="result-row"><span>${_t('bBoxWt')}</span><span class="val">${c.boxWeight.toFixed(2)} kg</span></div>
-      <div class="result-row"><span>${_t('bPerLayer')}</span><span class="val">${p.layers} ${_t('wordLayer')} × ${p.perLayer} ${_t('wordBox')} (${patternName})</span></div>
-      <div class="result-row"><span>${_t('bPatternMode')}</span><span class="val">${patternName}</span></div>
+      <div class="result-row"><span>${_t('bPerLayer')}</span><span class="val">${p.layers} ${_t('wordLayer')} × ${p.perLayer} ${_t('wordBox')} (${patternName}, ${orient})</span></div>
+      <div class="result-row"><span>${_t('bPatternMode')}</span><span class="val">${patternName} · ${orient}</span></div>
       <div class="result-row"><span>${_t('bOverStack')}</span><span class="val">${(cand.overhang||0)}mm / ${isFinite(cand.cartonMaxStack)?cand.cartonMaxStack+_t('wordLayer'):'∞'}</span></div>
       <div class="result-row"><span>${_t('bPerPallet')}</span><span class="val">${p.perPallet} ${_t('wordBox')}</span></div>
       <div class="result-row"><span>${_t('bPalletH')}</span><span class="val">${Math.round(p.palletHeight)} mm</span></div>
-      <div class="result-row"><span>${_t('bContPallets')}</span><span class="val">${ct.totalPallets} (堆叠 ${ct.stack}×, ${ct.orientation})</span></div>
+      <div class="result-row"><span>${_t('bContPallets')}</span><span class="val">${ct.totalPallets} (${_t('bStackTag')} ${ct.stack}×, ${ct.orientation})</span></div>
       <div class="result-row"><span>${_t('bTotalBoxes')}</span><span class="val">${ct.totalBoxes} ${_t('wordBox')}</span></div>
       <div class="result-row good"><span>${_t('bTotalPCS')}</span><span class="val">${ct.totalPCS.toLocaleString()} PCS</span></div>
       <div class="result-row ${fillCls}"><span>${_t('bFillRate')}</span><span class="val">${fillPct}%</span></div>
@@ -718,12 +852,13 @@
       return bs.join('<br>');
     };
     let rows = '';
+    const selIdx = state.selectedIndex;
     list.forEach((cand, i) => {
       const ct = cand.cont, c = cand.carton;
-      rows += `<tr data-idx="${i}" class="${i === 0 ? 'selected' : ''}">
+      rows += `<tr data-idx="${i}" class="${i === selIdx ? 'selected' : ''}">
         <td>${i + 1}${badgeFor(i) ? `<div class="badge-cell">${badgeFor(i)}</div>` : ''}</td>
         <td>${Math.round(c.outer.l)}×${Math.round(c.outer.w)}×${Math.round(c.outer.h)}</td>
-        <td>${cand.palletLoad.perLayer}×${cand.palletLoad.layers}</td>
+        <td>${cand.palletLoad.layers}×${cand.palletLoad.perLayer}</td>
         <td>${cand.palletLoad.perPallet}</td>
         <td>${ct.totalPallets}</td>
         <td>${ct.totalPCS.toLocaleString()}</td>
@@ -744,15 +879,16 @@
   function selectCandidate(idx) {
     const cand = state.candidates[idx];
     if (!cand) return;
+    // Single source of truth: record the selection, then let every panel and
+    // both viewports read from state.selected. This is what keeps the Top-10
+    // table, summary and 3D views in lockstep after candidate/mode/i18n swaps.
     state.selected = cand;
+    state.selectedIndex = idx;
     document.querySelectorAll('#bTop10 tr[data-idx]').forEach(tr => {
       tr.classList.toggle('selected', parseInt(tr.getAttribute('data-idx'), 10) === idx);
     });
     renderSummary(cand);
-    if (state.scenes) {
-      drawCarton(state.scenes.carton, cand);
-      drawPallet(state.scenes.pallet, cand);
-    }
+    scheduleDraw();
   }
 
   // =====================================================================
@@ -804,15 +940,34 @@
            <div class="hint">${_t('bOverHint')}</div>
          </div>`;
       document.getElementById('bTop10').innerHTML = '';
-      state.candidates = []; state.selected = null;
+      clearSelection();
       return;
     }
     state.candidates = res.candidates;
+    state.selectedIndex = -1;
     renderTop10(res.candidates);
     if (res.candidates.length) {
       selectCandidate(0);
     } else {
+      clearSelection();
       document.getElementById('bSummary').innerHTML = '<div class="empty-state">' + _t('bNoPlan') + '</div>';
+    }
+  }
+
+  // Drop any previous selection and wipe both viewports so an empty result set
+  // cannot leave the geometry of the last computed candidate on screen.
+  function clearSelection() {
+    state.candidates = [];
+    state.selected = null;
+    state.selectedIndex = -1;
+    state.pendingDraw = false;
+    if (state.scenes) {
+      resetHighlightB(state.scenes.carton);
+      resetHighlightB(state.scenes.pallet);
+      clearGroup(state.scenes.carton.group);
+      clearGroup(state.scenes.pallet.group);
+      state.scenes.carton.renderer.render(state.scenes.carton.scene, state.scenes.carton.camera);
+      state.scenes.pallet.renderer.render(state.scenes.pallet.scene, state.scenes.pallet.camera);
     }
   }
 
@@ -829,21 +984,16 @@
       b.style.display = 'grid';
       btnB.classList.add('active'); btnA.classList.remove('active');
       state.bActive = true;
-      if (!window.THREE) {
-        // Three.js not ready yet — build the scenes as soon as it loads,
-        // so an early Mode B click still gets a working 3D.
-        window.addEventListener('three-ready', () => showMode('B'), { once: true });
-        return;
-      }
-      ensureScenes();
+      // If THREE isn't ready, scheduleDraw() will redraw the CURRENT selection
+      // once 'three-ready' fires — no bounce through showMode('B') needed, and
+      // no risk of painting an empty scene in the meantime.
+      if (!ensureScenes()) { scheduleDraw(); return; }
       // canvases need a frame to get client size
       requestAnimationFrame(() => {
+        if (!state.bActive) return;
         resizeScenes();
-        if (state.selected) {
-          drawCarton(state.scenes.carton, state.selected);
-          drawPallet(state.scenes.pallet, state.selected);
-        }
-        startLoop();   // robust: restarts on every B entry, never double-spawns
+        drawSelected();   // redraws state.selected (never a stale/blank scene)
+        startLoop();      // robust: restarts on every B entry, never double-spawns
       });
     } else {
       b.style.display = 'none';

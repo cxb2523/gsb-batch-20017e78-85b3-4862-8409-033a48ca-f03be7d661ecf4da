@@ -7,7 +7,10 @@
     "start": "node server.js",
     "dev": "node server.js",
     "version:sync": "node scripts/gen-version.js",
-    "test:set-load": "node scripts/test-set-load.js"
+    "test:set-load": "node scripts/test-set-load.js",
+    "test:modeb": "node scripts/test-modeb-consistency.js",
+    "test:browser": "node scripts/browser-smoke.js",
+    "test": "node scripts/test-modeb-consistency.js && node scripts/test-set-load.js"
   },
   "dependencies": {
     "express": "^4.18.2"

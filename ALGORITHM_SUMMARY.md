@@ -180,14 +180,21 @@ allowInvert       是否允许倒置（当前实际只影响注释，Z 锁定时
 5. 去重（外尺寸相同）、按外体积升序，保留前 24 个候选。
 
 ### Stage 2 — 外箱 → 托盘单元载 `evalPallet`
+排布由**唯一的布局函数 `patternCells(kind, oL, oW, spanL, spanW)`** 生成，返回每层
+`cells[]`（每箱 `{x,z,w,d,rot}`，mm 坐标），`perLayer = cells.length`。3D 视图逐 cell
+绘制，摘要在同一份 `cells` 上取数 —— 因此「视图箱数 / 层数 / 朝向」与「摘要 / Top10」
+不可能再出现两套算法各算一套的偏差。
+
 ```
-c0  = floor(pallet.L/L) × floor(pallet.W/W)      // 0° 摆放每层箱数
-c90 = floor(pallet.L/W) × floor(pallet.W/L)      // 90° 摆放
-perLayer = max(c0, c90);  pattern = (c0>=c90)?'0°':'90°'
-availH   = containerInteriorH - pallet.baseH     // 托盘高度占用后的可用高
-layers   = max(1, floor(availH / H))             // 可堆叠层数
-perPallet= perLayer × layers
-palletWeight = perPal 箱 × 单箱毛重
+spanL = pallet.L + 2×overhang;  spanW = pallet.W + 2×overhang
+column    : floor(spanL/oL) × floor(spanW/oW)               // 规则阵列，整体居中
+interlock : 奇数行错位 oL/2；整行含错位量居中，绝不越出 span
+pinwheel  : 以 (oL+oW) 为边长铺 4 箱一组，组内 90° 交替旋转，无重叠 / 无悬空
+两种朝向 foot = (oL,oW) = (L,W) 或 (W,L)，取向取 perLayer 更大的那个
+perLayer  = cells.length;  rot90 = 该朝向的 90° 标注
+availH    = containerInteriorH - pallet.baseH
+layers    = max(1, floor(availH / H))，再被 cartonMaxStack 封顶
+perPallet = perLayer × layers;  palletWeight = perPallet × 单箱毛重
 ```
 
 ### Stage 3 — 托盘块 → 海运箱 `evalContainer`
@@ -211,10 +218,17 @@ if (totalWeight > container.maxPayload) return null   // 港口限重剪枝
 - 按 `totalPCS` 降序取 **Top 10** 候选，展示在左侧列表供选择。
 
 ### 3D 可视化（Mode B 双视口）
+- 「选中方案」是唯一数据源：`state.selected` + `state.selectedIndex`。切换候选、A↔B、中英切换、窗口缩放都只从 `state.selected` 重绘，绝不复用旧闭包或「第 0 行」。
 - 左视口「外箱拼箱透视」：半透明玻璃箱 + 内部分格产品块（`nx×ny×nz`），按 SKU 调色板 `PALETTE` 着色。
-- 右视口「托盘打托堆叠」：木托盘底座 + 按 `pattern`、`layers` 摆放的堆叠箱阵。
+- 右视口「托盘打托堆叠」：逐 `cells[]` 绘制（与算法计数同源），朝向 / 交错错位 / 风车旋转严格落在 `span = 托盘 + 2×overhang` 内；`cont.stack=2` 时绘制两层单元载（底托 + 上托），而非只画一层。
 - 两视口均有：默认网格地面（`GridHelper`，按物体尺寸自适应）、方向标（AxesHelper + 绿色 UP 箭头 + UP 文字）、OrbitControls 旋转、复位视角、PNG 导出（`preserveDrawingBuffer:true`）。
+- 每次重绘先 `resetHighlightB()` 释放旧高亮框，`clearGroup()` 对每个 mesh 的 geometry/material 调用 `dispose()`，避免切换候选残留上一次方案的几何体。
 - 渲染循环用 `rafId` 守卫的 `startLoop/stopLoop`，解决 A↔B 切换时循环卡死问题。
+- Three.js 未就绪时不画空场景：`scheduleDraw()` 置 `pendingDraw` 并监听 `three-ready`，就绪后按 `state.selected` 补绘。
+
+### 回归测试
+- `npm run test:modeb` — Node + 最小 DOM/THREE 垫片，覆盖布局/算法一致性、切换候选释放、A↔B、缩放、中英切换、overhang=20、maxStack、无方案/超重负向分支、stack=2 视图、THREE 延迟绘制、真实 app.js 联合 i18n 链路。
+- `npm run test:browser` — 真实无头 Chromium（Chrome/Edge）+ CDP 冒烟，验证 WebGL 页面无运行时异常且视图/摘要/表格锁定同一选中项。
 
 ---
 
