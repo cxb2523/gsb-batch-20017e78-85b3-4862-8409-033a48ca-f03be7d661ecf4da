@@ -16,6 +16,7 @@ interface UseVoiceOutputReturn {
   stop: () => void
   pause: () => void
   resume: () => void
+  replayLast: () => void
   voices: SpeechSynthesisVoice[]
   selectedVoice: SpeechSynthesisVoice | null
   setVoice: (voice: SpeechSynthesisVoice) => void
@@ -36,6 +37,14 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
   const speakQueueRef = useRef<{ text: string; options?: SpeakOptions }[]>([])
   const speakingRef = useRef(false)
   const synthRef = useRef<SpeechSynthesis | null>(null)
+  // Bumped on every stop()/disable. Utterance callbacks capture the current
+  // generation and ignore themselves if it has moved on — this neutralizes
+  // late onend/onerror/onstart events that browsers fire after cancel().
+  const generationRef = useRef(0)
+  // The most recent single item that actually started (or was interrupted
+  // mid-play). replayLast() replays only this, never the whole queue.
+  const lastPlayedRef = useRef<{ text: string; options?: SpeakOptions } | null>(null)
+  const enabledRef = useRef(enabled)
 
   const isSupported =
     typeof window !== 'undefined' && 'speechSynthesis' in window
@@ -47,6 +56,8 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
 
     const item = speakQueueRef.current.shift()!
     speakingRef.current = true
+    lastPlayedRef.current = item
+    const generation = generationRef.current
 
     const utterance = new SpeechSynthesisUtterance(item.text)
     if (selectedVoiceRef.current) utterance.voice = selectedVoiceRef.current
@@ -54,8 +65,12 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
     utterance.pitch = item.options?.pitch ?? 1
     utterance.volume = 1
 
-    utterance.onstart = () => setStatus('speaking')
+    utterance.onstart = () => {
+      if (generation !== generationRef.current) return
+      setStatus('speaking')
+    }
     utterance.onend = () => {
+      if (generation !== generationRef.current) return
       speakingRef.current = false
       if (speakQueueRef.current.length > 0) {
         processQueue()
@@ -64,27 +79,38 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
       }
     }
     utterance.onerror = () => {
+      if (generation !== generationRef.current) return
       speakingRef.current = false
       setStatus('idle')
     }
-    utterance.onpause = () => setStatus('paused')
-    utterance.onresume = () => setStatus('speaking')
+    utterance.onpause = () => {
+      if (generation !== generationRef.current) return
+      setStatus('paused')
+    }
+    utterance.onresume = () => {
+      if (generation !== generationRef.current) return
+      setStatus('speaking')
+    }
 
     utteranceRef.current = utterance
     synth.speak(utterance)
   }, [])
 
   const speak = useCallback((text: string, options?: SpeakOptions) => {
-    if (!isSupported || !enabled || !text.trim()) return
+    if (!isSupported || !enabledRef.current || !text.trim()) return
     speakQueueRef.current.push({ text, options })
     processQueue()
-  }, [isSupported, enabled, processQueue])
+  }, [isSupported, processQueue])
 
   const stop = useCallback(() => {
+    // Invalidate callbacks of any in-flight utterance BEFORE cancel(), so the
+    // asynchronous onend/onerror the browser still delivers are ignored.
+    generationRef.current += 1
     const synth = synthRef.current
     if (synth) synth.cancel()
     speakQueueRef.current = []
     speakingRef.current = false
+    utteranceRef.current = null
     setStatus('idle')
   }, [])
 
@@ -98,16 +124,35 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
     if (synth) synth.resume()
   }, [])
 
+  const replayLast = useCallback(() => {
+    if (!isSupported || !enabledRef.current) return
+    const last = lastPlayedRef.current
+    if (!last || !last.text.trim()) return
+    // Interrupt whatever is playing, then replay only this single item —
+    // the rest of the old queue stays cleared.
+    stop()
+    speakQueueRef.current.push({ text: last.text, options: last.options })
+    processQueue()
+  }, [isSupported, stop, processQueue])
+
   const setVoice = useCallback((voice: SpeechSynthesisVoice) => {
+    // Only affects utterances created after this call; the currently
+    // speaking utterance keeps its original voice.
     selectedVoiceRef.current = voice
     setSelectedVoiceState(voice)
     try { localStorage.setItem(VOICE_STORAGE_KEY, voice.voiceURI) } catch {}
   }, [])
 
   const setEnabledWrapped = useCallback((v: boolean) => {
+    enabledRef.current = v
     setEnabled(v)
     try { localStorage.setItem('friday_voice_output_enabled', String(v)) } catch {}
-  }, [])
+    if (!v) {
+      // Disabling is an immediate interrupt: cancel current utterance and
+      // drop everything queued. Re-enabling never auto-replays.
+      stop()
+    }
+  }, [stop])
 
   useEffect(() => {
     if (!isSupported) return
@@ -143,7 +188,7 @@ export function useVoiceOutput(): UseVoiceOutputReturn {
 
   return {
     isSupported, enabled, setEnabled: setEnabledWrapped,
-    status, speak, stop, pause, resume,
+    status, speak, stop, pause, resume, replayLast,
     voices, selectedVoice, setVoice,
   }
 }
