@@ -16,7 +16,9 @@ export default class YoutubeVideo extends Component {
         this.element = null;
         this.player = null;
         this.ready = false;
+        this.destroyed = false;
         this.authorizedOnce = false;
+        this.authorizationTimeout = null;
         this.options = {
             controls: 0,
             showInfo: 0,
@@ -60,21 +62,64 @@ export default class YoutubeVideo extends Component {
     }
 
     componentWillUnmount() {
+        this.destroyed = true;
         window.removeEventListener('resize', this.onResize);
-        this.player.destroy();
+        this.cancelAuthorizationCheck();
+        this.loop.stop();
+
+        if (this.player) {
+            this.player.destroy();
+        }
+
+        this.player = null;
     }
 
     componentDidUpdate(prevProps) {
-        const { time, playing, volume } = this.props;
+        const { src, time, playing, volume } = this.props;
+
+        if (volume !== prevProps.volume) {
+            this.setVolume(volume);
+        }
+
+        // Re-enter the unloaded state for the new source and ignore room
+        // controls until the YouTube player signals it is ready again.
+        if (src !== prevProps.src) {
+            this.resetOnSourceChange(prevProps);
+
+            return;
+        }
+
+        if (!this.ready) {
+            return;
+        }
 
         if (playing !== prevProps.playing) {
             playing ? this.play(time) : this.pause(time);
         } else if (time !== prevProps.time) {
             this.seek(time);
         }
+    }
 
-        if (volume !== prevProps.volume) {
-            this.setVolume(volume);
+    resetOnSourceChange(prevProps = this.props) {
+        this.ready = false;
+        this.authorizedOnce = false;
+        this.cancelAuthorizationCheck();
+        this.loop.stop();
+
+        if (prevProps.loaded) {
+            this.props.setLoaded(false);
+        }
+    }
+
+    // Catch up with the room state broadcast while the new video was loading.
+    reconcile() {
+        const { playing, time } = this.props;
+
+        if (playing) {
+            this.play(time);
+        } else {
+            this.pause(time);
+            this.seek(time);
         }
     }
 
@@ -83,6 +128,10 @@ export default class YoutubeVideo extends Component {
     }
 
     play(time) {
+        if (!this.ready || this.destroyed) {
+            return;
+        }
+
         if (this.player.getPlayerState() !== 1) {
             this.seek(time);
             this.player.playVideo();
@@ -91,6 +140,10 @@ export default class YoutubeVideo extends Component {
     }
 
     pause(time) {
+        if (!this.ready || this.destroyed) {
+            return;
+        }
+
         if (this.player.getPlayerState() !== 2) {
             this.cancelAuthorizationCheck();
             this.player.pauseVideo();
@@ -99,12 +152,16 @@ export default class YoutubeVideo extends Component {
     }
 
     stop() {
+        if (!this.ready || this.destroyed) {
+            return;
+        }
+
         this.cancelAuthorizationCheck();
         this.player.stopVideo();
     }
 
     seek(time) {
-        if (typeof time === 'number' && this.ready) {
+        if (typeof time === 'number' && this.ready && !this.destroyed) {
             this.player.seekTo(time);
 
             if (!this.props.playing) {
@@ -115,11 +172,13 @@ export default class YoutubeVideo extends Component {
     }
 
     setVolume(volume) {
-        this.player.setVolume(volume * 100);
+        if (this.player) {
+            this.player.setVolume(volume * 100);
+        }
     }
 
     schedulAuthtorizationCheck() {
-        if (!this.authorizedOnce) {
+        if (!this.authorizedOnce && !this.destroyed) {
             this.authorizationTimeout = setTimeout(this.checkAuthorization, 2000);
         }
     }
@@ -131,6 +190,10 @@ export default class YoutubeVideo extends Component {
     }
 
     checkAuthorization() {
+        if (this.destroyed || !this.player) {
+            return;
+        }
+
         this.cancelAuthorizationCheck();
 
         if (this.player.getPlayerState() === 1) {
@@ -154,21 +217,30 @@ export default class YoutubeVideo extends Component {
     }
 
     onResize() {
-        if (this.ready) {
+        if (this.ready && !this.destroyed) {
             this.player.setSize(window.innerWidth, window.innerHeight);
         }
     }
 
     onReady() {
+        if (this.destroyed) {
+            return;
+        }
+
         this.ready = true;
         this.props.setName(this.player.getVideoData().title);
         this.props.setLoaded(true);
         this.setVolume(this.props.volume);
         this.onDurationChange();
         this.loop.start();
+        this.reconcile();
     }
 
     onStateChange(event) {
+        if (this.destroyed) {
+            return;
+        }
+
         switch (event.data) {
             case YT.PlayerState.ENDED:
                 // this.loop.stop();

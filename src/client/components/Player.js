@@ -12,7 +12,12 @@ import Showtime from '@client/common/Showtime';
 class Player extends Component {
     static propTypes = {
         source: PropTypes.string.isRequired,
+        url: PropTypes.string,
         setShowtime: PropTypes.func.isRequired,
+    };
+
+    static defaultProps = {
+        url: null,
     };
 
     constructor(props) {
@@ -42,6 +47,14 @@ class Player extends Component {
 
     setTimeline(timeline) {
         this.timeline = timeline;
+    }
+
+    componentDidUpdate(prevProps) {
+        // The source changed: drop the previous timeline progress and buffer
+        // display immediately, before the new video reports any metadata.
+        if (this.props.url !== prevProps.url && this.timeline) {
+            this.timeline.reset();
+        }
     }
 
     onTimeUpdate() {
@@ -127,6 +140,7 @@ class Player extends Component {
 export default connect(
     state => ({
         source: state.player.source,
+        url: state.player.url,
     }),
     dispatch => ({
         setShowtime: showtime => dispatch(setShowtime(showtime)),

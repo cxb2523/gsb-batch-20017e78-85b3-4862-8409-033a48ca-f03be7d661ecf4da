@@ -30,9 +30,9 @@ export default class Loop {
 
     cancelFrame() {
         if (this.interval !== null) {
-            window.cancelAnimationFrame(this.frame);
-        } else {
             clearTimeout(this.frame);
+        } else {
+            window.cancelAnimationFrame(this.frame);
         }
 
         this.frame = null;
@@ -40,9 +40,9 @@ export default class Loop {
 
     requestFrame() {
         if (this.interval !== null) {
-            this.frame = window.requestAnimationFrame(this.update);
-        } else {
             this.frame = setTimeout(this.update, this.interval);
+        } else {
+            this.frame = window.requestAnimationFrame(this.update);
         }
     }
 

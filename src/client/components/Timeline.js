@@ -27,6 +27,15 @@ export default class Timeline extends Component {
         this.container = container;
     }
 
+    reset() {
+        this.setState({
+            time: '',
+            duration: '',
+            loaded: [],
+            played: 0,
+        });
+    }
+
     setTime(time, duration) {
         this.setState({
             played: this.formetPercent(time, duration),

@@ -94,12 +94,28 @@ const initialState = {
     fromServer: false,
     time: 0,
     showtime: false,
+    sources: [],
 };
 
 const inititalSubtitleState = {
     url: null,
     label: null,
 };
+
+// Reset every playback-related piece of state when a new source is loaded,
+// so duration, progress, buffer and readiness of the previous video never
+// leak into the next one (see PLAYER_LOAD_* reducers below).
+function resetVideoState(state) {
+    return {
+        ...state,
+        duration: null,
+        loaded: false,
+        authorized: true,
+        playing: false,
+        time: 0,
+        sources: [],
+    };
+}
 
 // REDUCERS
 
@@ -125,49 +141,39 @@ export default function player(state = initialState, action) {
     switch (type) {
         case PLAYER_LOAD_FROM_FILE:
             return {
-                ...state,
+                ...resetVideoState(state),
                 url: payload.url,
-                sources: [],
                 name: payload.name,
                 type: payload.type,
                 source: payload.source,
                 fromServer: false,
-                playing: false,
-                time: 0,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
         case PLAYER_LOAD_FROM_YOUTUBE:
             return {
-                ...state,
+                ...resetVideoState(state),
                 url: payload.url,
-                sources: [],
                 source: payload.source,
                 fromServer: false,
-                playing: false,
-                time: 0,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
         case PLAYER_LOAD_FROM_URL:
             return {
-                ...state,
+                ...resetVideoState(state),
                 url: payload.url,
-                sources: [],
                 name: payload.name,
                 type: payload.type,
                 source: payload.source,
                 fromServer: false,
-                playing: false,
-                time: 0,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
         case PLAYER_LOAD_FROM_SERVER:
             return {
-                ...state,
+                ...resetVideoState(state),
                 url: payload.url,
-                sources: [],
                 name: payload.name,
                 source: payload.source,
                 fromServer: true,

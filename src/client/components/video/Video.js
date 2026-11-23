@@ -51,16 +51,49 @@ export default class Video extends Component {
     get buffered() { return this.element.buffered; }
 
     componentDidUpdate(prevProps) {
-        const { time, playing, volume } = this.props;
+        const { src, time, playing, volume } = this.props;
+
+        if (volume !== prevProps.volume) {
+            this.element.volume = this.props.volume;
+        }
+
+        // A new source means the previous element state (time, buffer,
+        // readiness) is stale: go back to the unloaded state and ignore
+        // every room control until the new source can play.
+        if (src !== prevProps.src) {
+            this.resetOnSourceChange(prevProps);
+
+            return;
+        }
+
+        if (!this.ready) {
+            return;
+        }
 
         if (playing !== prevProps.playing) {
             playing ? this.play(time) : this.pause(time);
         } else if (time !== prevProps.time) {
             this.seek(time);
         }
+    }
 
-        if (volume !== prevProps.volume) {
-            this.element.volume = this.props.volume;
+    resetOnSourceChange(prevProps = this.props) {
+        this.ready = false;
+
+        if (prevProps.loaded) {
+            this.props.setLoaded(false);
+        }
+    }
+
+    // Once the new source is playable, catch up with the room state that
+    // was broadcast while the video was still loading.
+    reconcile() {
+        const { playing, time } = this.props;
+
+        if (playing) {
+            this.play(time);
+        } else {
+            this.pause(time);
         }
     }
 
@@ -73,6 +106,10 @@ export default class Video extends Component {
     }
 
     play(time) {
+        if (!this.ready) {
+            return;
+        }
+
         this.seek(time);
 
         let promise = null;
@@ -91,6 +128,10 @@ export default class Video extends Component {
     }
 
     pause(time) {
+        if (!this.ready) {
+            return;
+        }
+
         this.element.pause();
         this.seek(time);
     }
@@ -100,7 +141,7 @@ export default class Video extends Component {
     }
 
     seek(time) {
-        if (typeof time === 'number') {
+        if (this.ready && typeof time === 'number') {
             this.element.currentTime = time;
         }
     }
@@ -118,19 +159,21 @@ export default class Video extends Component {
     }
 
     onLoadStart() {
+        this.ready = false;
+
         if (this.props.loaded) {
             this.props.setLoaded(false);
         }
     }
 
     onCanPlay() {
+        this.ready = true;
+
         if (!this.props.loaded) {
             this.props.setLoaded(true);
-
-            if (this.props.time > this.element.currentTime) {
-                this.seek(this.props.time);
-            }
         }
+
+        this.reconcile();
     }
 
     onCanPlayThrough() {
