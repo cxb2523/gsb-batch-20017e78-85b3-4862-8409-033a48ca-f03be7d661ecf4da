@@ -5,6 +5,192 @@ if (false) {
 
 var loadingBool = true;
 var loadingNum = 0;
+
+// ---------------------------------------------------------------------------
+// 加载页收尾共享状态
+//
+// 「资源加载进度」(cc.loader.onProgress) 与「场景启动」(EVENT_AFTER_SCENE_LAUNCH)
+// 两条链路，以及 ads.js 的 noAdGoToScene 跳转路径，都通过这里的 finish() 收尾。
+//
+// finish() 是幂等的：第一条链路先到就完成遮罩隐藏、进度节点移除、定时器清理，
+// 后到的链路直接忽略，因此：
+//   - 进度多次触发 100% 不会重复移除 loadingText；
+//   - 场景先启动 / 进度先满 100% 都能把遮罩清干净，不留下残留；
+//   - 收尾之后任何进度回调都会被忽略，不会向已销毁的 loadingText 写入。
+// ---------------------------------------------------------------------------
+var daxiguaLoading = window.__daxiguaLoading = window.__daxiguaLoading || (function() {
+    var state = {
+        finished: false,           // 加载页是否已完成收尾
+        progressReached100: false, // 进度是否已经到过 100%
+        sceneLaunched: false,      // 场景是否已经真正启动
+        textRemoved: false,        // loadingText 是否已处理过，避免重复移除
+        timer: null,               // 进度满 100% 后延时收尾的定时器
+        progressOwner: null,       // 当前挂在 cc.loader.onProgress 上的回调
+        finishReason: null
+    };
+
+    function getTextNode() {
+        return typeof document === 'undefined' ? null : document.getElementById('loadingText');
+    }
+
+    function getSplashNode() {
+        return typeof document === 'undefined' ? null : document.getElementById('splash');
+    }
+
+    function getLoadingImgNode() {
+        return typeof document === 'undefined' ? null : document.getElementById('loadingImg');
+    }
+
+    function clearLoadingTimers() {
+        // index.html 中模拟进度的定时器
+        if (window.timer != null) {
+            clearInterval(window.timer);
+            window.timer = null;
+        }
+        if (state.timer != null) {
+            clearTimeout(state.timer);
+            state.timer = null;
+        }
+    }
+
+    function hideSplash() {
+        var splash = getSplashNode();
+        if (splash && splash.style) {
+            splash.style.display = 'none';
+        }
+    }
+
+    function removeLoadingText() {
+        if (state.textRemoved) {
+            return;
+        }
+        var node = getTextNode();
+        if (node) {
+            if (node.parentNode && typeof node.parentNode.removeChild === 'function') {
+                node.parentNode.removeChild(node);
+            } else if (typeof node.remove === 'function') {
+                node.remove();
+            } else if (node.style) {
+                node.style.display = 'none';
+            }
+        }
+        // loading.gif 若还未被 index.html 的定时器移除，也一并清掉，避免残留
+        var img = getLoadingImgNode();
+        if (img && img.parentNode && typeof img.parentNode.removeChild === 'function') {
+            img.parentNode.removeChild(img);
+        }
+        // 无论节点原本是否存在，之后都不再允许任何进度回调写入
+        state.textRemoved = true;
+        loadingBool = false;
+    }
+
+    function detachProgress() {
+        if (state.progressOwner && typeof cc !== 'undefined' && cc.loader &&
+            cc.loader.onProgress === state.progressOwner) {
+            cc.loader.onProgress = null;
+        }
+        state.progressOwner = null;
+    }
+
+    function finish(reason) {
+        if (state.finished) {
+            return false;
+        }
+        state.finished = true;
+        state.finishReason = reason || 'unknown';
+        loadingBool = false;
+        clearLoadingTimers();
+        hideSplash();
+        removeLoadingText();
+        detachProgress();
+        return true;
+    }
+
+    function handleProgress(completedCount, totalCount, item) {
+        // 场景已启动 / 加载页已收尾 / 100% 已处理过：忽略后续进度
+        if (state.finished || !loadingBool || state.progressReached100) {
+            return;
+        }
+
+        loadingNum++;
+
+        var completed = Number(completedCount);
+        var total = Number(totalCount);
+        if (!isFinite(completed) || completed < 0) {
+            completed = 0;
+        }
+        if (!isFinite(total) || total < 0) {
+            total = 0;
+        }
+
+        var data = (typeof window !== 'undefined' && window.loadData) || null;
+        if (data) {
+            data.completedCount = completed;
+            data.totalCount = total;
+        }
+
+        // totalCount 为 0 时不能做除法，否则 percent 会得到 NaN / Infinity
+        if (total <= 0) {
+            return;
+        }
+
+        var percent = 100 * completed / total;
+        // 保留原有的 totalCount > 1 门槛：避免单个资源的首批回调就误判为全部加载完成，
+        // 提前露出还没渲染好的画面。真正的收尾兜底由场景启动链路负责。
+        if (!isFinite(percent) || percent < 100 || total <= 1) {
+            return;
+        }
+
+        // 第一次到达 100% 才处理：立即停止进度写入与模拟进度定时器，
+        // 文字先更新为 100%，再沿用原有的短延时统一收尾。延时期间即使
+        // 回调再次触发，也会被上面的 progressReached100 提前拦截，不会重复移除。
+        state.progressReached100 = true;
+        loadingBool = false;
+        clearLoadingTimers();
+
+        var textNode = getTextNode();
+        if (textNode) {
+            textNode.innerHTML = 'loading......100%';
+        }
+        state.timer = setTimeout(function() {
+            state.timer = null;
+            finish('progress');
+        }, 100);
+    }
+
+    function handleSceneLaunched() {
+        state.sceneLaunched = true;
+        // 无论进度是否曾到达 100%，场景启动后都必须清掉遮罩与进度节点
+        finish('scene');
+    }
+
+    function attachProgress(handler) {
+        if (state.finished) {
+            // 加载页已经收尾，不再挂载任何进度回调，避免清理后又被重新写入/显示
+            if (typeof cc !== 'undefined' && cc.loader) {
+                cc.loader.onProgress = null;
+            }
+            state.progressOwner = null;
+            return;
+        }
+        state.progressOwner = handler;
+        if (typeof cc !== 'undefined' && cc.loader) {
+            cc.loader.onProgress = handler;
+        }
+    }
+
+    return {
+        state: state,
+        finish: finish,
+        handleProgress: handleProgress,
+        handleSceneLaunched: handleSceneLaunched,
+        attachProgress: attachProgress,
+        isFinished: function() {
+            return state.finished;
+        }
+    };
+})();
+
 window.boot = function() {
 
     var settings = window._CCSettings;
@@ -67,55 +253,29 @@ window.boot = function() {
         var splash = document.getElementById('splash');
         // var progressBar = splash.querySelector('.progress-bar span');
 
-
-
-        cc.loader.onProgress = function(completedCount, totalCount, item) {
-
-            loadData.completedCount = completedCount;
-            loadData.totalCount = totalCount;
-
-            if (loadingBool) {
-                var loadintT = document.getElementById("loadingText")
+        // 加载页已收尾（例如 ads 跳转路径先完成）时，不再重新显示遮罩或挂回进度回调
+        if (daxiguaLoading.isFinished()) {
+            if (splash) {
+                splash.style.display = 'none';
             }
-            var percent = 100 * completedCount / totalCount;
-            if (loadingBool && loadingNum >= 1 && totalCount > 1) {
-                if (percent.toFixed(0) >= 100) {
-                    loadintT.innerHTML = 'loading......100' + '%';
-                    setTimeout(function() {
-                        loadingBool = false;
-                        loadintT.remove();
-                    }, 0.1 * 1000);
-                    clearInterval(timer);
-                }
-            }
-            loadingNum++;
-            // if(loadingBool){
-            // 	var loadintT = document.getElementById("loadingText")
-            // }
-            // var percent = 100 * completedCount / totalCount;
-            // if(loadingBool && loadingNum >= 1){
-            // 	   console.log("dskpi",loadingNum);
-            // 	   loadintT.innerHTML = 'loading......' + parseInt(percent)  + '%';
-            // 	   if(percent.toFixed(0) >= 100){
+            return;
+        }
 
-            // 		   loadingBool = false;
-            // 		   loadintT.remove();
-            // 	   }
-            // }
-            // loadingNum ++;
-
-            // var percent = 100 * completedCount / totalCount;
-            // if (progressBar) {
-            // progressBar.style.width = percent.toFixed(2) + '%';
-            // }
-
-
+        var onProgress = function(completedCount, totalCount, item) {
+            daxiguaLoading.handleProgress(completedCount, totalCount, item);
         };
-        splash.style.display = 'block';
+
+        // 通过共享状态挂载，若加载页已收尾则不会再把回调装回 cc.loader
+        daxiguaLoading.attachProgress(onProgress);
+
+        if (splash) {
+            splash.style.display = 'block';
+        }
         // progressBar.style.width = '0%';
 
         cc.director.once(cc.Director.EVENT_AFTER_SCENE_LAUNCH, function() {
-            splash.style.display = 'none';
+            // 场景真正启动：无论进度是否曾到过 100%，都由共享状态统一收尾
+            daxiguaLoading.handleSceneLaunched();
         });
     }
 
