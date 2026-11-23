@@ -1,0 +1,168 @@
+from agent.llm import chat as llm_chat
+from config import MAX_ITERATIONS, get_system_prompt
+from core.executor import Executor
+from core.logger import info
+from core.memory import get_memory_manager
+from core.planner import Planner
+from core.registry import get_tool_definitions, get_tool_map
+from core.security import get_approval_registry, get_permission_manager
+from core.system1 import build_default_system1
+
+_system1 = None
+
+
+def _get_system1():
+    global _system1
+    if _system1 is None:
+        _system1 = build_default_system1()
+    return _system1
+
+
+_TRANSIENT_ERRORS = ["timeout", "not found", "connection", "rate limit"]
+
+_DESKTOP_GOAL_MARKERS = (
+    "organiz",
+    "organise",
+    "clean up",
+    "tidy",
+    "declutter",
+    "desktop",
+    "arrange window",
+    "manage my apps",
+    "close window",
+    "focus window",
+    "open app",
+)
+
+
+def _is_desktop_goal(goal: str) -> bool:
+    lowered = goal.lower()
+    return any(marker in lowered for marker in _DESKTOP_GOAL_MARKERS)
+
+
+def _desktop_context() -> str:
+    try:
+        from core.computer import get_computer_control
+
+        summary = get_computer_control().desktop_summary()
+        windows = [w["title"] for w in summary.get("windows", [])][:15]
+        return (
+            "CURRENT DESKTOP STATE\n"
+            f"- Platform: {summary['available'].get('platform')}\n"
+            f"- Mouse/keyboard: {'yes' if summary['available'].get('mouse_keyboard') else 'no'}\n"
+            f"- Window management: {'yes' if summary['available'].get('window_management') else 'no'}\n"
+            f"- Open windows: {', '.join(windows) if windows else 'none detected'}\n"
+            "Use desktop_summary, list_windows, open_app, focus_window, close_app to organize."
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"Desktop snapshot unavailable: {e}"
+
+
+class Agent:
+    def __init__(self, language="english", persona=None, confirm_enabled=True):
+        self.language = language
+        self.persona = persona
+        self.confirm_enabled = confirm_enabled
+        get_permission_manager().set_interactive(confirm_enabled)
+        self.messages = self._build_messages()
+        self._tool_defs = get_tool_definitions()
+        tool_map = get_tool_map()
+        self._planner = Planner(llm_chat, tool_definitions=self._tool_defs)
+        self._executor = Executor(llm_chat, tool_map)
+        self._output_dir: str | None = None
+
+    def resolve_approval(self, request_id: str, allowed: bool) -> bool:
+        return get_approval_registry().resolve(request_id, allowed)
+
+    def _build_messages(self):
+        base = get_system_prompt(self.language)
+        if self.persona:
+            try:
+                from core.persona import get_persona_prompt
+
+                persona_text = get_persona_prompt(self.persona)
+                base = persona_text + "\n\n" + base
+            except ImportError:
+                pass
+        return [{"role": "system", "content": base}]
+
+    @property
+    def output_dir(self) -> str | None:
+        return self._output_dir
+
+    def set_output_dir(self, path: str | None):
+        self._output_dir = path
+        self._executor.output_dir = path
+
+    def set_language(self, lang):
+        self.language = lang
+        self.clear()
+
+    def clear(self):
+        self.messages = self._build_messages()
+
+    def run(self, user_input: str):
+        self._executor.output_dir = self._output_dir
+
+        memory = get_memory_manager()
+        context = memory.inject_context(user_input)
+        if context:
+            enhanced = get_system_prompt(self.language) + "\n\n" + context
+            self.messages.append({"role": "system", "content": enhanced})
+        self.messages.append({"role": "user", "content": user_input})
+
+        fast = _get_system1().route(user_input)
+        if fast:
+            yield {"type": "fast", "reflex": fast["reflex"], "content": fast["content"]}
+            yield {"type": "done", "content": fast["content"], "final": True}
+            return
+
+        plan = self._planner.create_plan(user_input, context=self.messages)
+        info(f"Plan created: {len(plan)} tasks", tasks=[t.description for t in plan])
+
+        yield {"type": "plan", "tasks": [t.to_dict() for t in plan]}
+
+        for task in plan:
+            yield {"type": "task_start", "task": task.to_dict()}
+            info(f"Executing task: {task.id} - {task.description}")
+
+            for event in self._executor.execute_task(task, self.messages, self._tool_defs, MAX_ITERATIONS):
+                yield event
+
+            if task.status == "failed" and task.retries < task.max_retries:
+                err = (task.error or "").lower()
+                if any(x in err for x in _TRANSIENT_ERRORS):
+                    info(f"Retrying task: {task.id} (attempt {task.retries}/{task.max_retries})")
+                    for event in self._executor.retry_task(task, self.messages, self._tool_defs):
+                        yield event
+
+            yield {"type": "task_done", "task": task.to_dict()}
+
+        last = self.messages[-1] if self.messages else {}
+        final = last.get("content", "") if last.get("role") == "assistant" else ""
+
+        if final:
+            memory.store_conversation_memory(user_input, final)
+
+        yield {"type": "done", "content": final or "Done.", "final": True}
+
+    def run_autopilot(self, goal: str, workspace: str | None = None):
+        """Run a goal through the Autopilot loop (plan -> ordered steps -> verify).
+
+        Yields executor events interleaved with ``autopilot`` orchestration
+        events for the brain-view UI.
+        """
+        from core.autopilot import Autopilot
+
+        context = list(self.messages)
+        if _is_desktop_goal(goal):
+            context.append({"role": "system", "content": _desktop_context()})
+
+        auto = Autopilot(
+            planner=self._planner,
+            llm_provider=llm_chat,
+            tool_map=get_tool_map(),
+            tool_definitions=get_tool_definitions(),
+            workspace=workspace or self._output_dir,
+        )
+        yield from auto.run(goal, context=context)

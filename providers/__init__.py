@@ -1,0 +1,15 @@
+import providers.ollama  # noqa: F401 — registers itself via registry
+import providers.openai_compat  # noqa: F401 — registers openai/openrouter via registry
+from config.providers import get_active_provider, get_provider_config
+from providers.registry import get_provider_class, list_providers
+
+
+def get_provider(name: str | None = None):
+    from core.blackout import resolve_provider
+
+    name = resolve_provider(name)
+    if name is None:
+        name = get_active_provider()
+    cls = get_provider_class(name)
+    cfg = get_provider_config(name)
+    return cls(cfg)

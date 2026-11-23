@@ -1,0 +1,322 @@
+import { useEffect, useRef, useState } from 'react'
+import type { MarketplacePlugin, CustomTool } from '../../core/api'
+import { getPlugins, installPlugin, uninstallPlugin, getCustomTools, createCustomTool, deleteCustomTool, getPrivacyStatus, setPrivacy } from '../../core/api'
+
+interface SettingsPanelProps {
+  onClose: () => void
+  voiceOutputEnabled: boolean
+  onToggleVoiceOutput: () => void
+  voiceLanguage: string
+  onCycleLanguage: () => void
+  wakeWordActive: boolean
+  onToggleWakeWord: () => void
+  camActive: boolean
+  onToggleCamera: () => void
+  backendOnline: boolean
+  calendarAuth: string
+  emailAuth: string
+  onGoogleConnect: () => void
+  persona: string
+  onSetPersona: (key: string) => void
+}
+
+export function SettingsPanel({
+  onClose,
+  voiceOutputEnabled,
+  onToggleVoiceOutput,
+  voiceLanguage,
+  onCycleLanguage,
+  wakeWordActive,
+  onToggleWakeWord,
+  camActive,
+  onToggleCamera,
+  backendOnline,
+  calendarAuth,
+  emailAuth,
+  onGoogleConnect,
+  persona,
+  onSetPersona,
+}: SettingsPanelProps) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [plugins, setPlugins] = useState<MarketplacePlugin[] | null>(null)
+  const [pluginMsg, setPluginMsg] = useState('')
+  const [customTools, setCustomTools] = useState<CustomTool[] | null>(null)
+  const [toolDesc, setToolDesc] = useState('')
+  const [toolMsg, setToolMsg] = useState('')
+  const [toolBusy, setToolBusy] = useState(false)
+  const [blackout, setBlackout] = useState(false)
+
+  useEffect(() => {
+    getPlugins().then(setPlugins).catch(() => setPlugins([]))
+    getCustomTools().then(setCustomTools).catch(() => setCustomTools([]))
+    getPrivacyStatus().then(s => setBlackout(s.enabled)).catch(() => {})
+  }, [])
+
+  const handleInstall = async (name: string) => {
+    const res = await installPlugin(name)
+    setPluginMsg(res.error || res.message || '')
+    setPlugins(await getPlugins().catch(() => []))
+  }
+
+  const handleUninstall = async (name: string) => {
+    const res = await uninstallPlugin(name)
+    setPluginMsg(res.error || res.message || '')
+    setPlugins(await getPlugins().catch(() => []))
+  }
+
+  const handleCreateTool = async () => {
+    if (!toolDesc.trim()) return
+    setToolBusy(true)
+    setToolMsg('')
+    const res = await createCustomTool(toolDesc)
+    setToolBusy(false)
+    if (res.error) setToolMsg(`Error: ${res.error}`)
+    else {
+      setToolMsg(`Built tool "${res.tool?.name}"`)
+      setToolDesc('')
+    }
+    setCustomTools(await getCustomTools().catch(() => []))
+  }
+
+  const handleDeleteTool = async (name: string) => {
+    await deleteCustomTool(name)
+    setCustomTools(await getCustomTools().catch(() => []))
+  }
+
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [onClose])
+
+  const toggleRow = (label: string, enabled: boolean, onToggle: () => void) => (
+    <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+      <span className="text-sm" style={{ color: '#ccc' }}>{label}</span>
+      <button
+        onClick={onToggle}
+        className="relative w-10 h-5 rounded-full transition-all"
+        style={{
+          background: enabled ? 'rgba(0,168,255,0.3)' : 'rgba(255,255,255,0.08)',
+          border: enabled ? '1px solid rgba(0,168,255,0.4)' : '1px solid rgba(255,255,255,0.1)',
+        }}
+      >
+        <span
+          className="absolute top-0.5 w-3.5 h-3.5 rounded-full transition-all"
+          style={{
+            left: enabled ? '22px' : '3px',
+            background: enabled ? '#00a8ff' : '#666',
+          }}
+        />
+      </button>
+    </div>
+  )
+
+  const statusBadge = (_label: string, ok: boolean) => (
+    <span
+      className="inline-block px-2 py-0.5 rounded text-[11px]"
+      style={{
+        background: ok ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+        color: ok ? '#4ade80' : '#f87171',
+      }}
+    >
+      {ok ? 'Connected' : 'Disconnected'}
+    </span>
+  )
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.6)' }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div
+        ref={ref}
+        className="w-[420px] max-h-[80vh] overflow-y-auto rounded-2xl glass"
+        style={{
+          border: '1px solid var(--glass-border)',
+          boxShadow: '0 25px 60px rgba(0,0,0,0.5)',
+        }}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 h-12 shrink-0" style={{ borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <span className="text-sm font-medium tracking-wide" style={{ color: '#e5e5e5' }}>Settings</span>
+          <button
+            onClick={onClose}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-sm transition-all hover:bg-white/[.05]"
+            style={{ color: '#888' }}
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="px-6 py-4 space-y-1">
+          {/* Section: Voice */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>VOICE</div>
+          {toggleRow('Voice Output', voiceOutputEnabled, onToggleVoiceOutput)}
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Language</span>
+            <button
+              onClick={onCycleLanguage}
+              className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+              style={{ color: '#00a8ff', border: '1px solid rgba(0,168,255,0.2)' }}
+            >
+              {voiceLanguage}
+            </button>
+          </div>
+          {toggleRow('Wake Word ("Hey Friday")', wakeWordActive, onToggleWakeWord)}
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Voice Personality</span>
+            <div className="flex gap-1">
+              {['friday', 'jarvis', 'cortana'].map(k => (
+                <button
+                  key={k}
+                  onClick={() => onSetPersona(k)}
+                  className="px-2.5 py-1 rounded-lg text-[11px] uppercase tracking-wider transition-all"
+                  style={{
+                    background: persona === k ? 'rgba(0,168,255,0.15)' : 'rgba(255,255,255,0.04)',
+                    border: persona === k ? '1px solid rgba(0,168,255,0.3)' : '1px solid rgba(255,255,255,0.06)',
+                    color: persona === k ? '#00a8ff' : '#888',
+                  }}
+                >
+                  {k}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Section: Input */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>INPUT</div>
+          {toggleRow('Gesture Control (Camera)', camActive, onToggleCamera)}
+
+          {/* Section: Connections */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>CONNECTIONS</div>
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Backend</span>
+            {statusBadge('backend', backendOnline)}
+          </div>
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Google Calendar</span>
+            {calendarAuth === 'authenticated' ? (
+              statusBadge('calendar', true)
+            ) : (
+              <button
+                onClick={onGoogleConnect}
+                className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+                style={{ color: '#00a8ff', border: '1px solid rgba(0,168,255,0.2)' }}
+              >
+                Connect
+              </button>
+            )}
+          </div>
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Google Email</span>
+            {emailAuth === 'authenticated' ? (
+              statusBadge('email', true)
+            ) : (
+              <button
+                onClick={onGoogleConnect}
+                className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+                style={{ color: '#00a8ff', border: '1px solid rgba(0,168,255,0.2)' }}
+              >
+                Connect
+              </button>
+            )}
+          </div>
+
+          {/* Section: Plugins */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>PLUGINS</div>
+          {pluginMsg && <div className="text-[11px] py-1" style={{ color: '#00a8ff' }}>{pluginMsg}</div>}
+          {plugins === null && <div className="text-xs py-3" style={{ color: '#666' }}>Loading…</div>}
+          {(plugins ?? []).map(p => (
+            <div key={p.name} className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+              <div className="min-w-0">
+                <span className="text-sm" style={{ color: '#ccc' }}>{p.name}</span>
+                {p.builtin && <span className="ml-2 text-[10px] uppercase tracking-wider" style={{ color: '#555' }}>builtin</span>}
+                {p.description && <div className="text-[11px] truncate" style={{ color: '#666' }}>{p.description}</div>}
+              </div>
+              {p.builtin ? (
+                <span className="text-[10px] uppercase tracking-wider" style={{ color: '#4ade80' }}>active</span>
+              ) : p.installed ? (
+                <button
+                  onClick={() => handleUninstall(p.name)}
+                  className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+                  style={{ color: '#f87171', border: '1px solid rgba(248,113,113,0.2)' }}
+                >
+                  Remove
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleInstall(p.name)}
+                  className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+                  style={{ color: '#00a8ff', border: '1px solid rgba(0,168,255,0.2)' }}
+                >
+                  Install
+                </button>
+              )}
+            </div>
+          ))}
+
+          {/* Section: Privacy */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>PRIVACY</div>
+          {toggleRow('Blackout Mode (local-only, no outbound)', blackout, () => {
+            setPrivacy(!blackout).then(s => setBlackout(s.enabled)).catch(() => {})
+          })}
+          {blackout && <div className="text-[11px] py-2" style={{ color: '#4ade80' }}>Local-only — network tools blocked, Ollama provider.</div>}
+
+          {/* Section: Custom Tools */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>CUSTOM TOOLS</div>
+          <div className="py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <textarea
+              value={toolDesc}
+              onChange={e => setToolDesc(e.target.value)}
+              placeholder="Describe a tool, e.g. 'a tool that downloads the latest image from a URL and saves it'"
+              rows={3}
+              className="w-full rounded-lg px-3 py-2 text-xs resize-none outline-none"
+              style={{ background: 'rgba(255,255,255,0.04)', color: '#ccc', border: '1px solid rgba(255,255,255,0.08)' }}
+            />
+            <button
+              onClick={handleCreateTool}
+              disabled={toolBusy || !toolDesc.trim()}
+              className="mt-2 px-3 py-1.5 rounded-lg text-xs transition-all disabled:opacity-40"
+              style={{ color: '#00a8ff', border: '1px solid rgba(0,168,255,0.2)' }}
+            >
+              {toolBusy ? 'Building…' : 'Build tool'}
+            </button>
+            {toolMsg && <div className="mt-2 text-[11px]" style={{ color: toolMsg.startsWith('Error') ? '#f87171' : '#4ade80' }}>{toolMsg}</div>}
+          </div>
+          {customTools !== null && customTools.length === 0 && (
+            <div className="text-[11px] py-2" style={{ color: '#666' }}>No custom tools yet.</div>
+          )}
+          {(customTools ?? []).map(t => (
+            <div key={t.name} className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+              <div className="min-w-0">
+                <span className="text-sm" style={{ color: '#ccc' }}>{t.name}</span>
+                <div className="text-[11px] truncate" style={{ color: '#666' }}>{t.description}</div>
+              </div>
+              <button
+                onClick={() => handleDeleteTool(t.name)}
+                className="px-3 py-1 rounded-lg text-xs transition-all hover:bg-white/[.05]"
+                style={{ color: '#f87171', border: '1px solid rgba(248,113,113,0.2)' }}
+              >
+                Delete
+              </button>
+            </div>
+          ))}
+
+          {/* Section: About */}
+          <div className="text-[10px] tracking-[0.15em] py-2" style={{ color: '#555' }}>ABOUT</div>
+          <div className="flex items-center justify-between py-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <span className="text-sm" style={{ color: '#ccc' }}>Theme</span>
+            <span className="text-xs" style={{ color: '#888' }}>Dark</span>
+          </div>
+          <div className="flex items-center justify-between py-3">
+            <span className="text-sm" style={{ color: '#ccc' }}>Version</span>
+            <span className="text-xs" style={{ color: '#666' }}>0.4</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
