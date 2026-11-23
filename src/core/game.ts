@@ -44,8 +44,17 @@ const useGame = () => {
   // 保存整个 "棋盘" 的每个格子状态（下标为格子起始点横纵坐标）
   let chessBoard: ChessBoardUnitType[][] = [];
 
-  // 操作历史（存储点击的块）
-  let opHistory: BlockType[] = [];
+  // 操作历史（存储点击的块），使用 ref 保证重赋值后外部拿到的引用仍同步
+  const opHistory = ref<BlockType[]>([]);
+
+  // 操作历史快照（按块 id 记录点击前的双向遮挡关系，用于撤回时精确恢复）
+  interface HistorySnapshot {
+    // 点击时该块压住的下层块列表
+    higherThanBlocks: BlockType[];
+    // 点击时压住该块的上层块列表（圣光/破坏强制点击被压块时可能非空）
+    lowerThanBlocks: BlockType[];
+  }
+  const historySnapshotMap = new Map<number, HistorySnapshot>();
 
   // region 技能相关
 
@@ -265,16 +274,36 @@ const useGame = () => {
       for (let j = minY; j < maxY; j++) {
         const relationBlocks = chessBoard[i][j].blocks;
         if (relationBlocks.length > 0) {
-          // 取当前位置最高层的块
-          const maxLevelRelationBlock =
-            relationBlocks[relationBlocks.length - 1];
-          // 排除自己
-          if (maxLevelRelationBlock.id === block.id) {
+          // 取当前位置最高层、且仍在棋盘上（未被点走/消除）的块
+          let maxLevelRelationBlock: BlockType | undefined;
+          for (let k = relationBlocks.length - 1; k >= 0; k--) {
+            if (
+              relationBlocks[k].status === 0 &&
+              relationBlocks[k].id !== block.id
+            ) {
+              maxLevelRelationBlock = relationBlocks[k];
+              break;
+            }
+          }
+          if (!maxLevelRelationBlock) {
             continue;
           }
           maxLevel = Math.max(maxLevel, maxLevelRelationBlock.level);
-          block.higherThanBlocks.push(maxLevelRelationBlock);
-          maxLevelRelationBlock.lowerThanBlocks.push(block);
+          // 避免重复建立遮挡关系
+          if (
+            !block.higherThanBlocks.some(
+              (relationBlock) => relationBlock.id === maxLevelRelationBlock!.id
+            )
+          ) {
+            block.higherThanBlocks.push(maxLevelRelationBlock);
+          }
+          if (
+            !maxLevelRelationBlock.lowerThanBlocks.some(
+              (relationBlock) => relationBlock.id === block.id
+            )
+          ) {
+            maxLevelRelationBlock.lowerThanBlocks.push(block);
+          }
         }
       }
     }
@@ -308,14 +337,29 @@ const useGame = () => {
         randomBlocksVal.value[randomIdx].length
       );
     } else {
-      // 非随机区才可撤回
-      opHistory.push(block);
-      // 移除覆盖关系
+      // 非随机区才可撤回：先快照点击前的双向遮挡关系
+      opHistory.value.push(block);
+      historySnapshotMap.set(block.id, {
+        higherThanBlocks: [...block.higherThanBlocks],
+        lowerThanBlocks: [...block.lowerThanBlocks],
+      });
+      // 移除该块的全部双向遮挡关系：
+      // 1. 它压住的下层块不再被它压
       block.higherThanBlocks.forEach((higherThanBlock) => {
         _.remove(higherThanBlock.lowerThanBlocks, (lowerThanBlock) => {
           return lowerThanBlock.id === block.id;
         });
       });
+      // 2. 压住它的上层块不再压住它（圣光/破坏强制点击被压块时尤其需要）
+      block.lowerThanBlocks.forEach((lowerThanBlock) => {
+        _.remove(lowerThanBlock.higherThanBlocks, (higherThanBlock) => {
+          return higherThanBlock.id === block.id;
+        });
+      });
+      // 双向关系已全部解除，块进入槽位期间不再持有任何遮挡引用，
+      // 撤回时通过 historySnapshotMap 中的快照恢复
+      block.higherThanBlocks = [];
+      block.lowerThanBlocks = [];
     }
     // 新元素加入插槽
     let tempSlotNum = currSlotNum.value;
@@ -348,7 +392,8 @@ const useGame = () => {
         // 已消除块数 +1
         clearBlockNum.value++;
         // 清除操作记录，防止撤回
-        opHistory = [];
+        opHistory.value = [];
+        historySnapshotMap.clear();
         return;
       }
       newSlotAreaVal[tempSlotNum++] = slotBlock;
@@ -368,10 +413,27 @@ const useGame = () => {
   };
 
   /**
-   * 开始游戏
+   * 开始游戏（重开时清空上一局的所有残留状态，保证干净一局）
    */
   const doStart = () => {
+    // 重置所有局内状态
     gameStatus.value = 0;
+    levelBlocksVal.value = [];
+    randomBlocksVal.value = [];
+    slotAreaVal.value = [];
+    currSlotNum.value = 0;
+    totalBlockNum.value = 0;
+    clearBlockNum.value = 0;
+    opHistory.value = [];
+    historySnapshotMap.clear();
+    isHolyLight.value = false;
+    canSeeRandom.value = false;
+    allBlocks.length = 0;
+    Object.keys(blockData).forEach((key) => {
+      delete blockData[Number(key)];
+    });
+    initChessBoard(boxWidthNum, boxHeightNum);
+
     const { levelBlocks, randomBlocks, slotArea } = initGame();
     console.log(levelBlocks, randomBlocks, slotArea);
     levelBlocksVal.value = levelBlocks;
@@ -428,20 +490,136 @@ const useGame = () => {
   /**
    * 撤回
    *
-   * @desc 后退一步
+   * @desc 后退一步：恢复块的双向遮挡关系与槽占用数。
+   * 消除发生时操作历史会被清空，因此消除后的操作无法撤回，规则保持不变。
    */
   const doRevert = () => {
-    if (opHistory.length < 1) {
+    if (opHistory.value.length < 1) {
       return;
     }
-    opHistory[opHistory.length - 1].status = 0;
-    genLevelRelation(slotAreaVal.value[currSlotNum.value - 1])
-    // @ts-ignore
-    slotAreaVal.value[currSlotNum.value - 1] = null;
+    const block = opHistory.value.pop()!;
+    const snapshot = historySnapshotMap.get(block.id);
+    // 从槽位移除该块并保持其余块紧凑排列
+    const slotIndex = slotAreaVal.value.findIndex(
+      (slotBlock) => slotBlock && slotBlock.id === block.id
+    );
+    if (slotIndex >= 0) {
+      slotAreaVal.value.splice(slotIndex, 1);
+      // @ts-ignore 槽位数组以 null 表示空槽
+      slotAreaVal.value.push(null);
+      // 该块仍在槽位中才回退占用数（理论上一定成立）
+      currSlotNum.value = Math.max(currSlotNum.value - 1, 0);
+    }
+    // 块恢复为未点击
+    block.status = 0;
+    if (snapshot) {
+      // 仅恢复当前仍在棋盘上（status=0）的关系块：
+      // 快照中的块若已被点入槽位或已消除，则不再实际参与遮挡，
+      // 不能让其继续压住/被压，否则会出现永久不可点或失效引用。
+      // 恢复它压住的下层块关系：下层块重新被该块压住
+      block.higherThanBlocks = snapshot.higherThanBlocks.filter(
+        (higherThanBlock) => higherThanBlock.status === 0
+      );
+      block.higherThanBlocks.forEach((higherThanBlock) => {
+        if (
+          !higherThanBlock.lowerThanBlocks.some(
+            (lowerThanBlock) => lowerThanBlock.id === block.id
+          )
+        ) {
+          higherThanBlock.lowerThanBlocks.push(block);
+        }
+      });
+      // 恢复压住它的上层块关系：该块重新被这些仍在棋盘上的上层块压住
+      block.lowerThanBlocks = snapshot.lowerThanBlocks.filter(
+        (lowerThanBlock) => lowerThanBlock.status === 0
+      );
+      block.lowerThanBlocks.forEach((lowerThanBlock) => {
+        if (
+          !lowerThanBlock.higherThanBlocks.some(
+            (higherThanBlock) => higherThanBlock.id === block.id
+          )
+        ) {
+          lowerThanBlock.higherThanBlocks.push(block);
+        }
+      });
+      historySnapshotMap.delete(block.id);
+    } else {
+      // 兜底：无快照时清空旧关系后按当前棋盘重建遮挡关系
+      block.higherThanBlocks = [];
+      block.lowerThanBlocks = [];
+      genLevelRelation(block);
+    }
+  };
+
+  /**
+   * 从棋盘上彻底摘除一个块的双向遮挡关系
+   * @param block
+   */
+  const detachBlockRelations = (block: BlockType) => {
+    // 它压住的下层块不再被它压
+    block.higherThanBlocks.forEach((higherThanBlock) => {
+      _.remove(higherThanBlock.lowerThanBlocks, (lowerThanBlock) => {
+        return lowerThanBlock.id === block.id;
+      });
+    });
+    // 压住它的上层块不再压住它
+    block.lowerThanBlocks.forEach((lowerThanBlock) => {
+      _.remove(lowerThanBlock.higherThanBlocks, (higherThanBlock) => {
+        return higherThanBlock.id === block.id;
+      });
+    });
+    block.higherThanBlocks = [];
+    block.lowerThanBlocks = [];
+  };
+
+  /**
+   * 在棋盘中寻找一个未被占用的格子坐标。
+   * 每个块占 3 x 3 个格子，因此候选坐标覆盖的 9 个格子都必须无在棋盘块，
+   * 否则两个块即使锚点不同也会在棋盘上发生重叠。
+   * 在棋盘块指未被点入槽位的块（status=0 活跃、status=2 已消除占位）；
+   * status=1 的块已在槽位中、不在棋盘。
+   * 注意：chessBoard 只记录块的锚点格，因此这里直接按每个在棋盘块的
+   * 3 x 3 实际占位计算，避免锚点不同但几何重叠。
+   * 找不到时返回 null（极端情况）
+   */
+  const findEmptyChessPos = (
+    selfBlock: BlockType
+  ): { x: number; y: number } | null => {
+    // 收集所有其他在棋盘块的 3 x 3 占位区间
+    const onBoardBlocks = allBlocks.filter(
+      (chessBlock) =>
+        chessBlock.id !== selfBlock.id &&
+        chessBlock.status !== 1 &&
+        typeof chessBlock.x === "number" &&
+        typeof chessBlock.y === "number"
+    );
+    const candidates: { x: number; y: number }[] = [];
+    for (let x = 0; x <= boxWidthNum - 3; x++) {
+      for (let y = 0; y <= boxHeightNum - 3; y++) {
+        let overlap = false;
+        for (const other of onBoardBlocks) {
+          const xOverlap = x < other.x + 3 && other.x < x + 3;
+          const yOverlap = y < other.y + 3 && other.y < y + 3;
+          if (xOverlap && yOverlap) {
+            overlap = true;
+            break;
+          }
+        }
+        if (!overlap) {
+          candidates.push({ x, y });
+        }
+      }
+    }
+    if (candidates.length === 0) {
+      return null;
+    }
+    return candidates[Math.floor(Math.random() * candidates.length)];
   };
 
   /**
    * 移出块
+   *
+   * @desc 把槽位第一个块放回棋盘，重建遮挡关系并保证坐标不与已有块重叠
    */
   const doRemove = () => {
     // 移除第一个块
@@ -449,20 +627,52 @@ const useGame = () => {
     if (!block) {
       return;
     }
-    // 槽移除块
-    for (let i = 0; i < slotAreaVal.value.length - 1; i++) {
-      slotAreaVal.value[i] = slotAreaVal.value[i + 1];
+    // 槽移除块并保持紧凑（splice 后补一个空槽，长度不变）
+    slotAreaVal.value.splice(0, 1);
+    // @ts-ignore 槽位数组以 null 表示空槽
+    slotAreaVal.value.push(null);
+    // 槽占用数回退
+    currSlotNum.value = Math.max(currSlotNum.value - 1, 0);
+    // 该块已离开槽位，其点击历史不能再用于撤回
+    const historyIndex = opHistory.value.findIndex(
+      (historyBlock) => historyBlock.id === block.id
+    );
+    if (historyIndex >= 0) {
+      opHistory.value.splice(historyIndex, 1);
+      historySnapshotMap.delete(block.id);
     }
-    // @ts-ignore
-    slotAreaVal.value[slotAreaVal.value.length - 1] = null;
-    // 改变新块的坐标
-    block.x = Math.floor(Math.random() * (boxWidthNum - 2));
-    block.y = boxHeightNum - 2;
+    // 从旧的棋盘格子中摘除（层级块被点走时仍保留在 chessBoard 中）
+    if (
+      typeof block.x === "number" &&
+      typeof block.y === "number" &&
+      chessBoard[block.x]?.[block.y]
+    ) {
+      _.remove(
+        chessBoard[block.x][block.y].blocks,
+        (chessBlock) => chessBlock.id === block.id
+      );
+    }
+    // 清理旧的双向遮挡关系（此时块仍是 status=1，寻找空位时不会被误判为在棋盘）
+    detachBlockRelations(block);
+    // 寻找不会落到其他在棋盘块上的新坐标（自身已排除）
+    const emptyPos = findEmptyChessPos(block);
+    if (emptyPos) {
+      block.x = emptyPos.x;
+      block.y = emptyPos.y;
+    } else {
+      // 兜底：随机坐标（棋盘被占满时几乎不会发生）
+      block.x = Math.floor(Math.random() * (boxWidthNum - 2));
+      block.y = Math.floor(Math.random() * (boxHeightNum - 2));
+    }
+    // 放回棋盘、恢复为在棋盘状态并重建遮挡关系
     block.status = 0;
-    // 移除的是随机块的元素，移到层级区域
-    if (block.level < 1) {
-      block.level = 10000;
-      levelBlocksVal.value.push(block);
+    chessBoard[block.x][block.y].blocks.push(block);
+    genLevelRelation(block);
+    // 随机区移回的块需要加入层级区域参与渲染与判定
+    if (
+      !levelBlocksVal.value.some((levelBlock) => levelBlock.id === block.id)
+    ) {
+      levelBlocksVal.value = [...levelBlocksVal.value, block];
     }
   };
 
