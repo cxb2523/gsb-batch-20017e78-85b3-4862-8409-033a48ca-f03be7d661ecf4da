@@ -28,11 +28,72 @@ body {
   align-items: center;
 }
 
+.loading-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  max-width: min(640px, 86vw);
+  text-align: center;
+  color: #f2f2f2;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .koi-loading {
   width: 100px;
   height: 100px;
-  transform-origin: "center";
+  transform-origin: center;
   animation: koi 2s infinite linear;
+}
+
+.loading-message:empty,
+.loading-detail:empty {
+  display: none;
+}
+
+.loading-overlay[data-state="error"] .koi-loading {
+  animation-play-state: paused;
+  opacity: 0.35;
+  width: 72px;
+  height: 72px;
+}
+
+.loading-overlay[data-state="error"] .loading-message {
+  color: #ff9d9d;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.loading-detail {
+  white-space: pre-line;
+  color: #d8d8d8;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12.5px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.loading-retry {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font: inherit;
+  padding: 8px 22px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.loading-retry:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.loading-retry[hidden] {
+  display: none;
 }
 
 @keyframes koi {

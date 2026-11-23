@@ -6,12 +6,13 @@
     <title>Japanese Garden</title>
   </head>
   <body>
-    <div class="loading-overlay">
-      <svg
-        class="koi-loading"
-        xmlns="http://www.w3.org/2000/svg"
-        viewBox="0 0 67.4 86.7"
-      >
+    <div class="loading-overlay" data-state="loading">
+      <div class="loading-content">
+        <svg
+          class="koi-loading"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 67.4 86.7"
+        >
         <defs />
         <defs>
           <style>
@@ -32,8 +33,12 @@
             />
             <path d="M19 65.8l.5-.3a2.2 2.2 0 00-.4.3z" class="cls-1" />
           </g>
-        </g>
-      </svg>
+          </g>
+        </svg>
+        <p class="loading-message">正在加载锦鲤池…</p>
+        <p class="loading-detail"></p>
+        <button class="loading-retry" type="button" hidden>重试</button>
+      </div>
     </div>
     <canvas class="webgl"></canvas>
   </body>

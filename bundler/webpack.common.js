@@ -8,6 +8,9 @@ module.exports = {
   output: {
     filename: "bundle.[contenthash].js",
     path: path.resolve(__dirname, "../dist"),
+    // webpack 5.24 默认用 md4，现代 Node 的 OpenSSL 3 已移除该算法；
+    // 改用 sha256 可让同一份配置在新旧 Node 上都能构建。
+    hashFunction: "sha256",
   },
   devtool: "source-map",
   plugins: [

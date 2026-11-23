@@ -1,249 +1,27 @@
 import "./style.css"
 import * as dat from "dat.gui"
 import * as THREE from "three"
-import gsap from "gsap"
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js"
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
-import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js"
-import firefliesVertexShader from "./shaders/fireflies/vertex.glsl"
-import firefliesFragmentShader from "./shaders/fireflies/fragment.glsl"
-import waterVertexShader from "./shaders/water/vertex.glsl"
-import waterFragmentShader from "./shaders/water/fragment.glsl"
-import { Mesh, MeshBasicMaterial, PlaneBufferGeometry } from "three"
-import { Flow } from "three/examples/jsm/modifiers/CurveModifier.js"
+import { createSceneRig, RESOURCE_KEYS, RESOURCE_LABELS } from "./scene/createSceneRig.js"
+import { createLoadingOverlay } from "./ui/loadingOverlay.js"
 
 /**
  * Base
  */
-// Debug
-const debugObject = {}
-const gui = new dat.GUI({
-  width: 400,
-  closed: true,
-})
-
-// Canvas
 const canvas = document.querySelector("canvas.webgl")
+
+// Debug settings —— 与场景句柄解耦：
+// 重建时新句柄会读取这里的当前值，因此调试项在重建后仍然生效
+const debugObject = {
+  waterColor1: "#96c4e8",
+  waterColor2: "#e1c1eb",
+  fireflySize: 200,
+  clearColor: "#d49c9c",
+}
 
 // Scene
 const scene = new THREE.Scene()
 scene.fog = new THREE.Fog(0xffffff, 0, 17)
-/**
- * Loaders
- */
-const loadingManager = new THREE.LoadingManager(
-  //Loaded
-  () => {
-    // console.log("loaded")
-    window.setTimeout(() => {
-      gsap.to(".loading-overlay", {
-        opacity: 0,
-        duration: 1,
-        onComplete: () => {
-          gsap.set(".loading-overlay", {
-            display: "none",
-          })
-        },
-      })
-    })
-  },
-  //Progress
-  (itemUrl, itemLoaded, itemTotal) => {
-    const progressRatio = itemLoaded / itemTotal
-    // console.log(progressRatio)
-  }
-)
-// Texture loader
-const textureLoader = new THREE.TextureLoader(loadingManager)
-
-// Draco loader
-const dracoLoader = new DRACOLoader(loadingManager)
-dracoLoader.setDecoderPath("draco/")
-
-// GLTF loader
-const gltfLoader = new GLTFLoader(loadingManager)
-gltfLoader.setDRACOLoader(dracoLoader)
-
-/**
- * Mesh
- */
-const floorGeometry = new PlaneBufferGeometry(4, 4, 1)
-const floorMaterial = new MeshBasicMaterial({ color: "#2b1d0e" })
-const floorMesh = new Mesh(floorGeometry, floorMaterial)
-floorMesh.rotation.x = Math.PI * 0.5
-scene.add(floorMesh)
-
-/**
- * Koi Fish
- */
-const matcapTexture = textureLoader.load("./matcaps11.png")
-const koiMaterial = new THREE.MeshMatcapMaterial({ matcap: matcapTexture })
-
-//Koi Fish path
-const curve = new THREE.CatmullRomCurve3([
-  new THREE.Vector3(-0.3, 0.2, -0.3),
-  new THREE.Vector3(0.5, 0.2, -0.1),
-  new THREE.Vector3(0.2, 0.2, 0.7),
-  new THREE.Vector3(-0.8, 0.2, 0.7),
-  new THREE.Vector3(-0.6, 0.2, 0.1),
-  new THREE.Vector3(-0.6, 0.2, -0.2),
-])
-
-curve.curveType = "centripetal"
-curve.closed = true
-
-const points = curve.getPoints(50)
-const lineGeometry = new THREE.BufferGeometry().setFromPoints(points)
-
-const lineMaterial = new THREE.LineBasicMaterial({
-  transparent: true,
-  opacity: 0,
-})
-
-const curveObject = new THREE.LineLoop(lineGeometry, lineMaterial)
-
-scene.add(curveObject)
-
-let flow
-
-//model
-// https://clara.io/view/b47726c8-02cf-4eb5-b275-d9b2be591bad
-gltfLoader.load("./koi.glb", (gltf) => {
-  const koi = gltf.scene.children.find((child) => child.name === "fish")
-  koi.children[0].material = koiMaterial
-
-  flow = new Flow(gltf.scene) //move on the curve
-  flow.updateCurve(0, curve)
-  scene.add(flow.object3D)
-})
-
-/**
- * Water
- */
-
-//geometry
-const waterGeometry = new THREE.PlaneGeometry(2.5, 2.5, 150, 150)
-
-//material
-debugObject.waterColor1 = "#96c4e8"
-debugObject.waterColor2 = "#e1c1eb"
-
-gui.addColor(debugObject, "waterColor1").onChange(() => {
-  waterMaterial.uniforms.uColor1.value.set(debugObject.waterColor1)
-})
-gui.addColor(debugObject, "waterColor2").onChange(() => {
-  waterMaterial.uniforms.uColor2.value.set(debugObject.waterColor2)
-})
-
-const waterMaterial = new THREE.ShaderMaterial({
-  uniforms: {
-    uTime: { value: 0 },
-    uColor1: { value: new THREE.Color(debugObject.waterColor1) },
-    uColor2: { value: new THREE.Color(debugObject.waterColor2) },
-  },
-  vertexShader: waterVertexShader,
-  fragmentShader: waterFragmentShader,
-  transparent: true,
-})
-
-//mesh
-const waterMesh = new Mesh(waterGeometry, waterMaterial)
-waterMesh.rotation.x = -Math.PI * 0.5
-waterMesh.position.set(0, 0.3, 0.2)
-scene.add(waterMesh)
-
-/**
- * Texture
- */
-const bakedTexture = textureLoader.load("./jg-bake.jpg")
-bakedTexture.flipY = false
-bakedTexture.encoding = THREE.sRGBEncoding
-
-/**
- * Material
- */
-//Baked material
-const bakedMaterial = new THREE.MeshBasicMaterial({ map: bakedTexture })
-
-//Pole light material
-const lampMeshMaterial = new THREE.MeshBasicMaterial({ color: "#f5deb3" })
-
-/**
- * Model
- */
-gltfLoader.load("./japanese-garden.glb", (gltf) => {
-  const bakedMesh = gltf.scene.children.find((child) => child.name === "bake")
-  const shishiodoshiMesh = gltf.scene.children.find(
-    (child) => child.name === "shishi"
-  )
-  const lampMesh = gltf.scene.children.find((child) => child.name === "lamp")
-
-  bakedMesh.material = shishiodoshiMesh.material = bakedMaterial
-  lampMesh.material = lampMeshMaterial
-
-  gsap.to(shishiodoshiMesh.rotation, {
-    x: Math.PI * 0.25,
-    repeat: -1,
-    yoyo: true,
-    repeatDelay: 2,
-    ease: "power3.out",
-    duration: 2,
-  })
-
-  scene.add(gltf.scene)
-})
-
-/**
- * Fireflies
- */
-// Geometry
-
-const firefliesGeomerty = new THREE.BufferGeometry()
-const firefliesCount = 30
-const positionArray = new Float32Array(firefliesCount * 3) //xyz
-const scaleArray = new Float32Array(firefliesCount) //number
-
-for (let i = 0; i < firefliesCount; i++) {
-  positionArray[i * 3 + 0] = (Math.random() - 0.5) * 4
-  positionArray[i * 3 + 1] = Math.random() * 1.5 + 0.3
-  positionArray[i * 3 + 2] = (Math.random() - 0.5) * 4 + 0.5
-
-  scaleArray[i] = Math.random()
-}
-
-firefliesGeomerty.setAttribute(
-  "position",
-  new THREE.BufferAttribute(positionArray, 3) //xyz
-)
-
-firefliesGeomerty.setAttribute(
-  "aScale",
-  new THREE.BufferAttribute(scaleArray, 1) //number
-)
-
-const firefliesMaterial = new THREE.ShaderMaterial({
-  uniforms: {
-    uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
-    uSize: { value: 200 },
-    uTime: { value: 0 },
-  },
-  vertexShader: firefliesVertexShader,
-  fragmentShader: firefliesFragmentShader,
-  transparent: true,
-  blending: THREE.AdditiveBlending,
-  depthWrite: false,
-})
-
-gui
-  .add(firefliesMaterial.uniforms.uSize, "value")
-  .min(0)
-  .max(500)
-  .step(1)
-  .name("firefiessize")
-
-//Points
-const fireflies = new THREE.Points(firefliesGeomerty, firefliesMaterial)
-scene.add(fireflies)
 
 /**
  * Sizes
@@ -253,42 +31,10 @@ const sizes = {
   height: window.innerHeight,
 }
 
-window.addEventListener("resize", () => {
-  // Update sizes
-  sizes.width = window.innerWidth
-  sizes.height = window.innerHeight
-
-  // Update camera
-  camera.aspect = sizes.width / sizes.height
-  camera.updateProjectionMatrix()
-
-  // Update renderer
-  renderer.setSize(sizes.width, sizes.height)
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-
-  //Update fireflies
-  firefliesMaterial.uniforms.uPixelRatio.value = Math.min(
-    window.devicePixelRatio,
-    2
-  )
-})
-
 /**
  * Camera
  */
-// Base camera
-const camera = new THREE.PerspectiveCamera(
-  35,
-  sizes.width / sizes.height,
-  0.1,
-  100
-)
-//真上から
-// camera.position.x = 0
-// camera.position.y = 4
-// camera.position.z = 0
-
-//camera postion
+const camera = new THREE.PerspectiveCamera(35, sizes.width / sizes.height, 0.1, 100)
 camera.position.x = 4.1
 camera.position.y = 2.8
 camera.position.z = 4.1
@@ -308,38 +54,277 @@ const renderer = new THREE.WebGLRenderer({
 renderer.setSize(sizes.width, sizes.height)
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
 renderer.outputEncoding = THREE.sRGBEncoding
-
-debugObject.clearColor = "#d49c9c"
 renderer.setClearColor(debugObject.clearColor)
-gui.addColor(debugObject, "clearColor").onChange(() => {
+
+/**
+ * 场景生命周期：任意时刻只有一个活动句柄
+ */
+let activeRig = null
+let rigEpoch = 0
+// 仅保留少量最近的历史，便于在控制台里核对释放明细
+const rigHistory = []
+
+const overlay = createLoadingOverlay({
+  root: document.querySelector(".loading-overlay"),
+  message: document.querySelector(".loading-message"),
+  detail: document.querySelector(".loading-detail"),
+  retry: document.querySelector(".loading-retry"),
+  onRetry: () => rebuild({ reason: "retry" }),
+})
+
+function disposeActiveRig(reason) {
+  if (!activeRig) return null
+  const summary = activeRig.dispose(reason)
+  activeRig = null
+  return summary
+}
+
+function describeFailures(summary) {
+  const lines = []
+  if (summary && summary.failures.length) {
+    summary.failures.forEach((failure) => {
+      lines.push(`• ${failure.label}：${failure.message}`)
+    })
+  }
+  if (summary && summary.blocked && summary.blocked.length) {
+    summary.blocked.forEach((entry) => {
+      const blockedLabels = entry.blockedBy
+        .map((key) => RESOURCE_LABELS[key] || key)
+        .join("、")
+      lines.push(`• ${RESOURCE_LABELS[entry.key] || entry.key}：因 ${blockedLabels} 失败已跳过`)
+    })
+  }
+  if (!lines.length) lines.push("资源加载失败（未提供具体资源信息）")
+  return lines
+}
+
+async function rebuild(options) {
+  const opts = options || {}
+  const epoch = ++rigEpoch
+  const failResources = opts.failResources || []
+
+  // 1) 先释放旧场景（几何体 / 材质 / 贴图 / Draco 解码器），保证渲染循环里只剩新句柄
+  const disposed = disposeActiveRig("rebuild")
+  if (disposed) {
+    rigHistory.push({ type: "dispose", ...disposed })
+    trimHistory()
+  }
+
+  // 2) 新句柄：所有 loader 都是新建的，旧请求即使迟到也只会被它自己的
+  //    disposed 标记拦下，不会写入新场景
+  let rig
+  try {
+    rig = createSceneRig({
+      scene,
+      settings: {
+        waterColor1: debugObject.waterColor1,
+        waterColor2: debugObject.waterColor2,
+        fireflySize: debugObject.fireflySize,
+      },
+      failResources,
+      applyDelayMs: opts.applyDelayMs || 0,
+      pixelRatio: Math.min(window.devicePixelRatio, 2),
+      onLog: (event, payload) => {
+        if (window.__GARDEN_DEBUG__) console.info(`[garden] ${event}`, payload)
+      },
+    })
+  } catch (error) {
+    overlay.showError({
+      message: "场景初始化失败。",
+      details: [String((error && error.message) || error)],
+    })
+    return { epoch, ok: false, status: "failed", failures: [], blocked: [] }
+  }
+  activeRig = rig
+
+  const stillCurrent = () => epoch === rigEpoch && activeRig === rig
+
+  overlay.showLoading({
+    message: failResources.length ? "正在加载锦鲤池（含模拟失败）…" : "正在加载锦鲤池…",
+  })
+
+  const summary = await rig.ready
+
+  // 3) 迟到的结算结果不允许改写遮罩 / 场景状态
+  if (!stillCurrent()) {
+    const alreadyDisposed = rig.isDisposed()
+    const lateSummary = rig.dispose("superseded")
+    if (!alreadyDisposed) {
+      rigHistory.push({ type: "dispose", ...lateSummary })
+      trimHistory()
+    }
+    return {
+      ignored: true,
+      epoch,
+      reason: "一次更新的重建已经开始，本次结果被丢弃",
+    }
+  }
+
+  if (summary.ok) {
+    overlay.showReady()
+  } else {
+    overlay.showError({
+      message: "锦鲤池加载失败，请检查资源后重试。",
+      details: describeFailures(summary),
+    })
+  }
+
+  const report = {
+    epoch,
+    rigId: rig.id,
+    status: summary.status,
+    ok: summary.ok,
+    failures: summary.failures,
+    blocked: summary.blocked,
+    resources: summary.ok ? rig.getStats().resources : null,
+  }
+  rigHistory.push({ type: "settle", ...report })
+  trimHistory()
+
+  if (window.__GARDEN_DEBUG__) console.info("[garden] rebuild settled", report)
+  return report
+}
+
+function trimHistory() {
+  const limit = 40
+  if (rigHistory.length > limit) rigHistory.splice(0, rigHistory.length - limit)
+}
+
+/**
+ * Debug GUI
+ */
+const guiControllers = {}
+const gui = new dat.GUI({
+  width: 400,
+  closed: true,
+})
+
+guiControllers.waterColor1 = gui
+  .addColor(debugObject, "waterColor1")
+  .name("waterColor1")
+  .onChange(() => {
+    if (activeRig) activeRig.setWaterColor1(debugObject.waterColor1)
+  })
+guiControllers.waterColor2 = gui
+  .addColor(debugObject, "waterColor2")
+  .name("waterColor2")
+  .onChange(() => {
+    if (activeRig) activeRig.setWaterColor2(debugObject.waterColor2)
+  })
+guiControllers.fireflySize = gui
+  .add(debugObject, "fireflySize")
+  .min(0)
+  .max(500)
+  .step(1)
+  .name("firefliesSize")
+  .onChange(() => {
+    if (activeRig) activeRig.setFireflySize(debugObject.fireflySize)
+  })
+guiControllers.clearColor = gui.addColor(debugObject, "clearColor").onChange(() => {
   renderer.setClearColor(debugObject.clearColor)
 })
 
+const rebuildFolder = gui.addFolder("Rebuild")
+rebuildFolder.add({ rebuild: () => rebuild({ reason: "gui" }) }, "rebuild").name("重建场景")
+rebuildFolder
+  .add(
+    {
+      rebuildBroken: () => rebuild({ reason: "gui-simulated", failResources: ["garden"] }),
+    },
+    "rebuildBroken"
+  )
+  .name("重建（模拟庭院模型失败）")
+
 /**
- * Animate
+ * 控制台验证入口
+ */
+function applyDebugValue(key) {
+  if (key === "waterColor1") {
+    if (activeRig) activeRig.setWaterColor1(debugObject.waterColor1)
+  } else if (key === "waterColor2") {
+    if (activeRig) activeRig.setWaterColor2(debugObject.waterColor2)
+  } else if (key === "fireflySize") {
+    if (activeRig) activeRig.setFireflySize(debugObject.fireflySize)
+  } else if (key === "clearColor") {
+    renderer.setClearColor(debugObject.clearColor)
+  }
+  const controller = guiControllers[key]
+  if (controller) controller.updateDisplay()
+}
+
+window.gardenDebug = {
+  rebuild: (options) => rebuild(options),
+  rebuildWithFailures: (keys) => rebuild({ failResources: keys, reason: "console" }),
+  // 等价于在 GUI 里改值；重建后新句柄会从 debugObject 继承
+  setDebug: (values) => {
+    Object.keys(values || {}).forEach((key) => {
+      if (key in debugObject) debugObject[key] = values[key]
+    })
+    Object.keys(values || {}).forEach(applyDebugValue)
+    return {
+      waterColor1: debugObject.waterColor1,
+      waterColor2: debugObject.waterColor2,
+      fireflySize: debugObject.fireflySize,
+      clearColor: debugObject.clearColor,
+    }
+  },
+  getDebug: () => Object.assign({}, debugObject),
+  state: () => ({
+    activeRigId: activeRig ? activeRig.id : null,
+    active: activeRig ? activeRig.getStats() : null,
+    overlay: overlay.getState(),
+    history: rigHistory.slice(),
+    resourceKeys: RESOURCE_KEYS.slice(),
+    resourceLabels: RESOURCE_LABELS,
+    clearColor: `#${renderer.getClearColor(new THREE.Color()).getHexString()}`,
+    // 场景中应始终只有 1 个 rig 根节点
+    sceneRigs: scene.children
+      .filter((child) => child.name && child.name.indexOf("garden-rig-") === 0)
+      .map((child) => ({ name: child.name, children: child.children.length })),
+  }),
+  // 渲染信息快照：反复重建后 geometries / textures 不应持续增长
+  rendererInfo: () => ({
+    geometries: renderer.info.memory.geometries,
+    textures: renderer.info.memory.textures,
+    programs: renderer.info.programs ? renderer.info.programs.length : null,
+  }),
+}
+
+/**
+ * Resize
+ */
+window.addEventListener("resize", () => {
+  sizes.width = window.innerWidth
+  sizes.height = window.innerHeight
+
+  camera.aspect = sizes.width / sizes.height
+  camera.updateProjectionMatrix()
+
+  renderer.setSize(sizes.width, sizes.height)
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+
+  if (activeRig) activeRig.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+})
+
+/**
+ * Animate —— 只更新当前活动句柄
  */
 const clock = new THREE.Clock()
 
 const tick = () => {
   const elapsedTime = clock.getElapsedTime()
 
-  //Update materials
-  firefliesMaterial.uniforms.uTime.value = elapsedTime
-  waterMaterial.uniforms.uTime.value = elapsedTime
-
-  //Update Koi
-  if (flow) {
-    flow.moveAlongCurve(0.001)
+  if (activeRig && !activeRig.isDisposed()) {
+    activeRig.update(elapsedTime)
   }
 
-  // Update controls
   controls.update()
-
-  // Render
   renderer.render(scene, camera)
 
-  // Call tick again on the next frame
   window.requestAnimationFrame(tick)
 }
 
 tick()
+
+// 首次装配
+rebuild({ reason: "initial" })

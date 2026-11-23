@@ -2,8 +2,9 @@
   "repository": "#",
   "license": "UNLICENSED",
   "scripts": {
-    "build": "webpack --config ./bundler/webpack.prod.js",
-    "dev": "webpack serve --config ./bundler/webpack.dev.js"
+    "build": "node tools/build.js",
+    "dev": "node tools/build.js serve --config ./bundler/webpack.dev.js",
+    "verify": "node tools/verify-rebuild.js"
   },
   "dependencies": {
     "@babel/core": "^7.13.1",
