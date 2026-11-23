@@ -24,6 +24,8 @@ class Renderer3D {
         this.stockMesh = null;
         this.stockVisible = false;
         this.stockShowPaths = true;
+        this.stockLayerOnly = false;
+        this.stockSimKey = null; // the visible-move settings last given to the simulator
         this.onStockProgress = null; // Called each frame with the simulator while shown
 
         this.initWebGL();
@@ -150,10 +152,17 @@ class Renderer3D {
      * Set segments to render
      */
     setSegments(segments, bounds) {
+        // A different file's stock shouldn't be drawn over these moves: release the old
+        // simulator's grid (the controller builds a new one for the new file)
+        if (this.stockMesh && this.stockMesh.sim && this.stockMesh.sim.segments !== segments) {
+            this.setStockSimulator(null);
+        }
         this.segments = segments;
         this.bounds = bounds;
         this.maxSegmentIndex = segments.length;
         this.layerStart = Renderer3D.findLayerStarts(segments);
+        // The visible moves of the new file haven't been given to the stock simulator yet
+        this.stockSimKey = null;
         this.updateBuffers();
     }
 
@@ -187,7 +196,8 @@ class Renderer3D {
     }
 
     /**
-     * Set the stock simulator to draw (null to stop). Its grid must fit stockMaxCells.
+     * Set the stock simulator to draw (null to stop and release its grid). Its grid must
+     * fit stockMaxCells.
      */
     setStockSimulator(sim) {
         if (!this.gl) return;
@@ -196,6 +206,55 @@ class Renderer3D {
             this.stockMesh = new StockMeshRenderer(this.gl);
         }
         this.stockMesh.setSimulator(sim);
+        // The new (or removed) simulator hasn't had the visible moves applied yet
+        this.stockSimKey = null;
+    }
+
+    /**
+     * Whether the view draws a move: its tool is shown, rapids are shown and it lies in
+     * the Z layer filter. The stock simulation shares this test (see syncStockSimulation),
+     * so a hidden move neither shows a line nor cuts the stock.
+     */
+    isSegmentVisible(seg) {
+        if (!seg || !seg.start) return false;
+        if (seg.start.z < this.layerFilter.min || seg.start.z > this.layerFilter.max) return false;
+        if (seg.type === 'rapid' && !this.rapidMovesVisible) return false;
+        const toolNum = seg.tool || 0;
+        if (seg.type === 'cut' && this.toolStates.has(toolNum) && !this.toolStates.get(toolNum).visible) return false;
+        return true;
+    }
+
+    /**
+     * The move the toolpaths are drawn from at animation position `index`: 0, or with
+     * "Current layer only" (and the stock shown) the start of the layer being cut. The
+     * stock simulation carves from the same move, so both show the same layer.
+     */
+    stockLayerFrom(index) {
+        const layerOnly = this.stockVisible && this.stockLayerOnly && this.stockMesh && this.stockMesh.sim &&
+            index < this.segments.length && this.layerStart;
+        return layerOnly ? this.layerStart[index] : 0;
+    }
+
+    /**
+     * Give the simulator the view's visible-move test, and the layer start it carves from
+     * with "Current layer only" (the same one drawToolpaths() uses). Rewinds the stock
+     * when any of that changes.
+     */
+    syncStockSimulation(index) {
+        const sim = this.stockMesh && this.stockMesh.sim;
+        if (!sim || sim.segments !== this.segments) return;
+        const from = this.stockLayerFrom(index);
+        const hidden = [];
+        for (const [num, state] of this.toolStates) if (!state.visible) hidden.push(num);
+        hidden.sort((a, b) => a - b);
+        // Equal keys mean the same moves are visible: nothing to re-carve
+        const key = [this.rapidMovesVisible ? 1 : 0, this.layerFilter.min, this.layerFilter.max,
+            from, hidden.join(',')].join('|');
+        // Also set the test for a new simulator with the same settings (after a file
+        // switch or re-enabling), whose moves may differ
+        if (key === this.stockSimKey && sim.moveFilterKey === key) return;
+        this.stockSimKey = key;
+        sim.setVisibleMoves((seg) => this.isSegmentVisible(seg), key, from);
     }
 
     /**
@@ -321,14 +380,9 @@ class Renderer3D {
         const toolRgb = new Map();
         for (const [toolNum, state] of this.toolStates) toolRgb.set(toolNum, this.hexToRgb(state.color));
 
-        // Whether a move is drawn, and its color (kept for the move in progress)
-        this.segmentVisible = (seg) => {
-            if (seg.start.z < this.layerFilter.min || seg.start.z > this.layerFilter.max) return false;
-            if (seg.type === 'rapid' && !this.rapidMovesVisible) return false;
-            const toolNum = seg.tool || 0;
-            if (seg.type === 'cut' && this.toolStates.has(toolNum) && !this.toolStates.get(toolNum).visible) return false;
-            return true;
-        };
+        // Whether a move is drawn, and its color (kept for the move in progress). The
+        // visibility test is the method, so the stock simulation shares it too
+        this.segmentVisible = (seg) => this.isSegmentVisible(seg);
         this.segmentColor = (seg) => {
             if (seg.type === 'rapid') return rapidColor;
             if (seg.type === 'probe') return probeColor;
@@ -396,9 +450,7 @@ class Renderer3D {
 
         // With the stock shown while animating, earlier layers are cut into the stock, so
         // only the current layer's lines are drawn (stockLayerOnly)
-        const layerOnly = this.stockVisible && this.stockLayerOnly && this.stockMesh && this.stockMesh.sim &&
-            index < n && this.layerStart;
-        const from = layerOnly ? this.layerStart[index] : 0;
+        const from = this.stockLayerFrom(index);
 
         const draw = (positionBuffer, colorBuffer, count, first = 0) => {
             if (count <= 0) return;
@@ -467,22 +519,28 @@ class Renderer3D {
         
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        if (!this.vertexCount || this.vertexCount === 0) {
-            return;
-        }
-
         const aspect = this.canvas.width / this.canvas.height;
         const mvp = this.camera.getMVPMatrix(aspect);
 
-        // Machined stock, carved up to the animation position a little each frame
+        // Machined stock, carved up to the animation position a little each frame. Drawn
+        // even with no visible toolpath vertices (everything hidden), so the stock still
+        // reflects the current position
         const showStock = this.stockVisible && this.stockMesh && this.stockMesh.sim;
         if (showStock) {
             const sim = this.stockMesh.sim;
+            const index = Math.max(0, Math.min(this.maxSegmentIndex, this.segments.length));
+            // Same visible moves and layer start as the toolpaths drawn below, so the
+            // stock goes back and forward with the animation and matches what's shown
+            this.syncStockSimulation(index);
             // Up to the tool: the moves done, and the one in progress as far as it's got
-            sim.advanceTo(Math.min(this.maxSegmentIndex, this.segments.length), 25, this.segmentProgress || 0);
+            sim.advanceTo(index, 25, this.segmentProgress || 0);
             this.stockMesh.update();
             this.stockMesh.draw(mvp, this.camera, theme);
             if (this.onStockProgress) this.onStockProgress(sim);
+        }
+
+        if (!this.vertexCount || this.vertexCount === 0) {
+            return;
         }
 
         // Line program, also used by the grid and axes below
@@ -865,10 +923,24 @@ class Renderer3D {
      */
     destroy() {
         if (!this.gl) return;
-        
+
         const gl = this.gl;
         for (const buffer of Object.values(this.buffers)) gl.deleteBuffer(buffer);
+        this.buffers = {};
+        // The stock grid, tool meshes and programs it made go with it
+        if (this.stockMesh) {
+            this.stockMesh.destroy();
+            this.stockMesh = null;
+        }
+        this.stockSimKey = null;
+        this.segments = [];
+        this.vertexCount = 0;
         gl.deleteProgram(this.program);
-        if (this.stockMesh) this.stockMesh.destroy();
+        this.program = null;
+        if (this.sphereProgram) {
+            gl.deleteProgram(this.sphereProgram);
+            this.sphereProgram = null;
+        }
+        this.gl = null;
     }
 }

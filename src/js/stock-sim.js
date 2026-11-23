@@ -115,8 +115,13 @@ class StockSimulator {
 
         this.base = null; // heights after earlier jobs, the starting point for this one
         this.hiddenTools = new Set(); // segment.tool values (the tool panel's) not carved
+        // What the 3D view draws as visible: the same predicate, so hidden tools, hidden
+        // rapids and moves outside the Z layer filter don't carve either (see setVisibleMoves)
+        this.moveFilter = null;
+        this.moveFilterKey = null;
+        this.carveFrom = 0; // index the stock is carved from (the current layer's start)
         this.segments = [];
-        this.snapshots = new Map(); // segment index -> heights after carving [0, index)
+        this.snapshots = new Map(); // segment index -> heights after carving [carveFrom, index)
         this.gouges = new Set(); // indices of rapid moves that cut into the stock
         this.reset();
     }
@@ -152,7 +157,8 @@ class StockSimulator {
 
     /**
      * Leave out the moves of these tools (keyed like the tool panel: segment.tool),
-     * re-carving from the start if that changes anything
+     * re-carving from the start if that changes anything. Only used when the simulator
+     * runs on its own; the 3D view passes its full visibility test in setVisibleMoves.
      */
     setHiddenTools(hidden) {
         const next = new Set(hidden);
@@ -163,6 +169,41 @@ class StockSimulator {
         this.reset();
     }
 
+    /**
+     * Share the view's visible-move test with the carving, so the stock is cut by exactly
+     * the moves that are drawn: a hidden tool, hidden rapids and moves outside the Z layer
+     * filter don't remove material. With "Current layer only", the stock is also carved
+     * from `from`, the same layer start the toolpaths are drawn from: earlier layers are
+     * already in the uncut stock, so the stock shows just this layer's cuts.
+     * @param {Function} visible - (segment) => whether the 3D view draws it
+     * @param {*} [key] - changes whenever the answer would; equal keys skip the re-carve
+     * @param {number} [from] - index to carve from (earlier moves are left uncarved)
+     */
+    setVisibleMoves(visible, key = null, from = 0) {
+        from = Math.max(0, Math.min(Math.floor(from) || 0, this.segments.length));
+        const sameKey = key !== null && key === this.moveFilterKey;
+        this.moveFilter = visible;
+        if (sameKey && from === this.carveFrom) return;
+        this.moveFilterKey = key;
+        this.carveFrom = from;
+        this.snapshots.clear();
+        this.gouges.clear();
+        this.reset();
+    }
+
+    /**
+     * Whether move `index` is part of the simulation: drawn by the view and no earlier
+     * than where carving starts. Without a view-supplied test (used on its own), the
+     * hidden tools are left out instead.
+     */
+    isCarved(index) {
+        if (index < this.carveFrom) return false;
+        const seg = this.segments[index];
+        if (!seg) return false;
+        if (this.moveFilter) return this.moveFilter(seg, index);
+        return !(this.hiddenTools.size > 0 && this.hiddenTools.has(seg.tool || 0));
+    }
+
     setSegments(segments) {
         this.segments = segments;
         // Snapshots, so stepping the animation backward doesn't re-carve everything.
@@ -171,6 +212,10 @@ class StockSimulator {
         this.snapshotInterval = this.useSnapshots ? Math.max(256, Math.ceil(segments.length / count)) : Infinity;
         this.snapshots.clear();
         this.gouges.clear();
+        // The view sets these again for the new moves (see setVisibleMoves)
+        this.carveFrom = 0;
+        this.moveFilter = null;
+        this.moveFilterKey = null;
         this.reset();
     }
 
@@ -178,7 +223,9 @@ class StockSimulator {
         this.partial = null;
         if (this.base) this.heights.set(this.base);
         else this.heights.fill(this.stock.zmax);
-        this.carvedIndex = 0;
+        // Where the carved window starts: 0, or the current layer's start (see
+        // setVisibleMoves), so earlier moves stay as they were before carving began
+        this.carvedIndex = this.carveFrom;
         this.markAllDirty();
     }
 
@@ -221,7 +268,7 @@ class StockSimulator {
         const deadline = performance.now() + budgetMs;
         while (this.carvedIndex < target) {
             // Snapshots hold whole moves only, never one carved part way
-            if (this.carvedIndex > 0 && this.carvedIndex % this.snapshotInterval === 0 &&
+            if (this.carvedIndex > this.carveFrom && this.carvedIndex % this.snapshotInterval === 0 &&
                 !this.snapshots.has(this.carvedIndex) && !(this.partial && this.partial.index === this.carvedIndex)) {
                 this.snapshots.set(this.carvedIndex, this.heights.slice());
             }
@@ -243,7 +290,7 @@ class StockSimulator {
     carvePartial(index, progress) {
         const seg = this.segments[index];
         if (seg.type === 'probe') return;
-        if (this.hiddenTools.size > 0 && this.hiddenTools.has(seg.tool || 0)) return;
+        if (!this.isCarved(index)) return;
         const p = this.partial && this.partial.index === index ? this.partial : null;
         if (p && progress <= p.progress) return;
         const at = (t) => ({
@@ -251,6 +298,7 @@ class StockSimulator {
             y: seg.start.y + (seg.end.y - seg.start.y) * t,
             z: seg.start.z + (seg.end.z - seg.start.z) * t
         });
+        // Only carve on from an earlier part of this move if the tallies say it was carved
         const piece = { ...seg, start: p ? at(p.progress) : seg.start, end: at(progress) };
         // Only the first piece follows a probe (see carveMove)
         const prev = p ? piece : this.segments[index - 1];
@@ -259,11 +307,11 @@ class StockSimulator {
     }
 
     rewind(target) {
-        let best = 0;
+        let best = this.carveFrom;
         for (const index of this.snapshots.keys()) {
             if (index <= target && index > best) best = index;
         }
-        if (best > 0) {
+        if (best > this.carveFrom) {
             this.heights.set(this.snapshots.get(best));
             this.carvedIndex = best;
             this.markAllDirty();
@@ -273,8 +321,9 @@ class StockSimulator {
     }
 
     carveSegment(index) {
-        // Same tool key as the 3D view uses for hidden toolpaths
-        if (this.hiddenTools.size > 0 && this.hiddenTools.has(this.segments[index].tool || 0)) return;
+        // Same visible-move test the 3D view draws by, so hidden tools, hidden rapids and
+        // moves outside the layer filter don't cut, and nothing before the layer start does
+        if (!this.isCarved(index)) return;
         if (this.carveMove(this.segments, index, this.tools, this.defaultTool) &&
             this.segments[index].type === 'rapid') {
             this.gouges.add(index);
@@ -566,9 +615,23 @@ class StockMeshRenderer {
             gl.deleteBuffer(tile.normal);
         }
         this.tiles = [];
+        // Tile index buffers are shared by size, not by file; let a new simulator build
+        // its own, so nothing of the old grid's layout stays behind
+        if (sim !== this.sim) {
+            for (const shape of this.tileShapes.values()) {
+                gl.deleteBuffer(shape.ij);
+                gl.deleteBuffer(shape.index);
+            }
+            this.tileShapes.clear();
+        }
         this.sim = sim;
         if (!sim) {
+            // Release everything derived from the old simulator, so nothing of the old
+            // file's grid survives (the shared shape caches are size-keyed, not per file)
             this.rawNormals = this.normals = null;
+            this.staging = null;
+            this.skirtZ = null;
+            this.edge = null;
             return;
         }
         const { vx, vy, nx, ny, dx, dy, stock } = sim;
@@ -1142,13 +1205,20 @@ class StockMeshRenderer {
             gl.deleteBuffer(shape.ij);
             gl.deleteBuffer(shape.index);
         }
+        // A tool mesh may be shared with a drawTool call made after setSimulator(null)
         for (const mesh of [...(this.toolMeshes || new Map()).values(), ...(this.boxMeshes || new Map()).values()]) {
             gl.deleteBuffer(mesh.position);
             gl.deleteBuffer(mesh.normal);
         }
         gl.deleteProgram(this.program);
         if (this.toolProgram) gl.deleteProgram(this.toolProgram);
+        this.toolMeshes = null;
+        this.boxMeshes = null;
+        this.tileShapes.clear();
         this.sim = null;
+        this.program = null;
+        this.toolProgram = null;
+        this.gl = null;
     }
 }
 

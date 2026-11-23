@@ -183,7 +183,9 @@ It needs the size of the stock and of every tool that cuts. A post processor can
 
 For files without these comments, the panel estimates the stock from the toolpaths and guesses tool sizes from names like `1/4" flat end mill` or `6mm ball nose`. Check or enter the values under **Stock and tool sizes**, then click **Apply**. **Detail** sets the grid resolution. **Auto** sizes the cells to about 1/8 of the smallest tool's cutting feature (a tapered ball's tip, half a V-bit, otherwise the diameter), using 1 to 6 million cells. Draft, Normal, Fine and Ultra use 0.5, 2, 5 and 10 million cells. Finer grids show small details more accurately, but use more memory and take longer to carve.
 
-With **Current layer only** on (under "Show toolpaths on the stock"), the animation only draws the toolpaths of the layer being cut, from where the tool started that Z level. Earlier layers are already visible in the stock.
+With **Current layer only** on (under "Show toolpaths on the stock"), the animation draws only the toolpaths of the layer being cut, from where the tool started that Z level, and the stock is carved from that same point, so the lines and the cut surface agree.
+
+The stock is cut by exactly the moves the 3D view draws: hiding a tool or the rapids, or narrowing the **Z layers** range, removes those moves' cuts from the stock too, and the stock follows the animation backward as well as forward, showing the part at whatever position the timeline is at.
 
 While the stock is shown, **Fit** and double-click frame the whole stock. The 3D grid stands for the machine bed. It's sized from the machine's max travel (read from the connected machine in the FluidNC extension, or from a loaded `config.yaml`), or else made a little larger than the stock. A size you type in yourself is kept.
 

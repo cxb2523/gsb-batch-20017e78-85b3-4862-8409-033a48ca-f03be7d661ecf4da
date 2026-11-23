@@ -1910,14 +1910,8 @@ class Controller {
         this.renderer3d.setRapidMoveSettings(this.rapidMovesVisible, this.rapidMoveColor);
         this.renderer2d.updateBuffers();
         this.renderer3d.updateBuffers();
-        if (this.stockSim) this.stockSim.setHiddenTools(this.hiddenToolKeys());
-    }
-
-    /**
-     * Tool panel keys of the tools that are unchecked
-     */
-    hiddenToolKeys() {
-        return [...this.tools].filter(([, state]) => !state.visible).map(([key]) => key);
+        // The stock simulation shares the 3D view's visible-move test (toolStates,
+        // rapids, layer filter), applied at the next frame (renderer3d.syncStockSimulation)
     }
 
     /**
@@ -2423,11 +2417,17 @@ class Controller {
             const maxCells = Math.min(cells, this.renderer3d.stockMaxCells);
             this.stockSim = new StockSimulator(cfg.stock, cfg.tools, { maxCells });
             this.stockSim.setPriorJobs((this.priorJobs || []).filter(job => job.status === 'loaded'));
-            this.stockSim.setHiddenTools(this.hiddenToolKeys());
             this.stockSim.setSegments(this.segments);
             this.renderer3d.setStockSimulator(this.stockSim);
             this.stockFluteWarnings = this.findFluteLengthProblems();
             this.stockInfoText = null;
+        }
+        // Hidden by the user (or not simulable): drop the simulator and its grid, so a
+        // stale stock doesn't stay behind in the 3D view or its memory
+        if (!visible && this.stockSim) {
+            this.stockSim = null;
+            this.renderer3d.setStockSimulator(null);
+            this.setStockInfo('');
         }
 
         const paths = document.getElementById('stock-paths');
@@ -2489,8 +2489,10 @@ class Controller {
     updateStockInfo(sim) {
         const total = Math.min(this.renderer3d.maxSegmentIndex, sim.segments.length);
         const unit = this.stockConfig.units === 'inches' ? 'in' : 'mm';
+        // "Current layer only" carves just this layer, so progress counts from its start
+        const from = Math.min(sim.carveFrom || 0, total);
         let html = sim.carvedIndex < total
-            ? `Carving… ${Math.floor(sim.carvedIndex / Math.max(total, 1) * 100)}%`
+            ? `Carving… ${Math.floor((sim.carvedIndex - from) / Math.max(total - from, 1) * 100)}%`
             : `${sim.nx} × ${sim.ny} grid, ${+sim.dx.toFixed(3)} ${unit} cells`;
         const prior = (this.priorJobs || []).filter(job => job.status === 'loaded').length;
         if (prior > 0) html += `, after ${prior} earlier job${prior === 1 ? '' : 's'}`;
