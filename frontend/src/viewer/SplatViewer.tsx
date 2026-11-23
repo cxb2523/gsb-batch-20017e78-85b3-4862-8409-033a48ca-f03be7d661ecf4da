@@ -18,13 +18,18 @@ import {
 import type { StereoSettings, ViewerHandle } from '../types';
 import { computeOffAxisFrustum, computeStereoEye, effectiveBaseline, sanitizeEye } from './off-axis';
 import {
+  interpolatePlacement,
+  needsPlacementTransition,
+  placementsEquivalent,
+  resolveParallaxBudget,
+} from './parallax-budget';
+import {
   apexDistance,
-  computeTrueWindowPlacement,
-  computeWindowPlacement,
   estimateDepthQuantile,
   estimateCaptureAspect,
   estimateCaptureTangent,
   mapTrackedEye,
+  type WindowPlacement,
 } from './window-placement';
 import {
   type OrbitState,
@@ -217,6 +222,11 @@ const FRAME_REQUEST_MISSING_ADVICE = [
 // framed at a plausible arm's length rather than at zero.
 const DEFAULT_SUBJECT_DISTANCE = 3;
 
+// How long a mode switch glides between placements. Long enough to read as a
+// movement rather than a cut, short enough that the control still feels
+// immediate; a quarter of a second was chosen on a device for that.
+const PLACEMENT_TRANSITION_MS = 240;
+
 // Effectively the nearest gaussian, sampled densely enough that a lone stray
 // cannot set the placement for the whole scene.
 //
@@ -341,6 +351,19 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
   captureAspectHintRef.current = captureAspectHint;
   const subjectDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
   const anchorDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
+  // The measured nearest gaussian depth, kept alongside the anchor so the
+  // shared parallax budget can weigh it; null until a scene provides it.
+  const nearestDistanceRef = useRef<number | null>(null);
+  // The placement currently on screen and the one a mode switch is gliding
+  // towards. A jump between placements whose visible fractions differ enough
+  // reads as the scene lurching, so the change is run as a short transition.
+  const currentPlacementRef = useRef<WindowPlacement | null>(null);
+  const placementTransitionRef = useRef<{
+    from: WindowPlacement;
+    to: WindowPlacement;
+    startMs: number;
+  } | null>(null);
+  const transitionFrameRef = useRef(0);
   const splatEntityRef = useRef<pc.Entity | null>(null);
   const assetRef = useRef<pc.Asset | null>(null);
   const orbitRef = useRef<OrbitState>(createOrbitState());
@@ -363,31 +386,13 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
   // could differ; the sibling depth viewer measured that falling to twenty-odd
   // real frames once gated, at no visible cost.
   /**
-   * Put the scene behind the window, with the capture camera on the eye.
-   *
-   * Re-applied whenever the relief control moves, because scale is what that
-   * control changes: at the calibrated eye the picture is the photograph
-   * whatever the scale, so scaling only alters how much the view shifts when
-   * the head does.
+   * Put a settled placement on the scene: scale and slide the miniature, and
+   * remember the window size the eye frusta are built from.
    */
-  const applyWindowPlacement = useCallback(() => {
+  const applyPlacementToScene = useCallback((placement: WindowPlacement) => {
     const splat = splatEntityRef.current;
     const pose = headPoseRef.current;
-    const tangent = captureTangentRef.current;
-    if (!splat || !pose || !tangent) return;
-    const placement = pose.trueWindow
-      ? computeTrueWindowPlacement({
-        captureTangent: tangent,
-        anchorDistance: anchorDistanceRef.current,
-        // In a literal window pinch changes the miniature, never the aperture.
-        modelScale: (pose.sizeScale ?? 1) * (pose.zoom ?? 1),
-      })
-      : computeWindowPlacement({
-        captureTangent: tangent,
-        anchorDistance: anchorDistanceRef.current,
-        sizeScale: pose.sizeScale ?? 1,
-        zoom: pose.zoom ?? 1,
-      });
+    if (!splat || !pose) return;
     windowHalfHeightRef.current = placement.windowHalfHeight;
 
     splat.setLocalScale(placement.scale, placement.scale, placement.scale);
@@ -524,6 +529,101 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
       eyeDistance: eye.z,
     });
   }, []);
+
+  /**
+   * Advance a mode-switch transition by one frame.
+   *
+   * The placement is interpolated and everything derived from a placement --
+   * the window the frustum is built from included -- is rebuilt from the
+   * interpolated one, so no frame in the middle can show a separation either
+   * endpoint would have forbidden. Drawing is on demand, so the frame is
+   * requested explicitly.
+   */
+  const stepPlacementTransition = useCallback(() => {
+    transitionFrameRef.current = 0;
+    const transition = placementTransitionRef.current;
+    if (!transition) return;
+    const t = (performance.now() - transition.startMs) / PLACEMENT_TRANSITION_MS;
+    if (t >= 1) {
+      placementTransitionRef.current = null;
+      currentPlacementRef.current = transition.to;
+      applyPlacementToScene(transition.to);
+    } else {
+      const interpolated = interpolatePlacement(transition.from, transition.to, t);
+      currentPlacementRef.current = interpolated;
+      applyPlacementToScene(interpolated);
+      transitionFrameRef.current = requestAnimationFrame(stepPlacementTransition);
+    }
+    const pose = headPoseRef.current;
+    if (pose) applyHeadPoseToEyes(pose);
+    const app = appRef.current;
+    if (app) app.renderNextFrame = true;
+  }, [applyHeadPoseToEyes, applyPlacementToScene]);
+
+  /**
+   * Put the scene behind the window, with the capture camera on the eye.
+   *
+   * The placement comes from the shared parallax budget, which weighs the
+   * nearest depth, the stereo controls and the viewport together, so the
+   * miniature's scale and the stereo baseline cannot drift into disagreeing
+   * about how much parallax the scene may present.
+   *
+   * Re-applied whenever the relief control moves, because scale is what that
+   * control changes: at the calibrated eye the picture is the photograph
+   * whatever the scale, so scaling only alters how much the view shifts when
+   * the head does.
+   *
+   * A target whose visible fraction differs enough from what is on screen --
+   * switching between photo and True Window modes is the common case -- is
+   * glided to rather than snapped to, because an instant change of that size
+   * reads as the scene lurching.
+   */
+  const applyWindowPlacement = useCallback(() => {
+    const splat = splatEntityRef.current;
+    const pose = headPoseRef.current;
+    const tangent = captureTangentRef.current;
+    if (!splat || !pose || !tangent) return;
+    const app = appRef.current;
+    const settings = stereoRef.current;
+    const widthPx = app?.graphicsDevice.width || 1;
+    const heightPx = app?.graphicsDevice.height || 1;
+    const target = resolveParallaxBudget({
+      medianDepth: subjectDistanceRef.current,
+      nearestDepth: nearestDistanceRef.current,
+      captureTangent: tangent,
+      anchorDistance: anchorDistanceRef.current,
+      sizeScale: pose.sizeScale ?? 1,
+      zoom: pose.zoom ?? 1,
+      trueWindow: Boolean(pose.trueWindow),
+      baseline: settings.baseline,
+      compression: settings.compression,
+      clampPx: settings.clampPx,
+      eyeViewportWidthPx: widthPx,
+      aspect: widthPx / heightPx,
+    }).placement;
+
+    // Already gliding to this target: let the transition finish rather than
+    // restarting it on every tracked head pose.
+    const running = placementTransitionRef.current;
+    if (running && placementsEquivalent(running.to, target)) return;
+
+    const current = currentPlacementRef.current;
+    if (current && needsPlacementTransition(current, target)) {
+      placementTransitionRef.current = { from: current, to: target, startMs: performance.now() };
+      if (!transitionFrameRef.current) {
+        transitionFrameRef.current = requestAnimationFrame(stepPlacementTransition);
+      }
+      return;
+    }
+
+    if (transitionFrameRef.current) {
+      cancelAnimationFrame(transitionFrameRef.current);
+      transitionFrameRef.current = 0;
+    }
+    placementTransitionRef.current = null;
+    currentPlacementRef.current = target;
+    applyPlacementToScene(target);
+  }, [applyPlacementToScene, stepPlacementTransition]);
 
   /**
    * Place and shape both eyes from the current stereo settings.
@@ -779,6 +879,11 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
     return () => {
       disposed = true;
       observer.disconnect();
+      if (transitionFrameRef.current) {
+        cancelAnimationFrame(transitionFrameRef.current);
+        transitionFrameRef.current = 0;
+      }
+      placementTransitionRef.current = null;
       appRef.current?.destroy();
       appRef.current = null;
       cameraRef.current = null;
@@ -1024,6 +1129,7 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
     const distance = splatDistanceQuantile(centers, 0.5) ?? DEFAULT_SUBJECT_DISTANCE;
     const nearest = nearSplatDistance(centers);
     anchorDistanceRef.current = nearest ?? distance;
+    nearestDistanceRef.current = nearest;
 
     const hintedTangent = captureTangentHintRef.current;
     captureTangentRef.current = typeof hintedTangent === 'number'

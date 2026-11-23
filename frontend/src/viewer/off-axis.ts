@@ -225,6 +225,37 @@ export function projectThroughToeInEye(
 }
 
 /**
+ * The tightest a baseline may be under a pixel budget, in scene units.
+ *
+ * This is the pixel half of the shared parallax budget, factored out so that
+ * both the orbit/stereo path (`effectiveBaseline`, which measures the
+ * zero-parallax plane from a distance and a field of view) and the window path
+ * (`parallax-budget.ts`, which reads the plane straight off the placement)
+ * clamp against exactly the same rule. `halfWidth` is half the width of the
+ * zero-parallax plane in scene units, however the caller measures it.
+ *
+ * The limit is expressed in pixels of ONE eye's viewport: in side-by-side each
+ * eye draws into half the canvas, and a separation that is comfortable per eye
+ * is what fusion depends on.
+ */
+export function clampBaselineToPixelBudget({
+  baseline,
+  clampPx = 0,
+  eyeViewportWidthPx,
+  halfWidth,
+}: {
+  baseline: number;
+  clampPx?: number;
+  eyeViewportWidthPx: number;
+  halfWidth: number;
+}): number {
+  if (!(clampPx > 0) || !(eyeViewportWidthPx > 0) || !(halfWidth > 0)) return baseline;
+  // Separation in normalised coordinates spans 2 units across the viewport.
+  const maxSeparationNdc = (2 * clampPx) / eyeViewportWidthPx;
+  return Math.min(baseline, maxSeparationNdc * halfWidth);
+}
+
+/**
  * How far apart the eyes should actually be placed.
  *
  * The two controls carried over from the previous renderer, `compression` and
@@ -276,8 +307,5 @@ export function effectiveBaseline({
   if (!(clampPx > 0) || !(eyeViewportWidthPx > 0)) return scaled;
 
   const { halfWidth } = screenHalfExtents(zeroParallaxDistance, fovYDeg, aspect);
-  // Separation in normalised coordinates spans 2 units across the viewport.
-  const maxSeparationNdc = (2 * clampPx) / eyeViewportWidthPx;
-  const maxBaseline = maxSeparationNdc * halfWidth;
-  return Math.min(scaled, maxBaseline);
+  return clampBaselineToPixelBudget({ baseline: scaled, clampPx, eyeViewportWidthPx, halfWidth });
 }
