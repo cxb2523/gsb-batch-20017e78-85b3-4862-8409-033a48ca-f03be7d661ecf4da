@@ -131,10 +131,13 @@ export default class VTTParser {
                 break;
             // 6. Otherwise, run these substeps:
             } else {
-                // 1. If in header is not set and line count is 2, run these substeps:
-                if (!inHeader && lineCount === 2) {
-                    // 1. If seen cue is false and buffer starts with the substring "STYLE" (U+0053 LATIN CAPITAL LETTER S, U+0054 LATIN CAPITAL LETTER T, U+0059 LATIN CAPITAL LETTER Y, U+004C LATIN CAPITAL LETTER L, U+0045 LATIN CAPITAL LETTER E), and the remaining characters in buffer (if any) are all ASCII whitespace, then run these substeps:
-                    if (!this.#seenCue && buffer.startsWith("STYLE") && buffer.substring(5).trim() === "") {
+                // 1. If line count is 2, run these substeps:
+                // XXX: the specification only recognises STYLE and REGION blocks outside the header, but
+                // REGION blocks are commonly written directly after the file signature (in the "header"
+                // block), so they are collected there as well.
+                if (lineCount === 2) {
+                    // 1. If in header is not set and seen cue is false and buffer starts with the substring "STYLE" (U+0053 LATIN CAPITAL LETTER S, U+0054 LATIN CAPITAL LETTER T, U+0059 LATIN CAPITAL LETTER Y, U+004C LATIN CAPITAL LETTER L, U+0045 LATIN CAPITAL LETTER E), and the remaining characters in buffer (if any) are all ASCII whitespace, then run these substeps:
+                    if (!inHeader && !this.#seenCue && buffer.startsWith("STYLE") && buffer.substring(5).trim() === "") {
                         // TODO: stylesheet implementation
                     }
                     // 2. Otherwise, if seen cue is false and buffer starts with the substring "REGION" (U+0052 LATIN CAPITAL LETTER R, U+0045 LATIN CAPITAL LETTER E, U+0047 LATIN CAPITAL LETTER G, U+0049 LATIN CAPITAL LETTER I, U+004F LATIN CAPITAL LETTER O, U+004E LATIN CAPITAL LETTER N), and the remaining characters in buffer (if any) are all ASCII whitespace, then run these substeps:
@@ -337,6 +340,12 @@ export default class VTTParser {
     #parseCueSettings(input: string, regions: VTTRegion[], cue: TextTrackCue) {
         // 1. Let settings be the result of splitting input on spaces.
         const settings = input.split(" ");
+        // Whether a cue setting explicitly took the cue out of its region. The specification evaluates this
+        // per token, but a "region:" token that comes after "line:", "size:" or "vertical:" would then re-bind
+        // a cue that has already dropped out. Latching the decision and applying it once every token has been
+        // parsed makes the result independent of token order. Only the region is cleared; the line, position
+        // and other settings parsed below are left untouched.
+        let regionCleared = false;
         // 2. For each token setting in the list settings, run the following substeps:
         for (const setting of settings) {
             // 1. If setting does not contain a U+003A COLON character (:), or if the first U+003A COLON character (:) in setting is either the first or last character of setting, then jump to the step labeled next setting.
@@ -368,7 +377,7 @@ export default class VTTParser {
                     
                     // 3. If cue’s WebVTT cue writing direction is not horizontal, let cue’s WebVTT cue region be null (there are no vertical regions).
                     if (cue.vertical !== "")
-                        cue.region = null;
+                        regionCleared = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "line"
@@ -433,8 +442,8 @@ export default class VTTParser {
                     // 10. If the last character in linepos is a U+0025 PERCENT SIGN character (%), then let cue’s WebVTT cue snap-to-lines flag be false. Otherwise, let it be true.
                     cue.snapToLines = linepos.charAt(linepos.length - 1) !== "%";
                     // 11. If cue’s WebVTT cue line is not auto, let cue’s WebVTT cue region be null (the cue has been explicitly positioned with a line offset and thus drops out of the region).
-                    // XXX: this makes no sense, we're always setting the region to null because we always set the line to a number
-                    cue.region = null;
+                    // A valid line setting always produces a number, so the cue always drops out here.
+                    regionCleared = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "position"
@@ -477,7 +486,7 @@ export default class VTTParser {
                     cue.size = number;
                     // 3. If cue’s WebVTT cue size is not 100, let cue’s WebVTT cue region be null (the cue has been explicitly sized and thus drops out of the region).
                     if (cue.size !== 100)
-                        cue.region = null;
+                        regionCleared = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "align"
@@ -489,6 +498,11 @@ export default class VTTParser {
                 break;
             }
         }
+        // Apply the region binding decision now that every setting has been parsed, so a later "region:"
+        // token cannot undo an explicit line, size or vertical setting that came before it. The line and
+        // position values parsed above remain intact.
+        if (regionCleared)
+            cue.region = null;
     }
 
     #parsePercentString(input: string) {
@@ -671,7 +685,12 @@ export default class VTTParser {
         if (this.#peak() == "\u000A") {
             this.#position++;
         } else {
-            this.#collectBlock(true);
+            // The specification discards the header block, but REGION blocks written directly after
+            // the file signature are common, so keep any region it produced.
+            const block = this.#collectBlock(true);
+            if (block.region) {
+                this.#regions.push(block.region);
+            }
         }
         // 12. collect a sequence of code points that are U+000A LINE FEED (LF) characters.
         this.#collectWhitespace();
