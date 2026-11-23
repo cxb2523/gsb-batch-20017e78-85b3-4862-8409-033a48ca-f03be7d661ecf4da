@@ -44,22 +44,26 @@ function run(job) {
   job.channels = null; // the message is the only holder of the input, so it can go once it's copied
   const n = job.inLen || chans[0].length;
   const scale = chans[0] instanceof Int16Array ? 1 / 32768 : 1;
-  const fast = (channels, formant = false) => ({ channels, quality: 'fast', formant });
+  const reply = (channels, quality, formant) => ({ channels, quality, formant });
   const pitched = Math.abs(pitchRatio - 1) > 1e-6;
+  // A formant request only has anything to do when the pitch moves: a pure tempo change
+  // (stretch-only) leaves the spectrum where it was, so the request is not honoured there —
+  // and never reported as honoured. `corrected` below is set only once the correction has
+  // actually run, so the reply's formant says what was done, whichever path rendered.
+  const wantFormant = !!job.formant && pitched;
   if (!pitched && !converting) {
-    if (targetLen === n) return fast(chans.map((c) => (scale === 1 && c.length === n ? c : toFloat(c, n, scale))));
-    if (Math.abs(targetLen - n) <= NUDGE_MAX && canNudge(n, targetLen)) return fast(nudgeLoop(chans, n, targetLen, scale));
+    if (targetLen === n) return reply(chans.map((c) => (scale === 1 && c.length === n ? c : toFloat(c, n, scale))), 'fast', false);
+    if (Math.abs(targetLen - n) <= NUDGE_MAX && canNudge(n, targetLen)) return reply(nudgeLoop(chans, n, targetLen, scale), 'fast', false);
   }
   // Pitch and rate first, in one resample: the copy (with the tail room WSOLA extends it into)
   // replaces the input. Played at sr, len samples sound pitchRatio higher than the original.
   let x = chans, len = n;
-  const formant = !!job.formant && pitched;
   if (pitched || converting) {
     len = Math.round((n * rate) / pitchRatio);
     // A loop that then needs only a nudge (within 1.7 cents, as timeStretch would resample it in
     // a second pass) goes straight to its length; at its own tempo that is the whole job.
     if (converting && Math.abs(targetLen / len - 1) < 0.001) len = targetLen;
-    const done = len === targetLen && !formant, room = done ? 0 : tailRoom(sr);
+    const done = len === targetLen && !wantFormant, room = done ? 0 : tailRoom(sr);
     if (pitched) {
       if (scale !== 1) chans = chans.map((c) => toFloat(c, n, scale));
       // The filter follows the pitch, not the step: at 48 kHz a semitone up still reads under one
@@ -68,15 +72,20 @@ function run(job) {
       x = resampleLoop(chans, n, len, room, pitchRatio < 1 ? 'down' : 'up');
     } else x = convertLoop(chans, n, len, room, scale, job.srcRate >= 44100 && rate >= CV_RATE);
     chans = null;
-    if (done) return fast(x);
+    if (done) return reply(x, 'fast', false);
   }
-  const ratio = formant ? pitchRatio : 1;
+  // Formant correction, the one place both paths get it, in all three cases that need it
+  // (pitch-only, and pitch with a stretch on top, fast or hq): on the freshly pitched loop,
+  // before any stretching, so the fast path's WSOLA and the hq path's split and vocoder both
+  // see the corrected spectrum and it can neither be skipped on one path nor run twice. The
+  // spare room lets the stretch below extend the corrected loop in place.
+  let corrected = false;
+  if (wantFormant) { x = formantPass(x, len, sr, pitchRatio, tailRoom(sr)); corrected = true; }
   if (job.quality === 'hq' && HQ[type] && Math.abs(targetLen / len - 1) >= 0.001) {
     if (x[0] instanceof Int16Array) x = x.map((c) => toFloat(c, n, scale));
-    return { channels: hqStretch(x, len, targetLen, sr, type, ratio), quality: 'hq', formant };
+    return reply(hqStretch(x, len, targetLen, sr, type), 'hq', corrected);
   }
-  if (formant) x = formantPass(x, len, sr, ratio, tailRoom(sr));
-  return fast(timeStretch(x, len, targetLen, sr, type, pitched || converting ? 1 : scale), formant);
+  return reply(timeStretch(x, len, targetLen, sr, type, pitched || converting ? 1 : scale), 'fast', corrected);
 }
 
 // Float copy of c[0, n) (scaled from 16-bit), with `room` spare samples after it.
@@ -107,7 +116,10 @@ function besselI0(x) {
 }
 
 // Polyphase table plus each row's step to the next (for interpolating between phases). Cached:
-// a key change re-renders every layer at the same ratio, and a table costs tens of ms.
+// a key change re-renders every layer at the same ratio, and a table costs tens of ms. The key
+// is the filter's shape alone (cutoff, length, phases) — never the audio — so one job's table
+// is exactly another's and consecutive renders in this worker can't leak into each other. The
+// same holds for the FFT and window caches below, and formantPass keeps its own per-call state.
 const kernels = new Map();
 function kernel(fc, half, phases = RS_PHASES) {
   const key = fc + '/' + half + '/' + phases;
@@ -1078,8 +1090,10 @@ function fold(h, p, n, g) {
   }
 }
 
-function hqStretch(x, n, targetLen, sr, type, ratio) {
-  if (ratio !== 1) x = formantPass(x, n, sr, ratio, 0);
+// x: the loop in [0, n), already pitch-shifted and, when the job asked for it, formant-corrected
+// by run() — the correction is not repeated here, and x's memory lives on as the harmonic part
+// (splitPass reuses it), so nothing in it is corrected twice or dropped before the vocoder.
+function hqStretch(x, n, targetLen, sr, type) {
   const onsets = findOnsets(x, n, sr, ANCHOR[type] || ANCHOR.groove), voiced = FOLD[type] ? voicing(x, n, sr) : null;
   let { h, p, low } = splitPass(x, n, sr, tailRoom(sr));
   if (voiced) fold(h, p, n, voiced);
