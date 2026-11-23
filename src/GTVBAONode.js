@@ -78,6 +78,7 @@ class GTVBAONode extends GTVBAONodeBase {
 		this._upsampleEnabled = uniform( 0 );
 		this._upsampleJitter = uniform( 0 );
 		this._upsampleJitterPhase = uniform( new Vector2() );
+		this._disposed = false;
 		this._onVariantChange = null;
 		this._variantBatchDepth = 0;
 		this._batchedVariantNotify = false;
@@ -201,15 +202,23 @@ class GTVBAONode extends GTVBAONodeBase {
 		return createGtvbaoDepthAwareAoFromBuffers( this, aoTexture, depthTexture, normalTexture, screenUv );
 	}
 	isDepthAwareUpsampleActive() {
-		return this.useDepthAwareUpsample && this.useDepthMips.value && this.resolutionScale < 1;
+		// A disposed node has released its depth MIPs, so the upsample can never
+		// be active again; this keeps the method and the uniform in agreement.
+		return ! this._disposed && this.useDepthAwareUpsample && this.useDepthMips.value && this.resolutionScale < 1;
 	}
 	setSize( width, height ) {
+		if ( this._disposed ) return;
 		const renderTarget = this._getActiveRenderTarget();
 		const targetIsDebug = renderTarget === this._debugRenderTarget;
 		const aoWidth = Math.max( 1, Math.round( width * this.resolutionScale ) );
 		const aoHeight = Math.max( 1, Math.round( height * this.resolutionScale ) );
 		if ( this.useDepthMips.value ) this._depthPrefilter.setSize( aoWidth, aoHeight, width, height );
 		else this._depthPrefilter.release();
+		// The upsample switch belongs to the same sync point as the sizes: after
+		// any setSize the prefilter allocation, the AO target and the switch agree,
+		// so the first frame after a change never samples stale-size MIPs and never
+		// takes the upsample branch with the MIPs released.
+		this._upsampleEnabled.value = this.isDepthAwareUpsampleActive() ? 1 : 0;
 		const projectionScale = this._camera.projectionMatrix.elements[ 5 ];
 		const last = this._lastSize;
 		if (
@@ -229,6 +238,7 @@ class GTVBAONode extends GTVBAONodeBase {
 		this._halfProjScale.value = aoHeight * projectionScale * 0.25;
 	}
 	updateBefore( frame ) {
+		if ( this._disposed ) return;
 		const { renderer } = frame;
 		_rendererState = RendererUtils.resetRendererState( renderer, _rendererState );
 		const size = renderer.getDrawingBufferSize( _size );
@@ -242,7 +252,6 @@ class GTVBAONode extends GTVBAONodeBase {
 			this._temporalOffset.value = 1;
 		}
 		if ( this.useDepthMips.value ) this._depthPrefilter.compute( renderer );
-		this._upsampleEnabled.value = this.isDepthAwareUpsampleActive() ? 1 : 0;
 		const jitterActive = this.useTemporalFiltering === true && this.isDepthAwareUpsampleActive();
 		this._upsampleJitter.value = jitterActive ? this.upsampleJitter : 0;
 		setGtvbaoUpsampleJitterPhase( this._upsampleJitterPhase.value, frame.frameId );
@@ -265,6 +274,12 @@ class GTVBAONode extends GTVBAONodeBase {
 		return this._textureNode;
 	}
 	dispose() {
+		if ( this._disposed ) return;
+		this._disposed = true;
+		// The depth MIPs are released below; the upsample branch must not stay
+		// enabled (or become enabled again) over released textures.
+		this._upsampleEnabled.value = 0;
+		this._upsampleJitter.value = 0;
 		this._depthPrefilter.dispose();
 		this._aoRenderTarget.dispose();
 		this._debugRenderTarget.dispose();

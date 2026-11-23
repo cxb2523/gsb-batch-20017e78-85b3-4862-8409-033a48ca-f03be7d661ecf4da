@@ -126,6 +126,7 @@ class GTVBAODepthPrefilter {
 		this._materials = null;
 		this._targets = [];
 		this._useRenderPasses = false;
+		this._disposed = false;
 		this._width = 0;
 		this._height = 0;
 		this._depthWidth = 0;
@@ -140,6 +141,8 @@ class GTVBAODepthPrefilter {
 		this._disposeKernels();
 	}
 	setSize( width, height, depthWidth, depthHeight ) {
+		// A disposed prefilter must never allocate again.
+		if ( this._disposed ) return;
 		if ( this._width === width && this._height === height && this._depthWidth === depthWidth && this._depthHeight === depthHeight ) return;
 		this._width = width;
 		this._height = height;
@@ -185,7 +188,7 @@ class GTVBAODepthPrefilter {
 		}
 	}
 	compute( renderer ) {
-		if ( this._textures.length === 0 ) return;
+		if ( this._disposed || this._textures.length === 0 ) return;
 		if ( renderer.backend?.isWebGLBackend === true ) {
 			if ( ! this._useRenderPasses ) {
 				this._useRenderPasses = true;
@@ -205,6 +208,8 @@ class GTVBAODepthPrefilter {
 		renderer.compute( this._kernels );
 	}
 	dispose() {
+		if ( this._disposed ) return;
+		this._disposed = true;
 		this._disposeKernels();
 		this._disposeTextures();
 		for ( const placeholder of this._placeholders ) placeholder.dispose();
