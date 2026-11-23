@@ -33,6 +33,7 @@
     "clean": "rm -rf dist",
     "dev": "tsx server.ts",
     "lint": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
     "preview": "vite preview",
     "start": "tsx server.ts"
   },
@@ -57,6 +58,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
+    "jsdom": "^25.0.1",
     "sharp": "^0.35.5",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",

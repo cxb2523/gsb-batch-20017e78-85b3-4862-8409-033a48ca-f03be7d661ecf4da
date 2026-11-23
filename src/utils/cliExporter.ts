@@ -336,6 +336,8 @@ export function generateStandaloneHtml(project: Project): string {
     let voiceEnabled = true;
     let lastTimestamp = 0;
     let liveWordIdx = -1;
+    let narrationEpoch = 0;
+    let isScrubbing = false;
 
     const canvas = document.getElementById('playerCanvas');
     const ctx = canvas.getContext('2d');
@@ -458,51 +460,81 @@ export function generateStandaloneHtml(project: Project): string {
       subtitlesPill.innerHTML = html;
     }
 
-    function speakNarration(text) {
-      if (!voiceEnabled || !window.speechSynthesis || !text) return;
+    function speakNarration(text, startWordIndex) {
+      if (!voiceEnabled || !window.speechSynthesis || !text) return 0;
+      var allWords = text.trim().split(/\\s+/).filter(Boolean);
+      var from = Math.max(0, Math.min(allWords.length - 1, startWordIndex || 0));
+      var words = allWords.slice(from);
+      if (!words.length) return 0;
+      var spoken = words.join(' ');
+      var epoch = ++narrationEpoch;
       window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
+      var u = new SpeechSynthesisUtterance(spoken);
       u.rate = project.voiceRate || 1.0;
       u.pitch = project.voicePitch || 1.0;
       u.onboundary = (e) => {
+        if (epoch !== narrationEpoch) return;
         if (e.name === 'word') {
-          const before = text.slice(0, e.charIndex).trim();
-          liveWordIdx = before ? before.split(/\\s+/).filter(Boolean).length : 0;
+          var before = spoken.slice(0, e.charIndex).trim();
+          liveWordIdx = from + (before ? before.split(/\\s+/).filter(Boolean).length : 0);
         }
       };
-      u.onend = () => { liveWordIdx = -1; };
-      u.onerror = () => { liveWordIdx = -1; };
+      u.onend = () => {
+        if (epoch !== narrationEpoch) return;
+        liveWordIdx = -1;
+      };
+      u.onerror = () => {
+        if (epoch !== narrationEpoch) return;
+        liveWordIdx = -1;
+      };
       window.speechSynthesis.speak(u);
+      return epoch;
     }
 
     function stopSpeaking() {
+      narrationEpoch++;
       if (window.speechSynthesis) window.speechSynthesis.cancel();
       liveWordIdx = -1;
+    }
+
+    function wordIndexForTime(time) {
+      var words = (getActiveScene().narration || '').trim().split(/\\s+/).filter(Boolean);
+      if (!words.length) return 0;
+      var duration = Math.max(0.1, getActiveScene().durationSeconds || 7);
+      var ratio = Math.min(1, Math.max(0, time / duration));
+      return Math.min(words.length - 1, Math.floor(ratio * words.length + 1e-9));
+    }
+
+    function speakFromTime() {
+      var scene = getActiveScene();
+      speakNarration(scene.narration, wordIndexForTime(currentTime));
     }
 
     function setScene(idx) {
       currentSceneIdx = Math.max(0, Math.min(project.scenes.length - 1, idx));
       currentTime = 0;
       stopSpeaking();
-      const scene = getActiveScene();
+      var scene = getActiveScene();
       scrubber.max = scene.durationSeconds || 7;
       totalTimeLbl.textContent = (scene.durationSeconds || 7).toFixed(1) + 's';
       sceneIndicator.textContent = 'Scene ' + (currentSceneIdx + 1) + ' / ' + project.scenes.length + ' · ' + scene.title;
       renderScene(0);
       if (isPlaying) {
-        speakNarration(scene.narration);
+        speakFromTime();
       }
     }
 
     function loop(timestamp) {
       if (!isPlaying) return;
       if (!lastTimestamp) lastTimestamp = timestamp;
-      const delta = (timestamp - lastTimestamp) / 1000;
+      var delta = (timestamp - lastTimestamp) / 1000;
       lastTimestamp = timestamp;
 
-      currentTime += delta;
-      const scene = getActiveScene();
-      const duration = scene.durationSeconds || 7;
+      if (!isScrubbing) {
+        currentTime += delta;
+      }
+      var scene = getActiveScene();
+      var duration = scene.durationSeconds || 7;
 
       if (currentTime >= duration) {
         if (currentSceneIdx < project.scenes.length - 1) {
@@ -526,9 +558,9 @@ export function generateStandaloneHtml(project: Project): string {
       if (isPlaying) {
         playBtn.textContent = '⏸ Pause';
         lastTimestamp = performance.now();
-        const scene = getActiveScene();
+        var scene = getActiveScene();
         if (currentTime >= (scene.durationSeconds || 7)) currentTime = 0;
-        speakNarration(scene.narration);
+        speakFromTime();
         requestAnimationFrame(loop);
       } else {
         playBtn.textContent = '▶ Play';
@@ -541,7 +573,7 @@ export function generateStandaloneHtml(project: Project): string {
     restartBtn.addEventListener('click', () => {
       currentTime = 0;
       stopSpeaking();
-      if (isPlaying) speakNarration(getActiveScene().narration);
+      if (isPlaying) speakFromTime();
       renderScene(0);
     });
 
@@ -549,7 +581,7 @@ export function generateStandaloneHtml(project: Project): string {
       voiceEnabled = !voiceEnabled;
       voiceBtn.textContent = voiceEnabled ? '🔊 Voice: ON' : '🔇 Voice: OFF';
       if (!voiceEnabled) stopSpeaking();
-      else if (isPlaying) speakNarration(getActiveScene().narration);
+      else if (isPlaying) speakFromTime();
     });
 
     fsBtn.addEventListener('click', () => {
@@ -557,10 +589,22 @@ export function generateStandaloneHtml(project: Project): string {
       else document.exitFullscreen();
     });
 
+    scrubber.addEventListener('pointerdown', () => {
+      isScrubbing = true;
+      stopSpeaking();
+    });
+
     scrubber.addEventListener('input', (e) => {
+      isScrubbing = true;
       currentTime = parseFloat(e.target.value);
+      liveWordIdx = -1;
       curTimeLbl.textContent = currentTime.toFixed(1) + 's';
       renderScene(currentTime);
+    });
+
+    scrubber.addEventListener('change', () => {
+      isScrubbing = false;
+      if (isPlaying) speakFromTime();
     });
 
     // Initial load

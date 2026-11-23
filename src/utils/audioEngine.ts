@@ -1,4 +1,11 @@
 // Audio Engine with real-time generative background music, Web Speech TTS, and auto-ducking
+//
+// Lifecycle contract
+// ------------------
+// Every narration request (Web Speech or a custom uploaded clip) belongs to a *session*.
+// Only the newest session is allowed to touch shared state (ducking, word highlight,
+// end callbacks, fallback timers). Starting or stopping narration bumps the active
+// session so callbacks from an older scene / older utterance become no-ops.
 
 export interface AudioPlaybackState {
   isPlaying: boolean;
@@ -7,36 +14,79 @@ export interface AudioPlaybackState {
   duckingActive: boolean;
 }
 
-export type WordBoundaryListener = (word: string, charIndex: number, wordIndex: number) => void;
+export type WordBoundaryListener = (
+  word: string,
+  charIndex: number,
+  wordIndex: number,
+  sessionId: number
+) => void;
 
-class AudioEngine {
+export interface NarrationOptions {
+  /** Speak only the words starting at this index (used after seeking / resuming). */
+  startWordIndex?: number;
+}
+
+export interface CustomAudioOptions {
+  /** Start the uploaded track at this offset (seconds). */
+  startTime?: number;
+}
+
+/** Full-volume background music level. */
+export const MUSIC_LEVEL = 0.25;
+/** Ducking level applied while the narrator is speaking. */
+export const MUSIC_DUCK_LEVEL = 0.08;
+
+type TimerId = ReturnType<typeof setInterval>;
+
+export class AudioEngine {
   private ctx: AudioContext | null = null;
   private musicGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private masterGain: GainNode | null = null;
-  private isMusicPlaying = false;
-  private musicInterval: number | null = null;
+  private isMusicPlayingActive = false;
+  private musicInterval: TimerId | null = null;
   private currentTrack = 'lofi';
   private speechUtterance: SpeechSynthesisUtterance | null = null;
   private wordListeners: Set<WordBoundaryListener> = new Set();
   private currentWordIndex: number = -1;
   private currentSpokenWord: string = '';
-  private fallbackWordTimer: number | null = null;
+  private fallbackWordTimer: TimerId | null = null;
   private hasReceivedNativeBoundary: boolean = false;
+
+  private sessionSeq: number = 0;
+  private activeSession: number = 0;
+  private activeKind: 'speech' | 'custom' | null = null;
+  private activeOnEnd: (() => void) | null = null;
+  private customAudio: HTMLAudioElement | null = null;
+
+  private duckingActive: boolean = false;
+  private autoDuck: boolean = true;
+  private musicGainTarget: number = MUSIC_LEVEL;
 
   public getCurrentTrack(): string {
     return this.currentTrack;
   }
 
+  /** True while a Web Speech utterance is in flight (custom audio excluded). */
   public isSpeaking(): boolean {
-    return Boolean(this.speechUtterance);
+    return this.activeKind === 'speech' && this.speechUtterance !== null;
+  }
+
+  /** True while *any* narration (speech or uploaded audio) is in flight. */
+  public isNarrationActive(): boolean {
+    return this.activeSession !== 0;
+  }
+
+  /** Monotonic id of the currently active narration session (0 = idle). */
+  public getActiveSessionId(): number {
+    return this.activeSession;
   }
 
   public addWordListener(listener: WordBoundaryListener): () => void {
     this.wordListeners.add(listener);
-    if (this.currentWordIndex >= 0) {
+    if (this.activeSession !== 0 && this.currentWordIndex >= 0) {
       try {
-        listener(this.currentSpokenWord, 0, this.currentWordIndex);
+        listener(this.currentSpokenWord, 0, this.currentWordIndex, this.activeSession);
       } catch {}
     }
     return () => {
@@ -44,12 +94,15 @@ class AudioEngine {
     };
   }
 
-  public notifyWord(word: string, charIndex: number, wordIndex: number) {
-    this.currentSpokenWord = word;
-    this.currentWordIndex = wordIndex;
+  public notifyWord(word: string, charIndex: number, wordIndex: number, sessionId?: number) {
+    const session = sessionId === undefined ? this.activeSession : sessionId;
+    if (sessionId === undefined || sessionId === this.activeSession) {
+      this.currentSpokenWord = word;
+      this.currentWordIndex = wordIndex;
+    }
     this.wordListeners.forEach((listener) => {
       try {
-        listener(word, charIndex, wordIndex);
+        listener(word, charIndex, wordIndex, session);
       } catch (err) {
         console.error('Error in word listener:', err);
       }
@@ -61,8 +114,11 @@ class AudioEngine {
   }
 
   private initContext() {
+    if (typeof window === 'undefined') return;
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
       this.ctx = new AudioCtx();
 
       this.masterGain = this.ctx.createGain();
@@ -70,12 +126,15 @@ class AudioEngine {
       this.masterGain.connect(this.ctx.destination);
 
       this.musicGain = this.ctx.createGain();
-      this.musicGain.gain.setValueAtTime(0.25, this.ctx.currentTime);
+      this.musicGain.gain.setValueAtTime(this.musicGainTarget, this.ctx.currentTime);
       this.musicGain.connect(this.masterGain);
 
       this.sfxGain = this.ctx.createGain();
       this.sfxGain.gain.setValueAtTime(0.4, this.ctx.currentTime);
       this.sfxGain.connect(this.masterGain);
+
+      // Re-apply the logical ducking target now that the graph exists.
+      this.rampMusicGain(this.musicGainTarget, 0);
     }
 
     if (this.ctx.state === 'suspended') {
@@ -172,21 +231,95 @@ class AudioEngine {
     }
   }
 
-  // Audio Ducking: lowers music when narrator is speaking
-  public setDucking(active: boolean) {
-    if (!this.ctx || !this.musicGain) return;
-    const t = this.ctx.currentTime;
-    const target = active ? 0.08 : 0.25;
-    this.musicGain.gain.cancelScheduledValues(t);
-    this.musicGain.gain.linearRampToValueAtTime(target, t + 0.25);
+  // ---------------------------------------------------------------------------
+  // Music gain / auto-ducking
+  // ---------------------------------------------------------------------------
+
+  public getMusicGainTarget(): number {
+    return this.musicGainTarget;
   }
 
-  // Generative Background Music Tracks
+  public isDuckingActive(): boolean {
+    return this.duckingActive;
+  }
+
+  public isMusicActive(): boolean {
+    return this.isMusicPlayingActive;
+  }
+
+  public getAutoDuck(): boolean {
+    return this.autoDuck;
+  }
+
+  private baseMusicLevel: number = MUSIC_LEVEL;
+
+  /** Set the un-ducked music level (project.musicVolume). */
+  public setMusicVolume(volume: number) {
+    const parsed = Number(volume);
+    this.baseMusicLevel = Number.isFinite(parsed) ? Math.min(1, Math.max(0, parsed)) : MUSIC_LEVEL;
+    this.syncDucking();
+  }
+
+  private rampMusicGain(target: number, rampSeconds: number = 0.25) {
+    this.musicGainTarget = target;
+    if (!this.ctx || !this.musicGain) return;
+    const t = this.ctx.currentTime;
+    const param = this.musicGain.gain;
+    try {
+      param.cancelScheduledValues(t);
+      param.setValueAtTime(param.value, t);
+    } catch {}
+    try {
+      param.linearRampToValueAtTime(target, t + Math.max(0, rampSeconds));
+    } catch {
+      try {
+        param.setValueAtTime(target, t);
+      } catch {}
+    }
+  }
+
+  /**
+   * Ducking is a pure function of "narration session active" + autoDuck setting.
+   * This is what keeps music from remaining ducked after a scene change / pause /
+   * seek, and what makes re-enabling music mid-narration duck immediately.
+   */
+  private syncDucking() {
+    this.duckingActive = this.autoDuck && this.activeSession !== 0;
+    const duckedTarget = Math.min(this.baseMusicLevel, MUSIC_DUCK_LEVEL);
+    this.rampMusicGain(this.duckingActive ? duckedTarget : this.baseMusicLevel);
+  }
+
+  public setAutoDuck(enabled: boolean) {
+    this.autoDuck = Boolean(enabled);
+    this.syncDucking();
+  }
+
+  /**
+   * Explicit duck request kept for API compatibility. It is still gated by autoDuck
+   * and by an active narration session: music is never left ducked when nobody is
+   * speaking.
+   */
+  public setDucking(active: boolean) {
+    this.duckingActive = Boolean(active) && this.autoDuck && this.activeSession !== 0;
+    const duckedTarget = Math.min(this.baseMusicLevel, MUSIC_DUCK_LEVEL);
+    this.rampMusicGain(this.duckingActive ? duckedTarget : this.baseMusicLevel);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generative background music
+  // ---------------------------------------------------------------------------
+
   public startMusic(track: string = 'lofi') {
     this.initContext();
+    if (this.isMusicPlayingActive && this.currentTrack === track) {
+      // Idempotent: never stack a second chord interval for the same track.
+      this.syncDucking();
+      return;
+    }
     this.stopMusic();
     this.currentTrack = track;
-    this.isMusicPlaying = true;
+    this.isMusicPlayingActive = true;
+    this.syncDucking();
 
     // Generative chord progression based on track
     const chordProgressions: Record<string, number[][]> = {
@@ -214,7 +347,7 @@ class AudioEngine {
     let chordIdx = 0;
 
     const playChord = () => {
-      if (!this.isMusicPlaying || !this.ctx || !this.musicGain) return;
+      if (!this.isMusicPlayingActive || !this.ctx || !this.musicGain) return;
       const notes = chords[chordIdx % chords.length];
       chordIdx++;
 
@@ -243,189 +376,337 @@ class AudioEngine {
     };
 
     playChord();
-    this.musicInterval = window.setInterval(playChord, 3200);
+    this.musicInterval = setInterval(playChord, 3200);
   }
 
   public stopMusic() {
-    this.isMusicPlaying = false;
+    this.isMusicPlayingActive = false;
     if (this.musicInterval) {
       clearInterval(this.musicInterval);
       this.musicInterval = null;
     }
   }
 
-  // Web Speech API Voiceover with Word Boundary Synchronization
+  // ---------------------------------------------------------------------------
+  // Narration (Web Speech + custom audio) session management
+  // ---------------------------------------------------------------------------
+
+  private hasSpeechSupport(): boolean {
+    return (
+      typeof window !== 'undefined' &&
+      'speechSynthesis' in window &&
+      typeof SpeechSynthesisUtterance !== 'undefined'
+    );
+  }
+
+  private clearFallbackTimer() {
+    if (this.fallbackWordTimer) {
+      clearInterval(this.fallbackWordTimer);
+      this.fallbackWordTimer = null;
+    }
+  }
+
+  private teardownCustomAudio() {
+    const audio = this.customAudio;
+    if (!audio) return;
+    this.customAudio = null;
+    try {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.currentTime = 0;
+    } catch {}
+  }
+
+  /**
+   * Stop whichever narration is active, clear its fallback timer, detach custom
+   * audio callbacks and restore music volume. Ending a session notifies its owner
+   * exactly once; stale utterance/browser callbacks can no longer reach state.
+   */
+  public stopNarration() {
+    const hadSession = this.activeSession !== 0;
+    const onEnd = this.activeOnEnd;
+
+    this.activeSession = 0;
+    this.activeKind = null;
+    this.activeOnEnd = null;
+
+    this.clearFallbackTimer();
+    this.speechUtterance = null;
+    if (this.hasSpeechSupport()) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
+    }
+    this.teardownCustomAudio();
+
+    this.currentWordIndex = -1;
+    this.currentSpokenWord = '';
+    this.notifyWord('', -1, -1, 0);
+    this.syncDucking();
+
+    if (hadSession && onEnd) {
+      try {
+        onEnd();
+      } catch (err) {
+        console.error('Error in narration end callback:', err);
+      }
+    }
+  }
+
+  /** Backwards-compatible alias used by the script editor / legacy callers. */
+  public stopSpeaking() {
+    this.stopNarration();
+  }
+
+  /**
+   * Speak narration. Returns the new session id (0 when nothing was spoken).
+   * Any previous narration is stopped first, so repeated calls can never stack.
+   */
   public speakNarration(
     text: string,
     onWordSpoken?: (word: string, charIndex: number, wordIndex: number) => void,
     onEnd?: () => void,
     rate: number = 1.0,
-    pitch: number = 1.0
-  ) {
-    if (!('speechSynthesis' in window)) {
+    pitch: number = 1.0,
+    options: NarrationOptions = {}
+  ): number {
+    this.stopNarration();
+
+    const trimmedText = typeof text === 'string' ? text.trim() : '';
+    if (!trimmedText || !this.hasSpeechSupport()) {
       if (onEnd) onEnd();
-      return;
+      return 0;
     }
 
-    this.stopSpeaking();
-    this.setDucking(true);
+    this.initContext();
 
-    if (!text || !text.trim()) {
+    const session = ++this.sessionSeq;
+    this.activeSession = session;
+    this.activeKind = 'speech';
+    this.activeOnEnd = onEnd || null;
+    this.syncDucking();
+
+    const allWords = trimmedText.split(/\s+/).filter(Boolean);
+    const startWordIndex = Math.max(0, Math.min(allWords.length - 1, options.startWordIndex ?? 0));
+    const wordsList = allWords.slice(startWordIndex);
+    if (wordsList.length === 0) {
+      this.stopNarration();
       if (onEnd) onEnd();
-      return;
+      return 0;
     }
+    const spokenText = wordsList.join(' ');
 
-    const trimmedText = text.trim();
-    const wordsList = trimmedText.split(/\s+/).filter(Boolean);
-
-    const utterance = new SpeechSynthesisUtterance(trimmedText);
+    const utterance = new SpeechSynthesisUtterance(spokenText);
     utterance.rate = Math.max(0.7, Math.min(1.5, rate));
     utterance.pitch = Math.max(0.8, Math.min(1.3, pitch));
 
     // Try to pick a natural English voice
-    const voices = window.speechSynthesis.getVoices();
-    const naturalVoice = voices.find(
-      (v) => (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Siri') || v.name.includes('Samantha') || v.name.includes('Daniel')) && v.lang.startsWith('en')
-    ) || voices.find((v) => v.lang.startsWith('en'));
-
-    if (naturalVoice) {
-      utterance.voice = naturalVoice;
+    try {
+      const voices = window.speechSynthesis.getVoices();
+      const naturalVoice =
+        voices.find(
+          (v) =>
+            (v.name.includes('Natural') ||
+              v.name.includes('Google') ||
+              v.name.includes('Siri') ||
+              v.name.includes('Samantha') ||
+              v.name.includes('Daniel')) &&
+            v.lang.startsWith('en')
+        ) || voices.find((v) => v.lang.startsWith('en'));
+      if (naturalVoice) utterance.voice = naturalVoice;
+    } catch {
+      // Voice list unavailable
     }
 
     this.hasReceivedNativeBoundary = false;
 
-    // Fallback timer: in case SpeechSynthesis onboundary is not fired by the OS/voice
-    // Estimates speech progress (~2.6 words per second scaled by rate)
+    // Fallback timer: in case SpeechSynthesis onboundary is not fired by the OS/voice.
+    // Estimates speech progress (~2.6 words per second scaled by rate). Every tick
+    // re-checks the session id so a timer from a previous scene can never write into
+    // the current scene's subtitle state.
     let fallbackIdx = 0;
     const intervalMs = Math.max(150, Math.round(1000 / (2.6 * utterance.rate)));
-    this.fallbackWordTimer = window.setInterval(() => {
+    this.fallbackWordTimer = setInterval(() => {
+      if (session !== this.activeSession) {
+        this.clearFallbackTimer();
+        return;
+      }
       if (this.hasReceivedNativeBoundary) {
-        if (this.fallbackWordTimer) {
-          clearInterval(this.fallbackWordTimer);
-          this.fallbackWordTimer = null;
-        }
+        this.clearFallbackTimer();
         return;
       }
       if (fallbackIdx < wordsList.length) {
         const spokenWord = wordsList[fallbackIdx];
-        if (onWordSpoken) {
-          onWordSpoken(spokenWord, 0, fallbackIdx);
-        }
-        this.notifyWord(spokenWord, 0, fallbackIdx);
+        const wordIndex = startWordIndex + fallbackIdx;
         fallbackIdx++;
+        try {
+          if (onWordSpoken) onWordSpoken(spokenWord, 0, wordIndex);
+        } catch (err) {
+          console.error('Error in word callback:', err);
+        }
+        this.notifyWord(spokenWord, 0, wordIndex, session);
+      } else {
+        this.clearFallbackTimer();
       }
     }, intervalMs);
 
     utterance.onboundary = (event) => {
-      if (event.name === 'word') {
-        this.hasReceivedNativeBoundary = true;
-        if (this.fallbackWordTimer) {
-          clearInterval(this.fallbackWordTimer);
-          this.fallbackWordTimer = null;
-        }
+      if (session !== this.activeSession) return;
+      if (event.name !== 'word') return;
 
-        const charIdx = event.charIndex;
-        const slice = trimmedText.slice(charIdx);
-        const match = slice.match(/^[\w'-]+/);
-        const spokenWord = match
-          ? match[0]
-          : event.charLength
-          ? trimmedText.substring(charIdx, charIdx + event.charLength)
-          : '';
+      this.hasReceivedNativeBoundary = true;
+      this.clearFallbackTimer();
 
-        // Calculate 0-based word index
-        const textBefore = trimmedText.slice(0, charIdx);
-        const wordsBefore = textBefore.trim() ? textBefore.trim().split(/\s+/).filter(Boolean) : [];
-        const wordIndex = wordsBefore.length;
+      const charIdx = event.charIndex;
+      const slice = spokenText.slice(charIdx);
+      const match = slice.match(/^[\w'-]+/);
+      const spokenWord = match
+        ? match[0]
+        : event.charLength
+        ? spokenText.substring(charIdx, charIdx + event.charLength)
+        : '';
 
-        if (onWordSpoken) {
-          onWordSpoken(spokenWord, charIdx, wordIndex);
-        }
-        this.notifyWord(spokenWord, charIdx, wordIndex);
+      const textBefore = spokenText.slice(0, charIdx);
+      const wordsBefore = textBefore.trim() ? textBefore.trim().split(/\s+/).filter(Boolean) : [];
+      const wordIndex = startWordIndex + wordsBefore.length;
+
+      try {
+        if (onWordSpoken) onWordSpoken(spokenWord, charIdx, wordIndex);
+      } catch (err) {
+        console.error('Error in word callback:', err);
       }
+      this.notifyWord(spokenWord, charIdx, wordIndex, session);
     };
 
-    utterance.onend = () => {
-      if (this.fallbackWordTimer) {
-        clearInterval(this.fallbackWordTimer);
-        this.fallbackWordTimer = null;
-      }
-      this.setDucking(false);
+    const finish = () => {
+      if (session !== this.activeSession) return;
+      this.clearFallbackTimer();
       this.speechUtterance = null;
-      this.notifyWord('', -1, -1);
-      if (onEnd) onEnd();
+      this.activeSession = 0;
+      this.activeKind = null;
+      const callback = this.activeOnEnd;
+      this.activeOnEnd = null;
+      this.currentWordIndex = -1;
+      this.currentSpokenWord = '';
+      this.notifyWord('', -1, -1, 0);
+      this.syncDucking();
+      if (callback) {
+        try {
+          callback();
+        } catch (err) {
+          console.error('Error in narration end callback:', err);
+        }
+      }
     };
 
-    utterance.onerror = () => {
-      if (this.fallbackWordTimer) {
-        clearInterval(this.fallbackWordTimer);
-        this.fallbackWordTimer = null;
-      }
-      this.setDucking(false);
-      this.speechUtterance = null;
-      this.notifyWord('', -1, -1);
-      if (onEnd) onEnd();
-    };
+    utterance.onend = finish;
+    utterance.onerror = finish;
 
     this.speechUtterance = utterance;
-    window.speechSynthesis.speak(utterance);
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      finish();
+    }
+
+    return session;
   }
 
-  private customAudio: HTMLAudioElement | null = null;
+  /**
+   * Play an uploaded voiceover clip with the same session semantics as TTS.
+   * Returns the session id (0 when playback could not start).
+   */
+  public playCustomAudio(url: string, onEnd?: () => void, options: CustomAudioOptions = {}): number {
+    const AudioCtor: typeof Audio | undefined =
+      typeof Audio !== 'undefined'
+        ? Audio
+        : typeof window !== 'undefined'
+        ? (window as unknown as { Audio?: typeof Audio }).Audio
+        : undefined;
 
-  public playCustomAudio(url: string, onEnd?: () => void) {
-    this.stopSpeaking();
-    this.setDucking(true);
-    if (this.customAudio) {
-      this.customAudio.pause();
-      this.customAudio = null;
+    this.stopNarration();
+
+    if (!AudioCtor) {
+      if (onEnd) onEnd();
+      return 0;
     }
-    const audio = new Audio(url);
-    audio.onended = () => {
-      this.setDucking(false);
+
+    const session = ++this.sessionSeq;
+    this.activeSession = session;
+    this.activeKind = 'custom';
+    this.activeOnEnd = onEnd || null;
+    this.syncDucking();
+
+    const audio = new AudioCtor(url);
+
+    const finish = () => {
+      if (session !== this.activeSession) return;
       this.customAudio = null;
-      this.notifyWord('', -1, -1);
-      if (onEnd) onEnd();
+      this.activeSession = 0;
+      this.activeKind = null;
+      const callback = this.activeOnEnd;
+      this.activeOnEnd = null;
+      this.currentWordIndex = -1;
+      this.currentSpokenWord = '';
+      this.notifyWord('', -1, -1, 0);
+      this.syncDucking();
+      if (callback) {
+        try {
+          callback();
+        } catch (err) {
+          console.error('Error in narration end callback:', err);
+        }
+      }
     };
-    audio.onerror = () => {
-      this.setDucking(false);
-      this.customAudio = null;
-      this.notifyWord('', -1, -1);
-      if (onEnd) onEnd();
-    };
+
+    audio.onended = finish;
+    audio.onerror = finish;
+
+    if (options.startTime && options.startTime > 0) {
+      try {
+        audio.currentTime = options.startTime;
+      } catch {}
+    }
+
     this.customAudio = audio;
-    audio.play().catch(() => {});
+    try {
+      const playResult = audio.play();
+      if (playResult && typeof playResult.catch === 'function') {
+        playResult.catch(() => {});
+      }
+    } catch {}
+
+    return session;
+  }
+
+  /** Seek the uploaded clip, if one is active. */
+  public seekCustomAudio(time: number) {
+    if (!this.customAudio) return;
+    try {
+      this.customAudio.currentTime = Math.max(0, time);
+    } catch {}
   }
 
   public stopCustomAudio() {
-    if (this.customAudio) {
-      this.customAudio.pause();
-      this.customAudio.currentTime = 0;
-      this.customAudio = null;
+    if (this.activeKind === 'custom') {
+      this.stopNarration();
+      return;
     }
-    this.setDucking(false);
-    this.notifyWord('', -1, -1);
-  }
-
-  public stopSpeaking() {
-    if (this.fallbackWordTimer) {
-      clearInterval(this.fallbackWordTimer);
-      this.fallbackWordTimer = null;
-    }
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-    this.speechUtterance = null;
-    this.notifyWord('', -1, -1);
-    this.stopCustomAudio();
-    this.setDucking(false);
+    this.teardownCustomAudio();
   }
 
   public stopAll() {
-    this.stopSpeaking();
-    this.stopCustomAudio();
+    this.stopNarration();
     this.stopMusic();
-    this.notifyWord('', -1, -1);
+  }
+
+  /** Tear everything down (used by tests and full app resets). */
+  public dispose() {
+    this.stopAll();
+    this.wordListeners.clear();
+    this.currentWordIndex = -1;
+    this.currentSpokenWord = '';
   }
 }
 

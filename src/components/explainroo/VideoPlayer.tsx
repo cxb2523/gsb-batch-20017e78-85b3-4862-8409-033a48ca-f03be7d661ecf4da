@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Play,
   Pause,
@@ -14,6 +14,7 @@ import {
 import { Scene, ThemeLook } from '../../types/explainroo';
 import { renderSceneToCanvas } from '../../utils/canvasRenderer';
 import { audioEngine } from '../../utils/audioEngine';
+import { PlaybackController } from '../../utils/playbackController';
 
 interface VideoPlayerProps {
   scene: Scene;
@@ -29,6 +30,7 @@ interface VideoPlayerProps {
   autoDuck: boolean;
   voiceRate: number;
   voicePitch: number;
+  musicVolume?: number;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
@@ -42,34 +44,94 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   onPrevScene,
   onNextScene,
   musicTrack,
+  autoDuck,
   voiceRate,
   voicePitch,
+  musicVolume,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
-  const [currentTime, setCurrentTime] = useState<number>(0);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
-  const [isVoiceMuted, setIsVoiceMuted] = useState<boolean>(false);
-  const [isMusicEnabled, setIsMusicEnabled] = useState<boolean>(true);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isSubtitlesEnabled, setIsSubtitlesEnabled] = useState<boolean>(true);
-  const [liveWordIndex, setLiveWordIndex] = useState<number>(-1);
-
-  // Subscribe to real-time word boundary notifications from AudioEngine
-  useEffect(() => {
-    const unsub = audioEngine.addWordListener((_word, _charIdx, wordIdx) => {
-      setLiveWordIndex(wordIdx);
-    });
-    return () => unsub();
-  }, []);
 
   // Dragging state for interactive canvas editing
   const [draggingElementId, setDraggingElementId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
-  const duration = scene.durationSeconds || 7;
+  // Latest callbacks kept in refs so the controller never captures stale props.
+  const onNextSceneRef = useRef(onNextScene);
+  onNextSceneRef.current = onNextScene;
+
+  // One controller (and therefore one playback session owner) for this player.
+  const controller = useMemo(() => new PlaybackController(audioEngine), []);
+
+  const [snapshot, setSnapshot] = useState(() => controller.getSnapshot());
+
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(setSnapshot);
+    controller.setCallbacks({
+      onSceneEnd: () => onNextSceneRef.current(),
+    });
+    // Narration can also be stopped from outside (script editor preview); drop the
+    // stale subtitle override in that case so the highlight falls back to the clock.
+    const unsubscribeWord = audioEngine.addWordListener((_word, _charIdx, wordIdx, sessionId) => {
+      if (wordIdx < 0) controller.observeEngineWord(sessionId, wordIdx);
+    });
+    return () => {
+      unsubscribe();
+      unsubscribeWord();
+      controller.dispose();
+    };
+  }, [controller]);
+
+  // Bind scene + settings. `updateScene` is a no-op for same-scene edits, so
+  // typing narration or dragging an element never restarts the voiceover.
+  useEffect(() => {
+    controller.updateScene(scene, currentSceneIndex, totalScenes);
+  }, [controller, scene, currentSceneIndex, totalScenes]);
+
+  useEffect(() => {
+    controller.setMusicTrack(musicTrack);
+  }, [controller, musicTrack]);
+
+  useEffect(() => {
+    controller.setAutoDuck(autoDuck);
+  }, [controller, autoDuck]);
+
+  useEffect(() => {
+    controller.setSpeechParams(voiceRate, voicePitch);
+  }, [controller, voiceRate, voicePitch]);
+
+  useEffect(() => {
+    if (typeof musicVolume === 'number') controller.setMusicVolume(musicVolume);
+  }, [controller, musicVolume]);
+
+  useEffect(() => {
+    controller.setPlaybackSpeed(playbackSpeed);
+  }, [controller, playbackSpeed]);
+
+  // Animation frame loop: drives the timeline, scene rollover and pause state.
+  useEffect(() => {
+    if (!snapshot.isPlaying) return;
+    let animId = 0;
+    let lastTimestamp: number | null = null;
+
+    const loop = (timestamp: number) => {
+      if (lastTimestamp === null) lastTimestamp = timestamp;
+      const delta = (timestamp - lastTimestamp) / 1000;
+      lastTimestamp = timestamp;
+      controller.advance(delta * controller.getPlaybackSpeed());
+      animId = requestAnimationFrame(loop);
+    };
+
+    animId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animId);
+  }, [controller, snapshot.isPlaying]);
+
+  const duration = snapshot.duration;
+  const currentTime = snapshot.currentTime;
 
   // Render canvas whenever state changes
   const redrawCanvas = useCallback(
@@ -82,129 +144,43 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         currentTime: time,
         theme,
         selectedElementId: selectedId,
-        interactiveMode: !isPlaying,
+        interactiveMode: !snapshot.isPlaying,
       });
     },
-    [scene, theme, isPlaying]
+    [scene, theme, snapshot.isPlaying]
   );
 
-  // Redraw when scene, time, theme, or selection changes
   useEffect(() => {
-    redrawCanvas(currentTime, selectedElementId);
-  }, [redrawCanvas, currentTime, selectedElementId]);
-
-  // Reset playback time and live subtitle sync when scene changes
-  useEffect(() => {
-    setCurrentTime(0);
-    setLiveWordIndex(-1);
-  }, [scene.id]);
-
-  // Keep a ref to the latest time so the rAF loop does not need to call parent callbacks inside setState
-  const currentTimeRef = useRef<number>(0);
-  currentTimeRef.current = currentTime;
-
-  // Animation frame loop for smooth playback
-  useEffect(() => {
-    let animId: number;
-    let lastTimestamp: number | null = null;
-
-    if (isPlaying) {
-      if (isMusicEnabled) {
-        audioEngine.startMusic(musicTrack);
-      }
-
-      // Trigger voiceover (custom uploaded audio or Web Speech synthesis)
-      if (!isVoiceMuted) {
-        if (scene.customAudioUrl) {
-          audioEngine.playCustomAudio(scene.customAudioUrl);
-        } else if (scene.narration) {
-          audioEngine.speakNarration(
-            scene.narration,
-            (_word, _charIdx, wordIdx) => {
-              setLiveWordIndex(wordIdx);
-            },
-            () => {
-              setLiveWordIndex(-1);
-            },
-            voiceRate,
-            voicePitch
-          );
-        }
-      }
-
-      const loop = (timestamp: number) => {
-        if (!lastTimestamp) lastTimestamp = timestamp;
-        const delta = (timestamp - lastTimestamp) / 1000;
-        lastTimestamp = timestamp;
-
-        const nextTime = currentTimeRef.current + delta * playbackSpeed;
-
-        if (nextTime >= duration) {
-          if (currentSceneIndex < totalScenes - 1) {
-            setCurrentTime(0);
-            setLiveWordIndex(-1);
-            onNextScene();
-          } else {
-            setCurrentTime(duration);
-            setIsPlaying(false);
-            setLiveWordIndex(-1);
-            audioEngine.stopSpeaking();
-            return;
-          }
-        } else {
-          setCurrentTime(nextTime);
-        }
-
-        animId = requestAnimationFrame(loop);
-      };
-
-      animId = requestAnimationFrame(loop);
-    } else {
-      setLiveWordIndex(-1);
-      audioEngine.stopSpeaking();
-    }
-
-    return () => {
-      if (animId) cancelAnimationFrame(animId);
-      setLiveWordIndex(-1);
-      audioEngine.stopSpeaking();
-    };
-  }, [
-    isPlaying,
-    playbackSpeed,
-    duration,
-    currentSceneIndex,
-    totalScenes,
-    onNextScene,
-    isMusicEnabled,
-    musicTrack,
-    isVoiceMuted,
-    scene.narration,
-    voiceRate,
-    voicePitch,
-  ]);
+    redrawCanvas(snapshot.currentTime, selectedElementId);
+  }, [redrawCanvas, snapshot.currentTime, selectedElementId]);
 
   const togglePlay = () => {
-    if (currentTime >= duration) {
-      setCurrentTime(0);
-    }
-    setIsPlaying((prev) => !prev);
+    controller.togglePlay();
   };
 
   const handleRewind = () => {
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setLiveWordIndex(-1);
-    audioEngine.stopSpeaking();
+    controller.restart();
     audioEngine.playWhoosh();
+  };
+
+  const handleSeekStart = () => {
+    controller.beginScrub();
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newTime = parseFloat(e.target.value);
-    setCurrentTime(newTime);
-    if (!isPlaying) {
-      setLiveWordIndex(-1);
-    }
+    if (!controller.isScrubbingActive()) controller.beginScrub();
+    controller.scrubTo(Number.isFinite(newTime) ? newTime : 0);
+  };
+
+  /**
+   * Drags end in different orders per browser/input type (`pointerup` may arrive
+   * before or after `change`, and keyboard seeking fires only `change`). Ending a
+   * scrub is idempotent, so calling it from several handlers is safe and never
+   * starts a second narration.
+   */
+  const handleSeekEnd = () => {
+    controller.endScrub();
   };
 
   // Canvas Mouse / Touch interactions for direct visual manipulation
@@ -221,7 +197,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (isPlaying) return;
+    if (snapshot.isPlaying) return;
     const { x, y } = getCanvasCoords(e.clientX, e.clientY);
 
     // Hit test reverse (top-most elements first)
@@ -247,7 +223,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!draggingElementId || isPlaying) return;
+    if (!draggingElementId || snapshot.isPlaying) return;
     const { x, y } = getCanvasCoords(e.clientX, e.clientY);
     const newX = Math.round(x - dragOffset.x);
     const newY = Math.round(y - dragOffset.y);
@@ -268,6 +244,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       setIsFullscreen(false);
     }
   };
+
+  const isPlaying = snapshot.isPlaying;
+  const isVoiceMuted = snapshot.voiceMuted;
+  const isMusicEnabled = snapshot.musicEnabled;
 
   return (
     <div
@@ -312,12 +292,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 {(() => {
                   const words = scene.narration.split(/\s+/).filter(Boolean);
                   if (words.length === 0) return null;
-                  const progress = Math.min(0.999, Math.max(0, currentTime / Math.max(0.1, duration)));
-                  const computedFallbackIdx = Math.min(words.length - 1, Math.floor(progress * words.length));
                   const activeIdx =
-                    isPlaying && liveWordIndex >= 0 && liveWordIndex < words.length
-                      ? liveWordIndex
-                      : computedFallbackIdx;
+                    snapshot.activeWordIndex >= 0 && snapshot.activeWordIndex < words.length
+                      ? snapshot.activeWordIndex
+                      : Math.min(words.length - 1, Math.floor(Math.min(0.999, Math.max(0, currentTime / Math.max(0.1, duration))) * words.length));
 
                   // Rolling window of up to 7 words centered around active word
                   const windowSize = Math.min(words.length, 7);
@@ -369,7 +347,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               max={duration}
               step={0.05}
               value={currentTime}
+              onPointerDown={handleSeekStart}
+              onPointerUp={handleSeekEnd}
+              onPointerCancel={handleSeekEnd}
               onChange={handleSeek}
+              onKeyUp={handleSeekEnd}
+              onBlur={handleSeekEnd}
               className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-400 hover:accent-amber-300"
             />
 
@@ -408,8 +391,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 <button
                   key={el.id}
                   onClick={() => {
-                    setCurrentTime(t);
                     onSelectElement(el.id);
+                    controller.seek(t);
                   }}
                   className={`px-2 py-0.5 rounded-md border flex items-center gap-1 shrink-0 transition-colors cursor-pointer text-[10px] ${
                     isSelected
@@ -505,7 +488,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
             {/* Voice Narration Audio Toggle */}
             <button
-              onClick={() => setIsVoiceMuted((v) => !v)}
+              onClick={() => controller.setVoiceMuted(!isVoiceMuted)}
               className={`p-1.5 rounded-lg border transition-colors cursor-pointer ${
                 isVoiceMuted
                   ? 'bg-rose-500/10 border-rose-500/30 text-rose-400'
@@ -518,15 +501,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
             {/* Background Music Toggle */}
             <button
-              onClick={() => {
-                if (isMusicEnabled) {
-                  audioEngine.stopMusic();
-                  setIsMusicEnabled(false);
-                } else {
-                  setIsMusicEnabled(true);
-                  if (isPlaying) audioEngine.startMusic(musicTrack);
-                }
-              }}
+              onClick={() => controller.setMusicEnabled(!isMusicEnabled)}
               className={`p-1.5 rounded-lg border transition-colors cursor-pointer ${
                 isMusicEnabled
                   ? 'bg-amber-500/15 border-amber-500/30 text-amber-300'

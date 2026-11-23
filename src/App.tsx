@@ -331,6 +331,7 @@ export const App: React.FC = () => {
             onPrevScene={() => handleSelectScene(activeSceneIndex - 1)}
             onNextScene={() => handleSelectScene(activeSceneIndex + 1)}
             musicTrack={project.musicTrack}
+            musicVolume={project.musicVolume}
             autoDuck={project.autoDuck}
             voiceRate={project.voiceRate}
             voicePitch={project.voicePitch}
