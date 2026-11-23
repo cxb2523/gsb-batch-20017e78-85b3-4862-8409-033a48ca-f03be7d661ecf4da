@@ -46,6 +46,11 @@ export interface RiggingOptions {
   ikIterations?: number;
   /** Falloff radius for procedural skin weights (biharmonic distance approx) */
   skinningFalloff?: number;
+  /**
+   * Optional per-request timeout (ms) for worker INIT/RIG requests.
+   * A timed-out request rejects and releases its buffers; unset = no timeout.
+   */
+  requestTimeoutMs?: number;
 }
 
 export interface IKTarget {
