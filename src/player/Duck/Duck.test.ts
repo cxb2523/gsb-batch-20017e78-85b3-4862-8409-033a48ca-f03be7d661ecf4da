@@ -4,9 +4,9 @@ import { brushFromAABB } from '../../physics/Collision/Collision';
 import { World } from '../../physics/World/World';
 import { DEFAULT_SETTINGS } from '../../settings/Settings';
 import { PlayerController } from '../PlayerController';
-import { AIR_DUCK_ORIGIN_SHIFT } from './Duck.config';
-import { updateDuck } from './Duck';
-import { DUCK_IN_SPEED_FACTOR, DUCK_SPEED_IDEAL, TIME_BETWEEN_DUCKS } from './Duck.config';
+import { AIR_DUCK_ORIGIN_SHIFT, HULL_DUCK_HEIGHT, HULL_STAND_HEIGHT } from './Duck.config';
+import { updateDuck, applyDuckHull } from './Duck';
+import { DUCK_IN_SPEED_FACTOR, DUCK_SPEED_IDEAL, EYE_DUCK, EYE_STAND, TIME_BETWEEN_DUCKS } from './Duck.config';
 import { currentMaxSpeed } from '../CurrentMaxSpeed/CurrentMaxSpeed';
 
 const DT = 1 / 128;
@@ -142,6 +142,209 @@ describe('timed ground duck (CCSGameMovement::Duck)', () => {
     p.time += TIME_BETWEEN_DUCKS;
     updateDuck(p, DT);
     expect(p.duckHeld).toBe(true);
+  });
+});
+
+describe('continuous duck-transition hull', () => {
+  it('interpolates the collision hull head height with duckFrac, with no jump on the ducked flip', () => {
+    const p = groundPlayer();
+    p.input.duck = true;
+
+    // Snapshot the first tick that lands strictly inside the transition.
+    let midFrac = 0;
+    let midHeight = 0;
+    let wasDuckedAtMid = true;
+    for (let i = 0; i < 400 && !p.ducked; i++) {
+      updateDuck(p, DT);
+      if (p.duckFrac > 0 && p.duckFrac < 1 && midFrac === 0) {
+        midFrac = p.duckFrac;
+        midHeight = p.maxs.y;
+        wasDuckedAtMid = p.ducked;
+      }
+    }
+    expect(midFrac).toBeGreaterThan(0);
+
+    // Mid-transition the hull head height is strictly between stand and duck
+    // heights and tracks the duck amount linearly.
+    expect(midHeight).toBeGreaterThan(HULL_DUCK_HEIGHT);
+    expect(midHeight).toBeLessThan(HULL_STAND_HEIGHT);
+    expect(midHeight).toBeCloseTo(HULL_STAND_HEIGHT + (HULL_DUCK_HEIGHT - HULL_STAND_HEIGHT) * midFrac, 6);
+    // Before the flip the hull was already partway down — not the old
+    // standing hull waiting for `ducked` to change.
+    expect(wasDuckedAtMid).toBe(false);
+
+    expect(p.duckFrac).toBe(1);
+    expect(p.maxs.y).toBe(HULL_DUCK_HEIGHT);
+  });
+
+  it('varies the hull head height monotonically through stand -> duck -> stand, in sync with the eye', () => {
+    const p = groundPlayer();
+
+    const heights: number[] = [];
+    const eyes: number[] = [];
+    const fracs: number[] = [];
+
+    p.input.duck = true;
+    for (let i = 0; i < 400 && p.duckFrac < 1; i++) {
+      updateDuck(p, DT);
+      heights.push(p.maxs.y);
+      eyes.push(p.eyeHeight);
+      fracs.push(p.duckFrac);
+    }
+    expect(p.ducked).toBe(true);
+
+    p.input.duck = false;
+    for (let i = 0; i < 400 && p.duckFrac > 0; i++) {
+      updateDuck(p, DT);
+      heights.push(p.maxs.y);
+      eyes.push(p.eyeHeight);
+      fracs.push(p.duckFrac);
+    }
+    expect(p.ducked).toBe(false);
+    expect(p.maxs.y).toBe(HULL_STAND_HEIGHT);
+
+    // Every recorded tick's hull matches the fraction exactly.
+    for (let i = 0; i < heights.length; i++) {
+      expect(heights[i]).toBeCloseTo(HULL_STAND_HEIGHT + (HULL_DUCK_HEIGHT - HULL_STAND_HEIGHT) * fracs[i], 6);
+    }
+
+    // Down then up: strictly monotonic on each leg, never a discrete jump.
+    const peak = Math.max(...heights);
+    const min = Math.min(...heights);
+    const turn = heights.indexOf(min);
+    expect(peak).toBe(HULL_STAND_HEIGHT);
+    expect(min).toBe(HULL_DUCK_HEIGHT);
+    for (let i = 1; i <= turn; i++) expect(heights[i]).toBeLessThanOrEqual(heights[i - 1]);
+    for (let i = turn + 1; i < heights.length; i++) expect(heights[i]).toBeGreaterThanOrEqual(heights[i - 1]);
+    const largestStep = Math.max(...heights.map((h, i) => (i === 0 ? 0 : Math.abs(h - heights[i - 1]))));
+    expect(largestStep).toBeLessThan(HULL_STAND_HEIGHT - HULL_DUCK_HEIGHT); // no full 18u jump in one tick
+
+    // The eye height moves with the hull on the same schedule (monotonic,
+    // bounded by its stand/duck offsets).
+    expect(eyes[0]).toBeLessThan(EYE_STAND);
+    for (let i = 1; i <= turn; i++) expect(eyes[i]).toBeLessThanOrEqual(eyes[i - 1]);
+    for (let i = turn + 1; i < eyes.length; i++) expect(eyes[i]).toBeGreaterThanOrEqual(eyes[i - 1]);
+    expect(Math.min(...eyes)).toBeCloseTo(EYE_DUCK, 6);
+    expect(p.eyeHeight).toBeCloseTo(EYE_STAND, 6);
+  });
+
+  function lowCeilingWorld(ceilingBottom: number): World {
+    const world = new World();
+    world.solids.push(brushFromAABB(vec3(-512, -16, -512), vec3(512, 0, 512)));
+    world.solids.push(brushFromAABB(vec3(-512, ceilingBottom, -512), vec3(512, ceilingBottom + 32, 512)));
+    return world;
+  }
+
+  it('never embeds the player while ducking under a ceiling that only fits the ducked hull', () => {
+    // Duck fully while the ceiling is still high, then drop it to 58: the
+    // standing 72 hull never fits there, the ducked 54 hull does. A standing
+    // player could never be under that ceiling in the first place.
+    const world = lowCeilingWorld(128);
+    const p = new PlayerController(world, structuredClone(DEFAULT_SETTINGS), vec3(0, 0.03125, 0));
+    p.onGround = true;
+    p.input.duck = true;
+    for (let i = 0; i < 200; i++) updateDuck(p, DT);
+    expect(p.ducked).toBe(true);
+
+    world.solids[1] = brushFromAABB(vec3(-512, 58, -512), vec3(512, 90, 512));
+
+    // Keep holding/releasing the key under the low ceiling: every hull the
+    // transition can produce must stay out of solid.
+    for (let i = 0; i < 256; i++) {
+      p.input.duck = i % 64 < 32;
+      updateDuck(p, DT);
+      expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+    }
+    expect(p.maxs.y).toBe(HULL_DUCK_HEIGHT);
+    expect(p.origin.y).toBe(0.03125); // no origin drift on the ground
+  });
+
+  it('grows the hull through every intermediate height, all free, when unducking under a just-fitting ceiling', () => {
+    // 60 clearance: the fully ducked hull (54) fits, but the standing hull
+    // (72) does not, so the unduck must be refused; while the ceiling stays,
+    // the hull never crosses into solid.
+    const world = lowCeilingWorld(128);
+    const p = new PlayerController(world, structuredClone(DEFAULT_SETTINGS), vec3(0, 0.03125, 0));
+    p.onGround = true;
+    p.input.duck = true;
+    for (let i = 0; i < 200; i++) updateDuck(p, DT);
+    expect(p.ducked).toBe(true);
+
+    world.solids[1] = brushFromAABB(vec3(-512, 60, -512), vec3(512, 92, 512));
+    p.input.duck = false;
+    for (let i = 0; i < 256; i++) {
+      updateDuck(p, DT);
+      expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+    }
+    expect(p.ducked).toBe(true);
+    expect(p.duckFrac).toBe(1);
+
+    // Open the ceiling up fully: the unduck now runs, every intermediate
+    // hull remaining collision-free.
+    world.solids.length = 1;
+    const heights: number[] = [];
+    for (let i = 0; i < 400 && p.duckFrac > 0; i++) {
+      updateDuck(p, DT);
+      expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+      heights.push(p.maxs.y);
+    }
+    expect(p.ducked).toBe(false);
+    expect(p.duckFrac).toBe(0);
+    expect(p.maxs.y).toBe(HULL_STAND_HEIGHT);
+    for (let i = 1; i < heights.length; i++) expect(heights[i]).toBeGreaterThanOrEqual(heights[i - 1]);
+  });
+
+  it('cannot enter a stuck solid state under a low ceiling and stands back up once the ceiling is gone', () => {
+    const world = lowCeilingWorld(58);
+    const p = new PlayerController(world, structuredClone(DEFAULT_SETTINGS), vec3(0, 0.03125, 0));
+    p.onGround = true;
+    p.ducked = true;
+    p.ducking = false;
+    p.duckFlag = true;
+    p.duckFrac = 1;
+    applyDuckHull(p); // resync the hull to the forced fully-ducked state
+    expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+
+    // Releasing the key under the ceiling must not grow the hull into solid:
+    // the unduck is refused and the player stays fully ducked.
+    p.input.duck = false;
+    for (let i = 0; i < 128; i++) {
+      updateDuck(p, DT);
+      expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+    }
+    expect(p.ducked).toBe(true);
+    expect(p.duckFrac).toBe(1);
+    expect(p.maxs.y).toBe(HULL_DUCK_HEIGHT);
+
+    // Remove the ceiling: the released key now lets the unduck complete.
+    world.solids.length = 1;
+    for (let i = 0; i < 400 && p.duckFrac > 0; i++) {
+      updateDuck(p, DT);
+      expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+    }
+    expect(p.ducked).toBe(false);
+    expect(p.duckFrac).toBe(0);
+    expect(p.maxs.y).toBe(HULL_STAND_HEIGHT);
+    expect(world.isPositionFree(p.origin, p.mins, p.maxs)).toBe(true);
+  });
+
+  it('keeps every intermediate hull free of solid across a full tick-level duck/unduck cycle', () => {
+    const world = new World();
+    world.solids.push(brushFromAABB(vec3(-512, -16, -512), vec3(512, 0, 512)));
+    const player = new PlayerController(world, structuredClone(DEFAULT_SETTINGS), vec3(0, 0.03125, 0));
+    player.onGround = true;
+
+    player.input.duck = true;
+    for (let i = 0; i < 256; i++) player.tick(DT);
+    expect(player.ducked).toBe(true);
+
+    player.input.duck = false;
+    for (let i = 0; i < 256; i++) {
+      player.tick(DT);
+      expect(world.isPositionFree(player.origin, player.mins, player.maxs)).toBe(true);
+    }
+    expect(player.ducked).toBe(false);
+    expect(player.maxs.y).toBe(HULL_STAND_HEIGHT);
   });
 });
 

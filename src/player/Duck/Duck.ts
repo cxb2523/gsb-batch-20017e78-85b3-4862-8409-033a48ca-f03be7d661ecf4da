@@ -7,7 +7,7 @@
 // Provenance (cstrike15_src@f82112a, game/shared/cstrike15/cs_gamemovement.cpp):
 // CCSGameMovement::Duck / FinishDuck / FinishUnDuck / CanUnduck
 
-import { set, vec3 } from '../../math/vec3.js';
+import { set, vec3, type Vec3 } from '../../math/vec3.js';
 import type { MovementContext } from '../MovementContext.js';
 import {
   AIR_DUCK_ORIGIN_SHIFT,
@@ -31,6 +31,24 @@ export const STAND_MINS = vec3(-HULL_HALF_WIDTH, 0, -HULL_HALF_WIDTH);
 export const STAND_MAXS = vec3(HULL_HALF_WIDTH, HULL_STAND_HEIGHT, HULL_HALF_WIDTH);
 export const DUCK_MINS = vec3(-HULL_HALF_WIDTH, 0, -HULL_HALF_WIDTH);
 export const DUCK_MAXS = vec3(HULL_HALF_WIDTH, HULL_DUCK_HEIGHT, HULL_HALF_WIDTH);
+
+/**
+ * Hull for a given duck amount: the head height interpolates linearly
+ * between the standing (72) and fully ducked (54) hull, so every trace and
+ * isPositionFree check during a transition sees the continuously changing
+ * hull instead of a hull that only jumps when `ducked` flips. The footprint
+ * and the mins never change. Writes into `mins`/`maxs`, which the controller
+ * owns as reusable scratch vectors (no per-tick allocation).
+ */
+export function applyDuckHull(target: { mins: Vec3; maxs: Vec3; duckFrac: number }): void {
+  const t = target.duckFrac;
+  target.mins.x = -HULL_HALF_WIDTH;
+  target.mins.y = 0;
+  target.mins.z = -HULL_HALF_WIDTH;
+  target.maxs.x = HULL_HALF_WIDTH;
+  target.maxs.y = HULL_STAND_HEIGHT + (HULL_DUCK_HEIGHT - HULL_STAND_HEIGHT) * t;
+  target.maxs.z = HULL_HALF_WIDTH;
+}
 
 /** Airborne = no ground and not gripping a ladder (the only states where duck moves the feet). */
 function isAirborne(ctx: MovementContext): boolean {
@@ -82,7 +100,6 @@ function finishDuck(ctx: MovementContext): void {
   ctx.duckFlag = true;
   ctx.duckFrac = 1;
   ctx.lastDuckTime = ctx.time;
-  fixCrouchStuck(ctx);
 }
 
 function finishUnduck(ctx: MovementContext): void {
@@ -95,12 +112,13 @@ function finishUnduck(ctx: MovementContext): void {
 
 /**
  * CCSGameMovement::Duck. Ducking is timed on the ground: the duck amount
- * ramps toward 1 at `duckSpeed * 0.8` per second and the hull only switches
- * to the ducked one when it arrives (or immediately if airborne); unducking
- * ramps back at `max(1.5, duckSpeed)` and the standing hull returns as soon as
- * it is allowed to start. The max-speed crop follows the amount (see
- * CurrentMaxSpeed). Mashing the key burns `duckSpeed`, which recovers over
- * time and gates the key off entirely when depleted.
+ * ramps toward 1 at `duckSpeed * 0.8` per second and the collision hull head
+ * height interpolates with that amount every tick (the `ducked` flag flips
+ * only when it arrives, or immediately if airborne); unducking ramps back at
+ * `max(1.5, duckSpeed)` as soon as the standing hull is allowed to fit. The
+ * max-speed crop follows the amount (see CurrentMaxSpeed). Mashing the key
+ * burns `duckSpeed`, which recovers over time and gates the key off entirely
+ * when depleted.
  */
 export function updateDuck(ctx: MovementContext, dt: number): void {
   // CheckParameters: spam penalty on every raw press/release, then the filter.
@@ -126,6 +144,8 @@ export function updateDuck(ctx: MovementContext, dt: number): void {
   if (!held && ctx.duckFrac > 0) ctx.ducking = true;
   else if (held && ctx.duckFrac < 1) ctx.ducking = true;
 
+  const fracBefore = ctx.duckFrac;
+
   if (held && ctx.ducking) {
     ctx.duckFrac = approach(1, ctx.duckFrac, dt * ctx.duckSpeed * DUCK_IN_SPEED_FACTOR);
     if (ctx.duckFrac >= 1 || !ctx.onGround) finishDuck(ctx);
@@ -145,4 +165,14 @@ export function updateDuck(ctx: MovementContext, dt: number): void {
       ctx.duckFlag = true;
     }
   }
+
+  // The collision hull and eye height follow the duck amount continuously:
+  // a mid-transition tick collides with the interpolated hull, not the last
+  // hull that `ducked` happened to select.
+  applyDuckHull(ctx);
+
+  // FixPlayerCrouchStuck after any tick whose hull changed (ramps, including
+  // the air shift and the blocked-unduck snapback): never leave the player
+  // embedded in solid with the new hull.
+  if (ctx.duckFrac !== fracBefore) fixCrouchStuck(ctx);
 }

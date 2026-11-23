@@ -21,8 +21,8 @@ import type { World } from '../physics/World/World.js';
 import type { Settings } from '../settings/Settings.js';
 
 import { type InputState, type MovementContext } from './MovementContext.js';
-import { DUCK_MAXS, DUCK_MINS, STAND_MAXS, STAND_MINS, updateDuck } from './Duck/Duck.js';
-import { DUCK_SPEED_IDEAL, EYE_DUCK, EYE_STAND } from './Duck/Duck.config.js';
+import { applyDuckHull, updateDuck } from './Duck/Duck.js';
+import { DUCK_SPEED_IDEAL, EYE_DUCK, EYE_STAND, HULL_HALF_WIDTH, HULL_STAND_HEIGHT } from './Duck/Duck.config.js';
 import { checkLadder, ladderMove } from './Ladder/Ladder.js';
 import { checkJump } from './Jump/Jump.js';
 import { checkVelocity } from './CheckVelocity/CheckVelocity.js';
@@ -156,13 +156,11 @@ export class PlayerController implements MovementContext {
     return this.tickHistory.toString();
   }
 
-  get mins(): Vec3 {
-    return this.ducked ? DUCK_MINS : STAND_MINS;
-  }
-
-  get maxs(): Vec3 {
-    return this.ducked ? DUCK_MAXS : STAND_MAXS;
-  }
+  // Collision hull, updated in place by updateDuck() every tick so it tracks
+  // duckFrac continuously (see applyDuckHull). Stands start at the standing
+  // hull; movement code must never swap these references.
+  mins: Vec3 = vec3(-HULL_HALF_WIDTH, 0, -HULL_HALF_WIDTH);
+  maxs: Vec3 = vec3(HULL_HALF_WIDTH, HULL_STAND_HEIGHT, HULL_HALF_WIDTH);
 
   get eyeHeight(): number {
     // SetDuckedEyeOffset eases the view height with SimpleSpline.
@@ -270,6 +268,7 @@ export class PlayerController implements MovementContext {
     this.duckSpeed = DUCK_SPEED_IDEAL;
     this.rawDuckPrev = false;
     this.lastDuckTime = Number.NEGATIVE_INFINITY;
+    applyDuckHull(this);
     this.stamina = 0;
     this.groundTicksSinceLanding = 0;
     this.hasJumpedBefore = false;

@@ -46,7 +46,7 @@ export interface MovementContext {
   /** player->m_surfaceFriction: scales air acceleration; 0.25 while rising without ground (see CategorizePosition). */
   surfaceFriction: number;
   groundNormal: Vec3;
-  ducked: boolean; // m_bDucked: fully ducked, hull is the ducked hull
+  ducked: boolean; // m_bDucked: fully ducked (duckFrac === 1); the hull itself tracks duckFrac continuously
   ducking: boolean; // m_bDucking: duck/unduck transition in progress
   duckFlag: boolean; // FL_DUCKING: set when fully ducked, cleared early in the unduck
   duckHeld: boolean; // IN_DUCK after the anti-spam filter
@@ -98,6 +98,12 @@ export interface MovementContext {
   /** Reusable trace output; only valid until the next trace made with it. */
   readonly traceResult: TraceResult;
 
+  /**
+   * Live collision hull. Mutable vectors owned by the controller and updated
+   * in place by updateDuck(): the head height interpolates with duckFrac, so
+   * mid-transition ticks collide with an intermediate hull, not a binary
+   * stand/duck one. Read these, never swap the references.
+   */
   readonly mins: Vec3;
   readonly maxs: Vec3;
   readonly horizontalSpeed: number;

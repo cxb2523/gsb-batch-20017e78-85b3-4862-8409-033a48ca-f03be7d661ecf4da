@@ -15,24 +15,36 @@ export class World {
   ladders: LadderVolume[] = [];
 
   private grid: SpatialGrid | null = null;
+  /** Length of `solids` the current grid was built for. */
   private gridBrushCount = -1;
+  /**
+   * Invalidation version of the current grid. Bumped by rebuildIndex(); the
+   * grid also goes stale implicitly when solids.length changes. This is what
+   * makes in-place edits (mutating a brush's min/max, or swapping an entry)
+   * observable: a version mismatch forces a rebuild on the next query.
+   */
+  private gridVersion = 0;
+  private solidsVersion = 0;
   private readonly bounds = new Float64Array(6);
 
   /**
-   * Drops the broadphase index. It is rebuilt automatically when `solids`
-   * changes length; call this after editing an existing brush in place
-   * (moving its min/max, or swapping an entry for another brush).
+   * Drops the broadphase index and bumps its invalidation version. The next
+   * trace/isPositionFree rebuilds against the current brushes, so call this
+   * after editing an existing brush in place (moving its min/max, or swapping
+   * an entry for another brush). Length changes are picked up automatically.
    */
   rebuildIndex(): void {
     this.grid = null;
     this.gridBrushCount = -1;
+    this.solidsVersion++;
   }
 
   private index(): SpatialGrid | null {
     if (this.solids.length < GRID_MIN_BRUSHES) return null;
-    if (this.grid === null || this.gridBrushCount !== this.solids.length) {
+    if (this.grid === null || this.gridBrushCount !== this.solids.length || this.gridVersion !== this.solidsVersion) {
       this.grid = new SpatialGrid(this.solids);
       this.gridBrushCount = this.solids.length;
+      this.gridVersion = this.solidsVersion;
     }
     return this.grid;
   }
