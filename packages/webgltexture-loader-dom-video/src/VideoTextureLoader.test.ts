@@ -199,3 +199,240 @@ test("dispose deletes every cached texture", async () => {
   loader.dispose();
   expect(deleted).toEqual([a.texture, b.texture]);
 });
+
+const flushMicrotasks = async () => {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+};
+
+const expectPending = async (p: Promise<unknown>) => {
+  let settled = false;
+  p.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await flushMicrotasks();
+  expect(settled).toBe(false);
+};
+
+test("cancelLoad during polling clears the timer so no poll fires afterwards", () => {
+  jest.useFakeTimers();
+  try {
+    const loader = new VideoTextureLoader(mockGL());
+    const v = makeVideo(0, 0);
+    loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+    loader.cancelLoad(v);
+    expect(jest.getTimerCount()).toBe(0);
+    // Even driving time far beyond the poll interval must not reschedule.
+    jest.advanceTimersByTime(1000);
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("a cancelled load never caches and stays pending even if the video becomes ready", async () => {
+  jest.useFakeTimers();
+  try {
+    const deleted: WebGLTexture[] = [];
+    const firstTex = { __id: "first" } as unknown as WebGLTexture;
+    const retryTex = { __id: "retry" } as unknown as WebGLTexture;
+    let nextTex: WebGLTexture = firstTex;
+    const gl = mockGL({
+      createTexture: () => nextTex,
+      deleteTexture: ((t: WebGLTexture) => {
+        deleted.push(t);
+      }) as WebGLRenderingContext["deleteTexture"],
+    });
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const p = loader.load(v);
+    // Cancel while the video is still not ready: the timer is the only
+    // thing keeping the load alive.
+    loader.cancelLoad(v);
+    expect(jest.getTimerCount()).toBe(0);
+    // The video becomes ready afterwards; no tick must run any more.
+    v.videoWidth = 16;
+    v.videoHeight = 9;
+    jest.advanceTimersByTime(1000);
+    await flushMicrotasks();
+    expect(loader.get(v)).toBeUndefined();
+    await expectPending(p);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(deleted).toEqual([]);
+    // A fresh load of the same video starts a brand-new underlying load.
+    // The video is already ready, so it resolves immediately without a
+    // new poll timer.
+    nextTex = retryTex;
+    const retry = loader.load(v);
+    expect(jest.getTimerCount()).toBe(0);
+    const result = await retry;
+    expect(result.texture).toBe(retryTex);
+    expect(loader.get(v)).toBe(result);
+    loader.dispose();
+    expect(deleted).toEqual([retryTex]);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("reload after cancel starts a fresh poll that resolves and caches", async () => {
+  jest.useFakeTimers();
+  try {
+    const gl = mockGL();
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const first = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+    loader.cancelLoad(v);
+    expect(jest.getTimerCount()).toBe(0);
+    // A new load starts polling from scratch.
+    const second = loader.load(v);
+    expect(second).not.toBe(first);
+    expect(jest.getTimerCount()).toBe(1);
+    v.videoWidth = 32;
+    v.videoHeight = 24;
+    jest.advanceTimersByTime(100);
+    const result = await second;
+    expect(result.width).toBe(32);
+    expect(result.height).toBe(24);
+    expect(loader.get(v)).toBe(result);
+    expect(jest.getTimerCount()).toBe(0);
+    loader.dispose();
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("dispose during polling clears timers and a later load starts nothing", async () => {
+  jest.useFakeTimers();
+  try {
+    const gl = mockGL();
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const p = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+    loader.dispose();
+    expect(jest.getTimerCount()).toBe(0);
+    // The video becomes ready afterwards; the disposed load must not
+    // resolve, cache or reschedule anything.
+    v.videoWidth = 8;
+    v.videoHeight = 8;
+    jest.advanceTimersByTime(500);
+    await flushMicrotasks();
+    expect(jest.getTimerCount()).toBe(0);
+    expect(loader.get(v)).toBeUndefined();
+    await expectPending(p);
+    // A disposed loader never starts a new underlying load.
+    const afterDispose = loader.load(v);
+    expect(jest.getTimerCount()).toBe(0);
+    await expectPending(afterDispose);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("texture upload failure clears polling, releases the texture and rejects; retry reloads", async () => {
+  jest.useFakeTimers();
+  try {
+    const deleted: WebGLTexture[] = [];
+    const tex = { __id: "broken" } as unknown as WebGLTexture;
+    let shouldThrow = true;
+    const gl = mockGL({
+      createTexture: () => tex,
+      texImage2D: (() => {
+        if (shouldThrow) throw new Error("upload boom");
+      }) as unknown as WebGLRenderingContext["texImage2D"],
+      deleteTexture: ((t: WebGLTexture) => {
+        deleted.push(t);
+      }) as WebGLRenderingContext["deleteTexture"],
+    });
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const p = loader.load(v);
+    expect(jest.getTimerCount()).toBe(1);
+    v.videoWidth = 4;
+    v.videoHeight = 4;
+    jest.advanceTimersByTime(100);
+    await expect(p).rejects.toThrow(/upload boom/);
+    // Failure cleaned up both the timer and the partially created texture.
+    expect(jest.getTimerCount()).toBe(0);
+    expect(deleted).toEqual([tex]);
+    expect(loader.get(v)).toBeUndefined();
+    // The rejected promise is not reused: retry drives a fresh load.
+    shouldThrow = false;
+    const retry = loader.load(v);
+    const result = await retry;
+    expect(result.texture).toBe(tex);
+    expect(loader.get(v)).toBe(result);
+    expect(jest.getTimerCount()).toBe(0);
+    loader.dispose();
+    expect(deleted).toEqual([tex, tex]);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("immediate upload failure also releases the texture without leaving timers", async () => {
+  const deleted: WebGLTexture[] = [];
+  const tex = { __id: "broken-now" } as unknown as WebGLTexture;
+  const gl = mockGL({
+    createTexture: () => tex,
+    texImage2D: (() => {
+      throw new Error("instant boom");
+    }) as unknown as WebGLRenderingContext["texImage2D"],
+    deleteTexture: ((t: WebGLTexture) => {
+      deleted.push(t);
+    }) as WebGLRenderingContext["deleteTexture"],
+  });
+  const loader = new VideoTextureLoader(gl);
+  const v = makeVideo(2, 2);
+  await expect(loader.load(v)).rejects.toThrow(/instant boom/);
+  expect(deleted).toEqual([tex]);
+  expect(loader.get(v)).toBeUndefined();
+});
+
+test("cancelling while an upload is in flight leaves nothing cached and never restarts the poll", async () => {
+  jest.useFakeTimers();
+  try {
+    const deleted: WebGLTexture[] = [];
+    const tex = { __id: "stale" } as unknown as WebGLTexture;
+    // The upload never settles within the test, modelling a stuck source.
+    const gl = mockGL({
+      createTexture: () => tex,
+      texImage2D: (() =>
+        new Promise<void>(() => {})) as unknown as WebGLRenderingContext["texImage2D"],
+      deleteTexture: ((t: WebGLTexture) => {
+        deleted.push(t);
+      }) as WebGLRenderingContext["deleteTexture"],
+    });
+    const loader = new VideoTextureLoader(gl);
+    const v = makeVideo(0, 0);
+    const p = loader.load(v);
+    v.videoWidth = 10;
+    v.videoHeight = 10;
+    jest.advanceTimersByTime(100);
+    // The tick created the texture and is now blocked inside the upload;
+    // there is no poll timer pending.
+    expect(jest.getTimerCount()).toBe(0);
+    loader.cancelLoad(v);
+    await flushMicrotasks();
+    // Nothing was cached and no new timer got scheduled by the cancellation.
+    expect(loader.get(v)).toBeUndefined();
+    expect(jest.getTimerCount()).toBe(0);
+    await expectPending(p);
+    // Releasing time changes nothing: the cancelled entry stays inert.
+    jest.advanceTimersByTime(1000);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(loader.get(v)).toBeUndefined();
+    // The texture that reached the cache layer as a stale result was
+    // released exactly once (never double-deleted, never cached).
+    expect(deleted).toEqual([tex]);
+  } finally {
+    jest.useRealTimers();
+  }
+});
