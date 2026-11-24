@@ -29,6 +29,7 @@ export function createTimeline(
   let time = 0;
   let playing = !preview && timeline.trigger === 'start';
   let pausedByKey = timeline.trigger === 'key';
+  let stopped = false;
   const timelineMedia = makeMedia(timeline, objects, three, reportError, preview);
   const validProperties = ['position.x', 'position.y', 'position.z', 'rotation.x', 'rotation.y', 'rotation.z',
     'scale.x', 'scale.y', 'scale.z', 'web.x', 'web.y', 'web.rotation', 'web.scale', 'web.opacity', 'media'];
@@ -86,8 +87,11 @@ export function createTimeline(
     return keyValue(keys[keys.length - 1]);
   }
 
-  function render(at: number) {
-    timelineMedia.seek(at, !preview && (timeline.trigger !== 'key' || !pausedByKey));
+  // `jump` marks a discontinuous time change (scrub, scroll, restart). Clip and sound
+  // playback resynchronize on jumps instead of assuming continuous playback.
+  function render(at: number, jump: boolean) {
+    if (stopped) return;
+    timelineMedia.seek(at, !preview && (timeline.trigger !== 'key' || !pausedByKey), jump);
     for (const track of tracks) {
       const item = byId.get(track.targetId)!;
       const value = valueAt(track, at);
@@ -135,9 +139,11 @@ export function createTimeline(
     }
   }
 
+  // Explicit seeks (scrubbing, scroll, restart) are always jumps.
   function seek(value: number) {
+    if (stopped) return;
     time = Math.max(0, Math.min(duration, value));
-    render(time);
+    render(time, true);
   }
 
   if (!preview && timeline.trigger === 'key') {
@@ -147,6 +153,7 @@ export function createTimeline(
       if (!playing && time >= duration) time = 0;
       playing = !playing;
       pausedByKey = !playing;
+      render(time, true);
     }, { signal: abort.signal });
   }
   const scroll = host.querySelector<HTMLElement>('.engine-web-scroll');
@@ -163,19 +170,26 @@ export function createTimeline(
   return {
     seek,
     update(delta: number) {
+      if (stopped) return;
       if (playing && timeline.trigger !== 'scroll') {
-        seek(time + Math.max(0, delta));
+        time = Math.min(duration, time + Math.max(0, delta));
+        render(time, false);
         if (time >= duration) playing = false;
-      } else render(time);
+      } else render(time, false);
     },
     stop() {
+      if (stopped) return;
+      stopped = true;
       abort.abort();
       timelineMedia.stop();
+      mediaStates.clear();
       for (const [element, style] of initialStyles) {
         element.style.transform = style.transform;
         element.style.opacity = style.opacity;
         element.style.animation = style.animation;
       }
+      initialStyles.clear();
+      webValues.clear();
     }
   };
 }
