@@ -155,6 +155,7 @@ PXFX.define({
     const scorch = a < 0 ? 0 : 1 - p.ph(t, 6.45, 6.85);
     const flat = v.mode === '2d';
     p.post(({ pix, W, H, kind, zb, bayer, rgb }) => {
+      if (v.transparent) return;                           // transparent export keeps no ground or rift backdrop
       const fs = v.fs, voidC = rgb(12, 9, 22);
       for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
         if (!v.Q(ix + .5, iy + .5, 0)) continue;

@@ -321,7 +321,13 @@
     }
     bake(def) {
       const st = def.stage || E, v = def.view || E;
-      const key = [def.id, this.mode, this.W, this.H, this.night ? 1 : 0, this.transparent ? 1 : 0, this.OX, this.OY.toFixed(3), this.mode === '3d' ? this.yawV.toFixed(4) + this.pitch : 0, this.lens ? [this.lens.k, this.lens.cx, this.lens.cy, this.lens.cz, this.lens.tx, this.lens.ty, this.lens.tz].map(x => x.toFixed(4)).join() : 0].join('|');
+      // every input that can move or recolor the baked ground must appear in this key, so a camera,
+      // night/base-color, resolution, transparent-export or lens change rebuilds the bake on the first
+      // frame after it (never reuses the previous frame's ground/background pixels)
+      const yawKey = this.mode === '3d' ? this.yawV.toFixed(4) + '|' + (this.pitch == null ? '' : this.pitch.toFixed(4)) : '0';
+      const lensKey = this.lens ? [this.lens.k, this.lens.cx, this.lens.cy, this.lens.cz, this.lens.tx, this.lens.ty, this.lens.tz].map(x => x.toFixed(4)).join() : '0';
+      const key = [def.id, this.mode, this.W, this.H, this.night ? 1 : 0, this.transparent ? 1 : 0,
+        this.OX, this.OY.toFixed(3), this.S.toFixed(4), yawKey, lensKey].join('|');
       if (key === this.bakeKey) return;
       this.bakeKey = key;
       const W = this.W, H = this.H, gs = groundSet(st.ground || 'stone', this.night);
@@ -355,7 +361,11 @@
       this.camera(def);
       this.bake(def);
       this.pix.set(this.basePix); this.zb.set(this.baseZ); this.kind.set(this.baseKind);
+      // per-frame state always starts clean: edges recorded by an earlier frame must never outline
+      // (or suppress an outline on) this frame's solids. flush() still tracks solids drawn *within*
+      // this frame via zEdge/kEdge so a mid-frame flush only outlines the newly drawn solids.
       this.anySolid = false; this.edged = false;
+      this.zEdge.fill(-1e9); this.kEdge.fill(0);
       const p = this.api;
       p.t = t; p.mode = this.mode; p.night = this.night; p.props = !this.noProps; p.def = def;
       try { def.draw(p, t); }
@@ -369,7 +379,8 @@
     // paint the guide paths registered with p.guide(): 1 px lines in their colour, dotted where a solid or the
     // ground sits in front (the part of the path that goes behind the weapon), white square markers on top
     paintGuides() {
-      const W = this.W, H = this.H, pix = this.pix, zb = this.zb, ink = rgb(24, 20, 30), white = rgb(255, 255, 255);
+      const W = this.W, H = this.H, pix = this.pix, zb = this.zb, kind = this.kind, ink = rgb(24, 20, 30), white = rgb(255, 255, 255);
+      const mark = i => { if (kind[i] === 0) kind[i] = 3; };   // a guide over empty page is content, never a background leak
       for (const g of this.guides) {
         const col = g.col, pts = g.pts;
         for (let k = 0; k + 1 < pts.length; k++) {
@@ -382,7 +393,7 @@
           for (;;) {
             if (x0 >= 0 && y0 >= 0 && x0 < W && y0 < H) {
               const i = y0 * W + x0, d = a[2] + (b[2] - a[2]) * (j / n);
-              if (zb[i] <= d + .05 || ((x0 + y0) & 1)) pix[i] = col;
+              if (zb[i] <= d + .05 || ((x0 + y0) & 1)) { pix[i] = col; mark(i); }
             }
             if (x0 === x1 && y0 === y1) break;
             const e2 = 2 * err;
@@ -397,7 +408,8 @@
         for (let yy = -2; yy <= 2; yy++) for (let xx = -2; xx <= 2; xx++) {
           const ix = cx + xx, iy = cy + yy;
           if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
-          pix[iy * W + ix] = Math.abs(xx) === 2 || Math.abs(yy) === 2 ? ink : white;
+          const i = iy * W + ix;
+          pix[i] = Math.abs(xx) === 2 || Math.abs(yy) === 2 ? ink : white; mark(i);
         }
       }
     }
@@ -1144,7 +1156,7 @@
       const v = this.v;
       v.flush();
       if (!v.P(x, y, z)) return;
-      const rp = R * v.ps, cx = v.px, cy = v.py, W = v.W, H = v.H, pix = v.pix, tmp = v.tmp;
+      const rp = R * v.ps, cx = v.px, cy = v.py, W = v.W, H = v.H, pix = v.pix, tmp = v.tmp, kind = v.kind;
       tmp.set(pix);
       const y0 = Math.max(0, Math.floor(cy - rp)), y1 = Math.min(H - 1, Math.ceil(cy + rp));
       const x0 = Math.max(0, Math.floor(cx - rp)), x1 = Math.min(W - 1, Math.ceil(cx + rp));
@@ -1154,7 +1166,10 @@
         const off = fn(dx, dy, Math.sqrt(q));
         if (!off) continue;
         const sx = clamp(Math.round(ix + off[0] * rp), 0, W - 1), sy = clamp(Math.round(iy + off[1] * rp), 0, H - 1);
-        pix[iy * W + ix] = tmp[sy * W + sx];
+        const si = sy * W + sx, src = tmp[si], di = iy * W + ix;
+        if (v.transparent && !(src >>> 24)) continue;         // a clear export pixel stays clear under a warp
+        pix[di] = src;
+        if (v.transparent && kind[di] === 0) kind[di] = v.kind[si] || 3;   // tag moved content on a clear export
       }
     }
     // ordered-dither flash of the whole frame towards a colour (amount 0..1)
@@ -1163,7 +1178,11 @@
       if (amount <= 0) return;
       v.flush();
       const c = hex(color), col = rgb(c[0], c[1], c[2]), W = v.W, H = v.H;
-      for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) if (bayerAt(ix, iy) < amount) v.pix[iy * W + ix] = col;
+      for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
+        const i = iy * W + ix;
+        if (v.transparent && !(v.pix[i] >>> 24)) continue;   // never paint onto the cleared export background
+        if (bayerAt(ix, iy) < amount) v.pix[i] = col;
+      }
     }
     // custom full-frame pass: fn({ pix, W, H, kind, zb, bayer, rgb, hex, P, Q, night, mode }) after resolving the frame
     post(fn) {

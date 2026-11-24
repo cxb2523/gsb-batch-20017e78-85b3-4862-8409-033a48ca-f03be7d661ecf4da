@@ -157,12 +157,14 @@ PXFX.define({
         const j = sy * W + sx, dim = 1 - .55 * grow * Math.pow(Math.max(0, 1 - rho / .8), 1.5);
         let col = src[j], r = col & 255, g = col >> 8 & 255, b = col >> 16 & 255;
         if (!sk[j]) {
+          if (p.v.transparent) continue;                          // a clear export pixel stays clear (no void, no copy)
           if (rho < vr - .16 || (rho < vr && bayer(ix, iy) < (vr - rho) / .16)) {
             const h = p.r(sx * 7 + sy * 131, 3);
             if (h > .965) { r = 255; g = 240; b = 214; } else { r = 38; g = 28; b = 62; }
-          } else { pix[iy * W + ix] = col; continue; }          // empty page outside the void stays as it is
+          } else { pix[iy * W + ix] = col; continue; }            // empty page outside the void stays exactly as it was
         }
         pix[iy * W + ix] = (0xff000000 | (b * dim | 0) << 16 | (g * dim | 0) << 8 | (r * dim | 0)) >>> 0;
+        if (p.v.transparent && kind[iy * W + ix] === 0 && sk[j]) kind[iy * W + ix] = sk[j];   // carry the source content's classification
       }
     });
   },

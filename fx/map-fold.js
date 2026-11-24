@@ -233,6 +233,7 @@ PXFX.define({
     // ---- 1. the map: paint the paper over the void island (the folding half only while it lies flat) ----
     let hp = .035;
     p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode }) => {
+      if (p.v.transparent) return;                        // the paper map is ground: absent from a transparent export
       const pp = P(0, 0, 0);
       hp = .6 / Math.max(4, pp ? pp[3] : 15);
       const dith = mode === '2d' ? 0 : .7, [X0, X1, Y0, Y1] = self.SHEET, st = Object.assign({}, stBase);

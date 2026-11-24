@@ -91,7 +91,7 @@ PXFX.define({
   // screen-space refraction over a strip: fn(u, v) -> [along, across, lift] in world units (or null).
   // Pixels inside sample the scene shifted back along the strip, so the scenery is dragged with the swing.
   glass(p, outer, inner, fn) {
-    p.post(({ pix, W, H, zb, P }) => {
+    p.post(({ pix, W, H, kind, zb, P }) => {
       const O = [], I = [];
       for (let k = 0; k < outer.length; k++) {
         const a = P(outer[k][0], outer[k][1], outer[k][2]), b = P(inner[k][0], inner[k][1], inner[k][2]);
@@ -119,13 +119,16 @@ PXFX.define({
           const o = fn(w0 * ua + w1 * ub + w2 * uc, w0 * va + w1 * vb + w2 * vc);
           if (!o) continue;
           const sx = Math.round(ix - (tx * o[0] + rx * o[1]) * ps), sy = Math.round(iy - (ty * o[0] + ry * o[1]) * ps);
-          let c = src[(sy < 0 ? 0 : sy >= H ? H - 1 : sy) * W + (sx < 0 ? 0 : sx >= W ? W - 1 : sx)];
+          const sxp = sy < 0 ? 0 : sy >= H ? H - 1 : sy, syp = sx < 0 ? 0 : sx >= W ? W - 1 : sx;
+          const si = sxp * W + syp;
+          let c = src[si];
+          if (p.v.transparent && !(c >>> 24)) continue;        // refraction of a clear export pixel stays clear
           const l = o[2] || 0;
           if (l > 0) {
             const r = c & 255, g = c >> 8 & 255, b = c >> 16 & 255;
             c = (0xff000000 | (b + (255 - b) * l) << 16 | (g + (255 - g) * l) << 8 | (r + (255 - r) * l)) >>> 0;
           }
-          pix[i] = c;
+          pix[i] = c; if (p.v.transparent && kind[i] === 0) kind[i] = kind[si] || 3;   // carry the source content's classification
         }
       };
       for (let k = 0; k < n; k++) {

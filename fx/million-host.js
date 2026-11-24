@@ -205,7 +205,7 @@ PXFX.define({
       const N0 = W * H, ok = G.ok, wx = G.wx, wy = G.wy, base = G.col, typ = G.typ, gz = G.zb, dim = p.night ? .78 : 1;
       const shade = (c, f) => X.rgb((c & 255) * f, (c >> 8 & 255) * f, (c >> 16 & 255) * f);
       const sk = scorchK > 0, r2 = rNow * rNow, rr0 = R0 * R0;
-      for (let i = 0; i < N0; i++) {
+      if (!p.v.transparent) for (let i = 0; i < N0; i++) {   // ground/water is absent from a transparent export
         if (!ok[i]) continue;
         let c = base[i];
         const ty = typ[i];
@@ -232,8 +232,8 @@ PXFX.define({
         }
         if (st > 0) {
           if (st < .08) { for (let r = 0; r < n && iy - r >= 0; r++) { const o = (iy - r) * W + ix; pix[o] = white[2]; zb[o] = d0 + .03; kind[o] = 4; } }
-          else if (st < .55) { const e = (st - .08) / .47 + this.ih(i, 5) * .35; pix[o0] = e < .45 ? sparkC[e < .2 ? 2 : 1] : e < .8 ? sparkC[0] : ashC[3]; kind[o0] = e < .45 ? 3 : 1; }
-          else if ((i & 3) === 0) pix[o0] = ashC[2 + (i >> 2 & 1)];
+          else if (st < .55) { const e = (st - .08) / .47 + this.ih(i, 5) * .35; pix[o0] = e < .45 ? sparkC[e < .2 ? 2 : 1] : e < .8 ? sparkC[0] : ashC[3]; kind[o0] = e < .45 ? 3 : 4; }
+          else if ((i & 3) === 0) { pix[o0] = ashC[2 + (i >> 2 & 1)]; kind[o0] = 4; }
           continue;
         }
         const vr = this.ih(i, 3), hc = vr < (speck ? .4 : .55) ? hh - 1 : vr < (speck ? .62 : .85) ? Math.max(1, hh - 2) : -1;
@@ -241,8 +241,8 @@ PXFX.define({
           const top = r === n - 1, o = (iy - r) * W + ix;
           pix[o] = top && hc >= 0 ? helm[hc] : body[top ? (speck ? 1 : hl) : speck ? 1 : hl - 1]; zb[o] = d0 + .03; kind[o] = 4;
         }
-        if (ix + 1 < W && kind[o0 + 1] === 1) pix[o0 + 1] = shade(pix[o0 + 1], .62);
-        if (n >= 4 && vr > .93 && iy - n >= 0) pix[(iy - n) * W + Math.min(W - 1, ix + 1)] = helm[hh];
+        if (ix + 1 < W && kind[o0 + 1] === 1 && !p.v.transparent) pix[o0 + 1] = shade(pix[o0 + 1], .62);
+        if (n >= 4 && vr > .93 && iy - n >= 0) { const gi = (iy - n) * W + Math.min(W - 1, ix + 1); pix[gi] = helm[hh]; kind[gi] = 4; }
       }
     });
     // ---- close range: real pawns for the soldiers in view ----

@@ -168,6 +168,7 @@ PXFX.define({
           if (w0 < 0 || w1 < 0 || w2 < 0) continue;
           const sx = Math.min(W - 1, Math.max(0, Math.round(ix - ox))), sy = Math.min(H - 1, Math.max(0, Math.round(iy - oy)));
           const c = src[sy * W + sx];
+          if (p.v.transparent && !(c >>> 24)) continue;        // don't drag the cleared export page into the rift
           let r = c & 255, g = c >> 8 & 255, b = c >> 16 & 255;
           // distance to edges in pixels: w * (2 * area / edge length)
           const dA = w0 * Math.abs(area) / eA, dC = w2 * Math.abs(area) / eC;

@@ -901,7 +901,13 @@
       if (ix < 0 || iy < 0 || ix >= W || iy >= H || (alpha < 1 && X.bayerAt(ix, iy) >= alpha)) return;
       v.pix[i] = c; v.zb[i] = 1e9; v.kind[i] = 4;
     };
-    for (const i of mask.keys()) for (const d of [-1, 1, -W, W, -W - 1, -W + 1, W - 1, W + 1]) if (!mask.has(i + d)) put(i + d, ink);
+    // the dark outline is drawn first into empty cells; on a transparent export those cells are the
+    // cleared page, so the outline must not leave opaque background behind it
+    for (const i of mask.keys()) for (const d of [-1, 1, -W, W, -W - 1, -W + 1, W - 1, W + 1]) {
+      if (mask.has(i + d)) continue;
+      if (v.transparent && !(v.pix[i + d] >>> 24)) continue;
+      put(i + d, ink);
+    }
     for (const [i, ci] of mask) put(i, cols[ci]);
     return dead;
   };

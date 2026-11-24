@@ -198,6 +198,7 @@ PXFX.define({
     const heads = [this.head(t, 0), this.head(t, 1)];
     // ---- 1. ground pass: the pit, the slab's top face (the same ground texture), its shadow, the cut line ----
     p.post(({ pix, W, H, kind, zb, bayer, P, Q, mode }) => {
+      if (p.v.transparent) return;                        // transparent export draws no ground, pit or cut line
       const rc = self.rays(W, H, mode, P, Q), a = rc.a, flat = mode === '2d';
       self.mask(rc, sh, W, H);
       const ins = rc.ins, SX = PXFX.SHADOW_X, SY = PXFX.SHADOW_Y, hs = lift - TH * .5;

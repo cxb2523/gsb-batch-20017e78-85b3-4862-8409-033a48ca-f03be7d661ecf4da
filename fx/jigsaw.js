@@ -204,6 +204,7 @@ PXFX.define({
         }
       }
       const RA = rc.a;
+      const clearExport = p.v.transparent;            // no board/soil ground in a transparent export; seam light still draws
       for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
         const i = iy * W + ix;
         ids[i] = -1;
@@ -211,9 +212,12 @@ PXFX.define({
         const o = i * 6, gx = RA[o], gy = RA[o + 1];
         const id = b.mem(gx, gy);
         if (resting(id)) {
-          const u = Math.floor((gx - T.X0) / T.R), w = Math.floor((gy - T.Y0) / T.R), k = Math.min(T.n - 1, Math.max(0, w)) * T.n + Math.min(T.n - 1, Math.max(0, u));
-          pix[i] = T.speck[k] ? cols.grass[4] : cols.grass[Math.max(0, Math.min(3, Math.floor(T.tone[k] * 4 + (flat ? 0 : (bayer(ix, iy) - .5) * .6))))];
-          kind[i] = 1; zb[i] = RA[o + 2]; ids[i] = id;
+          if (!clearExport) {
+            const u = Math.floor((gx - T.X0) / T.R), w = Math.floor((gy - T.Y0) / T.R), k = Math.min(T.n - 1, Math.max(0, w)) * T.n + Math.min(T.n - 1, Math.max(0, u));
+            pix[i] = T.speck[k] ? cols.grass[4] : cols.grass[Math.max(0, Math.min(3, Math.floor(T.tone[k] * 4 + (flat ? 0 : (bayer(ix, iy) - .5) * .6))))];
+            kind[i] = 1; zb[i] = RA[o + 2];
+          }
+          ids[i] = id;
           continue;
         }
         // a hole or outside the board: look down the view ray for the side of a resting piece
@@ -222,9 +226,12 @@ PXFX.define({
           const h = -TH * s / 2, qx2 = gx + RA[o + 3] * h, qy2 = gy + RA[o + 4] * h;
           const id2 = b.mem(qx2, qy2);
           if (resting(id2)) {
-            const band = Math.floor(PXFX.hash(Math.floor(qx2 * 6 + qy2 * 6), s) * 2);
-            pix[i] = cols.soil[Math.max(0, 3 - s - band + (flat ? 0 : bayer(ix, iy) > .7 ? 1 : 0))];
-            kind[i] = 1; zb[i] = RA[o + 2] + RA[o + 5] * h; ids[i] = -2;
+            if (!clearExport) {
+              const band = Math.floor(PXFX.hash(Math.floor(qx2 * 6 + qy2 * 6), s) * 2);
+              pix[i] = cols.soil[Math.max(0, 3 - s - band + (flat ? 0 : bayer(ix, iy) > .7 ? 1 : 0))];
+              kind[i] = 1; zb[i] = RA[o + 2] + RA[o + 5] * h;
+            }
+            ids[i] = -2;
             break;
           }
         }

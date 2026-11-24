@@ -175,6 +175,7 @@ PXFX.define({
   flip(p, s, skyA, cloudA, t) {
     const PL = this.palette, self = this;
     p.post(({ pix, kind, W, H, hex, rgb, bayer, night }) => {
+      if (p.v.transparent) return;                        // the flipped sky/clouds are page background
       const N = W * H;
       if (!self._tmp || self._tmp.N !== N) self._tmp = { N, pix: new Uint32Array(N), kind: new Uint8Array(N) };
       const tp = self._tmp.pix, tk = self._tmp.kind;

@@ -147,6 +147,7 @@ PXFX.define({
       const dense = Math.min(.92, (pose === 'burst' ? .62 : pose === 'tear' ? .5 : pose === 'silhouette' ? .38 : 0) * ld);
       for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
         const i = iy * W + ix, col = pix[i];
+        if (p.v.transparent && !(col >>> 24)) continue;        // keep the cleared export background clear
         const dx = (ix + .5 - cx) / S, dy = (cy - iy - .5) / S, rho = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
         const L = ((col & 255) * .299 + (col >> 8 & 255) * .587 + (col >> 16 & 255) * .114) / 255;
         const subj = kind[i] === 2;
