@@ -259,9 +259,36 @@ export function computeMetricsFromImageData(
 }
 
 /**
+ * Reusable 2D scratch canvases. Repeatedly creating canvases (the previous
+ * implementation made two fresh ones on every ~500ms metric tick) can exhaust
+ * the browser's 2D-context pool, after which getContext('2d') transiently
+ * returns null and every metric silently collapsed to zero. Keeping a single
+ * pair avoids that churn.
+ */
+let scratchCanvasA: HTMLCanvasElement | null = null
+let scratchCanvasB: HTMLCanvasElement | null = null
+
+function getScratchPair(width: number, height: number) {
+  if (typeof document === 'undefined') {
+    return null
+  }
+  if (!scratchCanvasA) scratchCanvasA = document.createElement('canvas')
+  if (!scratchCanvasB) scratchCanvasB = document.createElement('canvas')
+  scratchCanvasA.width = width
+  scratchCanvasA.height = height
+  scratchCanvasB.width = width
+  scratchCanvasB.height = height
+  return { canvasA: scratchCanvasA, canvasB: scratchCanvasB }
+}
+
+/**
  * Compute metrics from WebGL canvas by reading pixels
  * This is used when we have a WebGL canvas and need to read back pixels
  * WEBGL-004: Support ROI region for localized analysis
+ *
+ * Returns null when a 2D context is temporarily unavailable, so callers can
+ * retain their previous valid metrics instead of overwriting them with a
+ * misleading all-zero result.
  */
 export function computeMetricsFromWebGLCanvas(
   _gl: WebGLRenderingContext,
@@ -271,35 +298,23 @@ export function computeMetricsFromWebGLCanvas(
   videoB: HTMLVideoElement | HTMLImageElement,
   threshold: number = 10,
   roi?: ROIRect | null
-): WebGLAnalysisMetrics {
-  // Create temporary canvases to draw the video frames
-  const canvasA = document.createElement('canvas')
-  const canvasB = document.createElement('canvas')
-
+): WebGLAnalysisMetrics | null {
   // Use smaller size for performance
   const sampleWidth = Math.min(320, width)
   const sampleHeight = Math.min(180, height)
 
-  canvasA.width = sampleWidth
-  canvasA.height = sampleHeight
-  canvasB.width = sampleWidth
-  canvasB.height = sampleHeight
+  const pair = getScratchPair(sampleWidth, sampleHeight)
+  if (!pair) {
+    return null
+  }
+  const { canvasA, canvasB } = pair
 
   const ctxA = canvasA.getContext('2d')
   const ctxB = canvasB.getContext('2d')
 
   if (!ctxA || !ctxB) {
-    return {
-      ssim: 0,
-      deltaE: 0,
-      diffPixelPercent: 0,
-      peakDifference: 0,
-      meanDifference: 0,
-      timestamp: Date.now(),
-      passPixelCount: 0,
-      failPixelCount: 0,
-      totalPixelCount: 0
-    }
+    // Transient context exhaustion: do not fabricate zero metrics.
+    return null
   }
 
   // Draw video frames to canvases

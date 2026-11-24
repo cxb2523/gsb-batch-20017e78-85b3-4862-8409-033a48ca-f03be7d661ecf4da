@@ -271,6 +271,24 @@ export class WebGLComparisonRenderer {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
   }
 
+  /**
+   * Reset a texture to a neutral placeholder. Used when the source behind a
+   * logical slot changes and the new source is not yet sampleable, so a frame
+   * decoded from the previous source can never remain uploaded as the
+   * "current" texture.
+   */
+  clearTexture(which: 'A' | 'B'): void {
+    const gl = this.gl
+    if (!gl) return
+
+    const texture = which === 'A' ? this.textureA : this.textureB
+    if (!texture) return
+
+    const placeholder = new Uint8Array([128, 128, 128, 255])
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, placeholder)
+  }
+
   private renderCount = 0
 
   /**

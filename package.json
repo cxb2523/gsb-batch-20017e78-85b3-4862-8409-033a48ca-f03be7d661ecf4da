@@ -13,7 +13,9 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test:security": "playwright test"
+    "test:security": "playwright test",
+    "test:fixtures": "node tests/fixtures/generate-fixtures.mjs",
+    "test:webgl": "node tests/fixtures/generate-fixtures.mjs && playwright test --config playwright.webgl.config.mjs"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",

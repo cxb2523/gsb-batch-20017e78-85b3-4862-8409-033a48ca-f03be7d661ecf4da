@@ -15,6 +15,7 @@ import { usePlaybackStore } from '../../stores/playbackStore'
 import { WebGLComparisonRenderer } from '../../lib/webgl/WebGLComparisonRenderer'
 import { getComparisonModeInfo } from '../../lib/webgl/comparison-shaders'
 import { useOptimizedClipSync } from '../../hooks/useOptimizedVideoSync'
+import { useWebGLSourceMapping } from '../../hooks/useWebGLSourceMapping'
 import { computeMetricsFromWebGLCanvas } from '../../lib/webgl/metricsComputation'
 import { BarChart3, Ruler, FlipHorizontal, ZoomIn, ZoomOut, RotateCcw, Crosshair, Camera, Copy, Scan, X, LineChart, FileText, Palette, AlertTriangle, Activity, Image, Video } from 'lucide-react'
 import type { ROIRect } from '../../types'
@@ -41,7 +42,6 @@ export function WebGLComparison() {
   const [mousePos, setMousePos] = useState({ x: 0.5, y: 0.5 })
   const [screenMousePos, setScreenMousePos] = useState({ x: 0, y: 0 })
   const [isSupported, setIsSupported] = useState(true)
-  const [imagesLoaded, setImagesLoaded] = useState({ a: false, b: false })
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
   const [cursorPixelInfo, setCursorPixelInfo] = useState<{
@@ -131,81 +131,50 @@ export function WebGLComparison() {
   const stableMediaA = rawMediaA?.type === 'video' || rawMediaA?.type === 'image' ? (rawMediaA.url ? rawMediaA : null) : null
   const stableMediaB = rawMediaB?.type === 'video' || rawMediaB?.type === 'image' ? (rawMediaB.url ? rawMediaB : null) : null
 
-  // WEBGL-008: A/B Flip - only affects which source maps to which WebGL texture
-  // Video elements keep stable src, we just swap which ref maps to which texture
-  const mediaA = webglComparisonSettings.flipAB ? stableMediaB : stableMediaA
-  const mediaB = webglComparisonSettings.flipAB ? stableMediaA : stableMediaB
+  // WEBGL-008: A/B Flip mapping lives exclusively in useWebGLSourceMapping.
+  // `mediaA`/`mediaB` are the logical (post-flip) descriptors used by the UI
+  // and export paths; the hidden video/image elements keep their stable
+  // physical sources and are never reloaded by a flip.
+  const sourceMapping = useWebGLSourceMapping({
+    stableMediaA,
+    stableMediaB,
+    flipAB: webglComparisonSettings.flipAB,
+    videoARef,
+    videoBRef,
+    imgARef,
+    imgBRef,
+  })
+  const { slots: mappedSlots, bothReady: sourcesReady } = sourceMapping
+  const mediaA = mappedSlots.a.media
+  const mediaB = mappedSlots.b.media
+
+  // Latest mapping handed to the rAF/metrics loops so they never read a
+  // stale closure.
+  const mappingRef = useRef(sourceMapping)
+  mappingRef.current = sourceMapping
 
   // Use the optimized clip sync hook for videos (respects play/pause state)
   useOptimizedClipSync(videoARef, activeClipA || firstClipA)
   useOptimizedClipSync(videoBRef, activeClipB || firstClipB)
 
-  // Track when videos are ready for texture upload (have decoded at least one frame)
-  // Use stable media refs so flipAB doesn't reset this state
-  const [videosReady, setVideosReady] = useState({ a: false, b: false })
-
-  // Ensure videos load their first frame for texture (even when paused)
-  // IMPORTANT: Use stableMediaA/B URLs so this doesn't reset when flipAB changes
-  useEffect(() => {
-    // Only reset when the actual source URLs change, not when flipAB toggles
-    setVideosReady({ a: false, b: false })
-
-    const videoA = videoARef.current
-    const videoB = videoBRef.current
-
-    const handleLoadedDataA = () => {
-      setVideosReady(prev => ({ ...prev, a: true }))
-    }
-    const handleLoadedDataB = () => {
-      setVideosReady(prev => ({ ...prev, b: true }))
-    }
-
-    // Small delay to let video elements update their src
-    const checkReady = setTimeout(() => {
-      if (videoA && stableMediaA?.type === 'video') {
-        videoA.addEventListener('loadeddata', handleLoadedDataA)
-        // If already loaded, mark as ready
-        if (videoA.readyState >= 2) {
-          setVideosReady(prev => ({ ...prev, a: true }))
-        }
-      }
-      if (videoB && stableMediaB?.type === 'video') {
-        videoB.addEventListener('loadeddata', handleLoadedDataB)
-        if (videoB.readyState >= 2) {
-          setVideosReady(prev => ({ ...prev, b: true }))
-        }
-      }
-    }, 50)
-
-    return () => {
-      clearTimeout(checkReady)
-      videoA?.removeEventListener('loadeddata', handleLoadedDataA)
-      videoB?.removeEventListener('loadeddata', handleLoadedDataB)
-    }
-  }, [stableMediaA?.url, stableMediaB?.url, stableMediaA?.type, stableMediaB?.type])
-
-  // Initialize renderer
-  useEffect(() => {
-    if (!canvasRef.current || !containerRef.current) return
-
-    // Check WebGL support
+  // Initialize renderer. Keyed on the canvas element's actual presence rather
+  // than a one-shot mount effect: the component starts in an empty state with
+  // no <canvas>, so an effect with `[]` deps would run before the canvas exists
+  // and never re-run once it mounts after media is added. A callback ref fires
+  // precisely when the real canvas attaches (and again with null on unmount).
+  const initRendererFor = useCallback((canvas: HTMLCanvasElement) => {
     if (!WebGLComparisonRenderer.isSupported()) {
       setIsSupported(false)
       return
     }
 
-    const container = containerRef.current
-    const canvas = canvasRef.current
-    let isCleanedUp = false
     let retryCount = 0
+    const container = containerRef.current
 
-    // Function to initialize renderer with proper dimensions
     const initRenderer = () => {
-      if (isCleanedUp) return
-
-      const rect = container.getBoundingClientRect()
-      let width = rect.width
-      let height = rect.height
+      const rect = container?.getBoundingClientRect()
+      let width = rect?.width ?? 0
+      let height = rect?.height ?? 0
 
       // If container has no dimensions, try again (max 10 retries)
       if ((width <= 0 || height <= 0) && retryCount < 10) {
@@ -221,26 +190,30 @@ export function WebGLComparison() {
       canvas.width = width
       canvas.height = height
 
-      const renderer = new WebGLComparisonRenderer(canvas)
-      rendererRef.current = renderer
-
-      // Set the mode from store
-      renderer.setMode(webglComparisonSettings.mode)
-    }
-
-    // Wait a frame to ensure container is laid out
-    const timeoutId = setTimeout(initRenderer, 50)
-
-    return () => {
-      isCleanedUp = true
-      clearTimeout(timeoutId)
-      if (rendererRef.current) {
-        rendererRef.current.dispose()
-        rendererRef.current = null
+      try {
+        const renderer = new WebGLComparisonRenderer(canvas)
+        rendererRef.current = renderer
+        renderer.setMode(useProjectStore.getState().webglComparisonSettings.mode)
+      } catch (err) {
+        console.error('[WebGL] Renderer initialization failed:', err)
       }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // Intentionally empty - mode changes handled by separate effect
+
+    // Wait a frame to ensure the container is laid out
+    setTimeout(initRenderer, 50)
+  }, [])
+
+  const setCanvasRef = useCallback((canvas: HTMLCanvasElement | null) => {
+    // Tear down any previous renderer before (re)attaching.
+    if (rendererRef.current) {
+      rendererRef.current.dispose()
+      rendererRef.current = null
+    }
+    canvasRef.current = canvas
+    if (canvas) {
+      initRendererFor(canvas)
+    }
+  }, [initRendererFor])
 
   // Update mode when settings change
   useEffect(() => {
@@ -249,11 +222,12 @@ export function WebGLComparison() {
     }
   }, [webglComparisonSettings.mode])
 
-  // Handle resize
+  // Handle resize. The container is mounted in both the empty and ready
+  // states, so observing it (with a renderer-null guard) keeps resize working
+  // even though the canvas appears only after media is added.
   useEffect(() => {
     const container = containerRef.current
-    const canvas = canvasRef.current
-    if (!container || !canvas) return
+    if (!container) return
 
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0]
@@ -263,7 +237,6 @@ export function WebGLComparison() {
 
       // Validate dimensions before setting
       if (width <= 0 || height <= 0) {
-        console.log('[WebGL Component] ResizeObserver skipping invalid dimensions:', width, 'x', height)
         return
       }
 
@@ -271,13 +244,12 @@ export function WebGLComparison() {
       const w = Math.round(width)
       const h = Math.round(height)
 
-      // Only update if renderer exists and dimensions changed
       if (rendererRef.current) {
         rendererRef.current.resize(w, h)
-      } else {
-        // If no renderer yet, just set canvas dimensions
-        canvas.width = Math.max(w, 100)
-        canvas.height = Math.max(h, 100)
+      } else if (canvasRef.current) {
+        // Renderer not initialized yet: just keep the canvas backing size sane.
+        canvasRef.current.width = Math.max(w, 100)
+        canvasRef.current.height = Math.max(h, 100)
       }
     })
 
@@ -285,7 +257,14 @@ export function WebGLComparison() {
     return () => resizeObserver.disconnect()
   }, [])
 
-  // Render function - uses stable media sources, flipAB only swaps texture assignment
+  // Identity of the source most recently uploaded into each WebGL texture.
+  // When the logical slot's source changes before the new source is ready,
+  // the texture is explicitly cleared so a decoded frame from the previous
+  // source can never remain visible as the current texture.
+  const uploadedSourceIdRef = useRef<{ a: string; b: string }>({ a: '', b: '' })
+
+  // Render loop - the flip mapping from useWebGLSourceMapping is the single
+  // authority deciding which physical element feeds texture A/B.
   const render = useCallback(() => {
     const renderer = rendererRef.current
     if (!renderer) {
@@ -293,68 +272,61 @@ export function WebGLComparison() {
       return
     }
 
-    // Get current settings from store to avoid stale closure issues
-    const settings = useProjectStore.getState().webglComparisonSettings
-    const flipAB = settings.flipAB
+    // Always read the freshest mapping (flip/clip/url changes included).
+    const mapping = mappingRef.current
+    const slotA = mapping.slots.a
+    const slotB = mapping.slots.b
 
-    // Determine which video/image ref maps to which texture based on flipAB
-    // Video elements always have stable sources, we just swap texture assignment
-    const textureASource = flipAB ? videoBRef.current : videoARef.current
-    const textureBSource = flipAB ? videoARef.current : videoBRef.current
-    const imgASource = flipAB ? imgBRef.current : imgARef.current
-    const imgBSource = flipAB ? imgARef.current : imgBRef.current
-    const mediaForA = flipAB ? stableMediaB : stableMediaA
-    const mediaForB = flipAB ? stableMediaA : stableMediaB
-    const readyA = flipAB ? videosReady.b : videosReady.a
-    const readyB = flipAB ? videosReady.a : videosReady.b
-    const imgLoadedA = flipAB ? imagesLoaded.b : imagesLoaded.a
-    const imgLoadedB = flipAB ? imagesLoaded.a : imagesLoaded.b
-
-    // Update texture A
-    if (mediaForA) {
-      if (mediaForA.type === 'video' && textureASource && textureASource.readyState >= 2 && readyA) {
-        renderer.updateTexture('A', textureASource)
-      } else if (mediaForA.type === 'image' && imgASource && imgLoadedA) {
-        renderer.updateTexture('A', imgASource)
-      }
+    // --- Texture A: upload only the current, ready source ---------------
+    if (slotA.media && slotA.ready && slotA.element) {
+      renderer.updateTexture('A', slotA.element)
+      uploadedSourceIdRef.current.a = slotA.sourceId
+    } else if (
+      // Source changed (or vanished) and the new one is not sampleable yet:
+      // neutralize the texture instead of leaving the previous frame on it.
+      uploadedSourceIdRef.current.a !== slotA.sourceId
+    ) {
+      renderer.clearTexture('A')
+      uploadedSourceIdRef.current.a = slotA.sourceId
     }
 
-    // Update texture B
-    if (mediaForB) {
-      if (mediaForB.type === 'video' && textureBSource && textureBSource.readyState >= 2 && readyB) {
-        renderer.updateTexture('B', textureBSource)
-      } else if (mediaForB.type === 'image' && imgBSource && imgLoadedB) {
-        renderer.updateTexture('B', imgBSource)
-      }
+    // --- Texture B -------------------------------------------------------
+    if (slotB.media && slotB.ready && slotB.element) {
+      renderer.updateTexture('B', slotB.element)
+      uploadedSourceIdRef.current.b = slotB.sourceId
+    } else if (uploadedSourceIdRef.current.b !== slotB.sourceId) {
+      renderer.clearTexture('B')
+      uploadedSourceIdRef.current.b = slotB.sourceId
     }
 
     // Get media dimensions for aspect ratio correction
     let textureAWidth = 1920, textureAHeight = 1080
     let textureBWidth = 1920, textureBHeight = 1080
 
-    if (mediaForA?.type === 'video' && textureASource) {
-      textureAWidth = textureASource.videoWidth || 1920
-      textureAHeight = textureASource.videoHeight || 1080
-    } else if (mediaForA?.type === 'image' && imgASource) {
-      textureAWidth = imgASource.naturalWidth || 1920
-      textureAHeight = imgASource.naturalHeight || 1080
-    } else if (mediaForA?.width && mediaForA?.height) {
-      textureAWidth = mediaForA.width
-      textureAHeight = mediaForA.height
+    if (slotA.kind === 'video' && slotA.element instanceof HTMLVideoElement) {
+      textureAWidth = slotA.element.videoWidth || 1920
+      textureAHeight = slotA.element.videoHeight || 1080
+    } else if (slotA.kind === 'image' && slotA.element instanceof HTMLImageElement) {
+      textureAWidth = slotA.element.naturalWidth || 1920
+      textureAHeight = slotA.element.naturalHeight || 1080
+    } else if (slotA.media?.width && slotA.media?.height) {
+      textureAWidth = slotA.media.width
+      textureAHeight = slotA.media.height
     }
 
-    if (mediaForB?.type === 'video' && textureBSource) {
-      textureBWidth = textureBSource.videoWidth || 1920
-      textureBHeight = textureBSource.videoHeight || 1080
-    } else if (mediaForB?.type === 'image' && imgBSource) {
-      textureBWidth = imgBSource.naturalWidth || 1920
-      textureBHeight = imgBSource.naturalHeight || 1080
-    } else if (mediaForB?.width && mediaForB?.height) {
-      textureBWidth = mediaForB.width
-      textureBHeight = mediaForB.height
+    if (slotB.kind === 'video' && slotB.element instanceof HTMLVideoElement) {
+      textureBWidth = slotB.element.videoWidth || 1920
+      textureBHeight = slotB.element.videoHeight || 1080
+    } else if (slotB.kind === 'image' && slotB.element instanceof HTMLImageElement) {
+      textureBWidth = slotB.element.naturalWidth || 1920
+      textureBHeight = slotB.element.naturalHeight || 1080
+    } else if (slotB.media?.width && slotB.media?.height) {
+      textureBWidth = slotB.media.width
+      textureBHeight = slotB.media.height
     }
 
     // Render with current settings (read fresh from store)
+    const settings = useProjectStore.getState().webglComparisonSettings
     renderer.render({
       amplification: settings.amplification,
       threshold: settings.threshold,
@@ -373,7 +345,7 @@ export function WebGLComparison() {
 
     // Continue animation loop
     animationRef.current = requestAnimationFrame(render)
-  }, [stableMediaA, stableMediaB, mousePos, imagesLoaded, videosReady])
+  }, [mousePos])
 
   // Start render loop
   useEffect(() => {
@@ -386,8 +358,14 @@ export function WebGLComparison() {
     }
   }, [render])
 
-  // WEBGL-001: Compute metrics periodically (every 500ms)
-  // Uses stable media sources and respects flipAB for correct A/B mapping
+  // WEBGL-001: Compute metrics periodically (every 500ms).
+  // Metrics consume the exact same flip mapping as the renderer and cursor
+  // inspector. While either mapped source is not yet sampleable (media switch
+  // or clip change), the overlay is marked unavailable and no stale metrics
+  // are refreshed. The last valid values remain in the store otherwise.
+  const [metricsUnavailable, setMetricsUnavailable] = useState(false)
+  const lastMetricsSourceKeyRef = useRef<string>('')
+
   useEffect(() => {
     if (!webglComparisonSettings.showMetricsOverlay) {
       return
@@ -402,37 +380,40 @@ export function WebGLComparison() {
       }
       lastMetricsTimeRef.current = now
 
-      // Get current flipAB state
-      const flipAB = useProjectStore.getState().webglComparisonSettings.flipAB
+      // Single mapping authority — same sources as render & cursor picking
+      const mapping = mappingRef.current
+      const slotA = mapping.slots.a
+      const slotB = mapping.slots.b
 
-      // Get source elements - respect flipAB for correct A/B mapping
-      let sourceA: HTMLVideoElement | HTMLImageElement | null = null
-      let sourceB: HTMLVideoElement | HTMLImageElement | null = null
+      const canSample =
+        slotA.media !== null &&
+        slotB.media !== null &&
+        slotA.ready &&
+        slotB.ready &&
+        slotA.element !== null &&
+        slotB.element !== null
 
-      const mediaForA = flipAB ? stableMediaB : stableMediaA
-      const mediaForB = flipAB ? stableMediaA : stableMediaB
-      const videoRefA = flipAB ? videoBRef : videoARef
-      const videoRefB = flipAB ? videoARef : videoBRef
-      const imgRefA = flipAB ? imgBRef : imgARef
-      const imgRefB = flipAB ? imgARef : imgBRef
-      const imgLoadedA = flipAB ? imagesLoaded.b : imagesLoaded.a
-      const imgLoadedB = flipAB ? imagesLoaded.a : imagesLoaded.b
-
-      if (mediaForA?.type === 'video' && videoRefA.current && videoRefA.current.readyState >= 2) {
-        sourceA = videoRefA.current
-      } else if (mediaForA?.type === 'image' && imgRefA.current && imgLoadedA) {
-        sourceA = imgRefA.current
+      if (!canSample || !canvasRef.current) {
+        // New source pair not ready yet: keep the previous valid results but
+        // show them as unavailable; never refresh the overlay from old sources.
+        if (lastMetricsSourceKeyRef.current !== mapping.sourcePairKey) {
+          setMetricsUnavailable(true)
+        }
+        metricsTimerRef.current = requestAnimationFrame(computeMetrics)
+        return
       }
 
-      if (mediaForB?.type === 'video' && videoRefB.current && videoRefB.current.readyState >= 2) {
-        sourceB = videoRefB.current
-      } else if (mediaForB?.type === 'image' && imgRefB.current && imgLoadedB) {
-        sourceB = imgRefB.current
-      }
-
-      if (sourceA && sourceB && rendererRef.current) {
-        const gl = (rendererRef.current as unknown as { gl: WebGLRenderingContext | null }).gl
-        if (gl) {
+      const sourceA = slotA.element
+      const sourceB = slotB.element
+      // Obtain the GL context from the canvas directly rather than holding a
+      // dependency on the renderer instance: metric computation draws its own
+      // 2D canvases and only needs a live context, so it must not be blocked
+      // by renderer (re)initialization lifecycle.
+      const gl =
+        canvasRef.current.getContext('webgl') ||
+        canvasRef.current.getContext('webgl2')
+      if (gl && sourceA && sourceB) {
+        try {
           const metrics = computeMetricsFromWebGLCanvas(
             gl,
             canvasRef.current?.width || 640,
@@ -440,9 +421,19 @@ export function WebGLComparison() {
             sourceA,
             sourceB,
             Math.round(webglComparisonSettings.threshold * 255),
-            webglComparisonSettings.roi // WEBGL-004: Pass ROI for localized metrics
+            webglComparisonSettings.roi // WEBGL-004: ROI in normalized source coords (flip-stable)
           )
-          setWebGLAnalysisMetrics(metrics)
+          // A null result means a transient 2D-context failure: keep the last
+          // valid metrics and retry next tick rather than storing zeros.
+          if (metrics) {
+            lastMetricsSourceKeyRef.current = mapping.sourcePairKey
+            setMetricsUnavailable(false)
+            setWebGLAnalysisMetrics(metrics)
+          }
+        } catch (err) {
+          // A transient draw failure must not kill the polling loop; keep the
+          // previous valid metrics and retry on the next tick.
+          console.error('[WebGL] Metrics computation failed:', err)
         }
       }
 
@@ -456,7 +447,7 @@ export function WebGLComparison() {
         cancelAnimationFrame(metricsTimerRef.current)
       }
     }
-  }, [webglComparisonSettings.showMetricsOverlay, webglComparisonSettings.threshold, webglComparisonSettings.roi, stableMediaA, stableMediaB, imagesLoaded, setWebGLAnalysisMetrics])
+  }, [webglComparisonSettings.showMetricsOverlay, webglComparisonSettings.threshold, webglComparisonSettings.roi, setWebGLAnalysisMetrics])
 
   // Handle mouse move for interactive modes
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -488,53 +479,48 @@ export function WebGLComparison() {
       setDragStart({ x: e.clientX, y: e.clientY })
     }
 
-    // WEBGL-003: Sample pixel values at cursor position
-    // Use stable sources with flipAB handling for correct A/B mapping
+    // WEBGL-003: Sample pixel values at cursor position.
+    // Uses the same flip mapping as the renderer and metrics, and only
+    // samples sources that are ready for their current media identity.
     if (webglComparisonSettings.showCursorInspector) {
-      const sampleCanvas = document.createElement('canvas')
-      sampleCanvas.width = 1
-      sampleCanvas.height = 1
-      const ctx = sampleCanvas.getContext('2d')
+      const mapping = mappingRef.current
+      const slotA = mapping.slots.a
+      const slotB = mapping.slots.b
 
-      if (ctx) {
-        let pixelA: { r: number; g: number; b: number } | null = null
-        let pixelB: { r: number; g: number; b: number } | null = null
+      if (!slotA.ready || !slotB.ready || !slotA.element || !slotB.element) {
+        // Sources switching: do not sample stale pixels from old media
+        setCursorPixelInfo({ a: null, b: null })
+      } else {
+        const sampleCanvas = document.createElement('canvas')
+        sampleCanvas.width = 1
+        sampleCanvas.height = 1
+        const ctx = sampleCanvas.getContext('2d')
 
-        // Respect flipAB for correct A/B mapping
-        const flipAB = webglComparisonSettings.flipAB
-        const mediaForA = flipAB ? stableMediaB : stableMediaA
-        const mediaForB = flipAB ? stableMediaA : stableMediaB
-        const videoRefA = flipAB ? videoBRef : videoARef
-        const videoRefB = flipAB ? videoARef : videoBRef
-        const imgRefA = flipAB ? imgBRef : imgARef
-        const imgRefB = flipAB ? imgARef : imgBRef
+        if (ctx) {
+          let pixelA: { r: number; g: number; b: number } | null = null
+          let pixelB: { r: number; g: number; b: number } | null = null
 
-        // Sample from source A
-        const sourceA = mediaForA?.type === 'video' ? videoRefA.current :
-                       mediaForA?.type === 'image' ? imgRefA.current : null
-        if (sourceA) {
-          const srcWidth = 'videoWidth' in sourceA ? sourceA.videoWidth : sourceA.naturalWidth
-          const srcHeight = 'videoHeight' in sourceA ? sourceA.videoHeight : sourceA.naturalHeight
-          ctx.drawImage(sourceA, x * srcWidth, (1 - y) * srcHeight, 1, 1, 0, 0, 1, 1)
-          const data = ctx.getImageData(0, 0, 1, 1).data
-          pixelA = { r: data[0], g: data[1], b: data[2] }
+          // Sample from logical source A (post-flip mapping)
+          const sourceA = slotA.element
+          const srcWidthA = 'videoWidth' in sourceA ? sourceA.videoWidth : sourceA.naturalWidth
+          const srcHeightA = 'videoHeight' in sourceA ? sourceA.videoHeight : sourceA.naturalHeight
+          ctx.drawImage(sourceA, x * srcWidthA, (1 - y) * srcHeightA, 1, 1, 0, 0, 1, 1)
+          const dataA = ctx.getImageData(0, 0, 1, 1).data
+          pixelA = { r: dataA[0], g: dataA[1], b: dataA[2] }
+
+          // Sample from logical source B (post-flip mapping)
+          const sourceB = slotB.element
+          const srcWidthB = 'videoWidth' in sourceB ? sourceB.videoWidth : sourceB.naturalWidth
+          const srcHeightB = 'videoHeight' in sourceB ? sourceB.videoHeight : sourceB.naturalHeight
+          ctx.drawImage(sourceB, x * srcWidthB, (1 - y) * srcHeightB, 1, 1, 0, 0, 1, 1)
+          const dataB = ctx.getImageData(0, 0, 1, 1).data
+          pixelB = { r: dataB[0], g: dataB[1], b: dataB[2] }
+
+          setCursorPixelInfo({ a: pixelA, b: pixelB })
         }
-
-        // Sample from source B
-        const sourceB = mediaForB?.type === 'video' ? videoRefB.current :
-                       mediaForB?.type === 'image' ? imgRefB.current : null
-        if (sourceB) {
-          const srcWidth = 'videoWidth' in sourceB ? sourceB.videoWidth : sourceB.naturalWidth
-          const srcHeight = 'videoHeight' in sourceB ? sourceB.videoHeight : sourceB.naturalHeight
-          ctx.drawImage(sourceB, x * srcWidth, (1 - y) * srcHeight, 1, 1, 0, 0, 1, 1)
-          const data = ctx.getImageData(0, 0, 1, 1).data
-          pixelB = { r: data[0], g: data[1], b: data[2] }
-        }
-
-        setCursorPixelInfo({ a: pixelA, b: pixelB })
       }
     }
-  }, [isDragging, dragStart, isDrawingROI, roiStart, webglComparisonSettings.webglZoom, webglComparisonSettings.webglPanX, webglComparisonSettings.webglPanY, webglComparisonSettings.showCursorInspector, webglComparisonSettings.flipAB, setWebGLPan, stableMediaA, stableMediaB])
+  }, [isDragging, dragStart, isDrawingROI, roiStart, webglComparisonSettings.webglZoom, webglComparisonSettings.webglPanX, webglComparisonSettings.webglPanY, webglComparisonSettings.showCursorInspector, setWebGLPan])
 
   // WEBGL-007: Handle mouse wheel for zoom
   const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
@@ -685,7 +671,10 @@ export function WebGLComparison() {
       const link = document.createElement('a')
       link.download = `dualview-analysis-${webglComparisonSettings.mode}-${Date.now()}.png`
       link.href = exportCanvas.toDataURL('image/png')
+      // Attach before clicking so the navigation/download is not suppressed.
+      document.body.appendChild(link)
       link.click()
+      link.remove()
     }
   }, [webglComparisonSettings, webglAnalysisMetrics])
 
@@ -745,15 +734,6 @@ export function WebGLComparison() {
     // Download
     downloadBlob(pdfBlob, `dualview-analysis-report-${Date.now()}.pdf`)
   }, [webglComparisonSettings, webglAnalysisMetrics, mediaA, mediaB])
-
-  // Handle image load
-  const handleImageALoad = useCallback(() => {
-    setImagesLoaded(prev => ({ ...prev, a: true }))
-  }, [])
-
-  const handleImageBLoad = useCallback(() => {
-    setImagesLoaded(prev => ({ ...prev, b: true }))
-  }, [])
 
   // Handle file upload for empty state
   const handleUpload = useCallback(async (files: FileList | null, targetTrack: 'a' | 'b') => {
@@ -906,7 +886,7 @@ export function WebGLComparison() {
     >
       {/* Video elements for texture sources - STABLE sources, never swapped by flipAB */}
       <video
-        ref={videoARef}
+        ref={sourceMapping.elementRefs.videoA}
         src={stableMediaA?.type === 'video' ? stableMediaA.url : undefined}
         style={{ position: 'absolute', width: '1px', height: '1px', opacity: 0, pointerEvents: 'none', zIndex: -1 }}
         muted
@@ -915,7 +895,7 @@ export function WebGLComparison() {
         preload="auto"
       />
       <video
-        ref={videoBRef}
+        ref={sourceMapping.elementRefs.videoB}
         src={stableMediaB?.type === 'video' ? stableMediaB.url : undefined}
         style={{ position: 'absolute', width: '1px', height: '1px', opacity: 0, pointerEvents: 'none', zIndex: -1 }}
         muted
@@ -924,29 +904,31 @@ export function WebGLComparison() {
         preload="auto"
       />
 
-      {/* Hidden image elements for texture sources - STABLE sources */}
+      {/* Hidden image elements for texture sources - STABLE physical sources */}
       {stableMediaA?.type === 'image' && (
         <img
-          ref={imgARef}
+          ref={sourceMapping.elementRefs.imageA}
           src={stableMediaA.url}
           className="hidden"
-          onLoad={handleImageALoad}
+          onLoad={sourceMapping.imageEventHandlers.a.onLoad}
+          onError={sourceMapping.imageEventHandlers.a.onError}
           alt=""
         />
       )}
       {stableMediaB?.type === 'image' && (
         <img
-          ref={imgBRef}
+          ref={sourceMapping.elementRefs.imageB}
           src={stableMediaB.url}
           className="hidden"
-          onLoad={handleImageBLoad}
+          onLoad={sourceMapping.imageEventHandlers.b.onLoad}
+          onError={sourceMapping.imageEventHandlers.b.onError}
           alt=""
         />
       )}
 
       {/* WebGL Canvas */}
       <canvas
-        ref={canvasRef}
+        ref={setCanvasRef}
         className="w-full h-full"
         style={{
           minWidth: '640px',
@@ -969,6 +951,11 @@ export function WebGLComparison() {
       {webglComparisonSettings.showMetricsOverlay && webglAnalysisMetrics && (
         <div className="absolute top-4 right-4 bg-black/80 px-4 py-3 rounded text-sm font-mono">
           <div className="text-gray-300 font-semibold mb-2 text-xs uppercase tracking-wider">Analysis Metrics</div>
+          {metricsUnavailable ? (
+            <div className="text-yellow-400 text-xs py-2 pr-2">
+              Sources not ready — waiting for new media to become sampleable
+            </div>
+          ) : (
           <div className="space-y-1">
             <div className="flex justify-between gap-4">
               <span className="text-gray-400">SSIM:</span>
@@ -1012,6 +999,7 @@ export function WebGLComparison() {
               </div>
             </div>
           </div>
+          )}
         </div>
       )}
 
@@ -1055,6 +1043,15 @@ export function WebGLComparison() {
       {webglComparisonSettings.webglZoom > 1 && (
         <div className="absolute top-14 left-4 bg-black/70 px-2 py-1 rounded text-xs text-gray-400">
           Zoom: {webglComparisonSettings.webglZoom.toFixed(1)}x • Double-click to reset
+        </div>
+      )}
+
+      {/* Source readiness indicator: shown while a current source is not yet
+          sampleable, so no stale frame/metric can be mistaken for live data */}
+      {(mappedSlots.a.media || mappedSlots.b.media) && !sourcesReady && (
+        <div className="absolute bottom-14 left-1/2 -translate-x-1/2 bg-yellow-500/90 text-black px-3 py-1.5 rounded text-xs font-medium flex items-center gap-2 z-40">
+          <span className="inline-block w-2 h-2 rounded-full bg-black animate-pulse" />
+          Loading new sources — previous results retained until sampling is available
         </div>
       )}
 
