@@ -58,6 +58,13 @@ describe('board save policy', () => {
     expect(classifySaveResponse(409, 0, 'SOMETHING_ELSE').action).toBe('retry-later');
   });
 
+  it('treats a re-key whose images could not move as retryable, not as a stored save', () => {
+    expect(classifySaveResponse(0, 0, 'FILES_NOT_READY', undefined, 'images')).toEqual({
+      action: 'files-not-ready',
+      message: 'images',
+    });
+  });
+
   it('carries the backoff for the current attempt in a retry outcome', () => {
     const outcome = classifySaveResponse(503, 3);
     expect(outcome).toEqual({ action: 'retry-later', retryAfterMs: 8000 });

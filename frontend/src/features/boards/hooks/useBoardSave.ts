@@ -10,18 +10,17 @@ import { useBlocker, useLocation } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { getSceneVersion } from '@excalidraw/excalidraw';
-import type { AppState, ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types';
+import type { AppState } from '@excalidraw/excalidraw/types';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types';
 import { authClient, useSession } from '@/lib/auth-client';
 import { useKeyContext } from '@/context/KeyContext';
-import { encryptBoardFile } from '@/lib/crypto-format';
-import { dataUrlToBytes } from '@/lib/image-resize';
 import { setHighestSeenRevision } from '@/lib/revision-store';
-import { getBoard, uploadBoardFile } from '../api';
+import { getBoard } from '../api';
 import { sealAndSaveBoard, type SealedSaveResult } from '../board-save';
 import { isEditable, type BoardLoadOutcome } from '../board-load';
 import { toBoardMetadata, type BoardMetadata } from '../board-metadata';
 import { classifySaveError, classifySaveResponse } from '../board-save-policy';
+import type { BoardFileState } from '../file-state';
 import { boardKeys } from '../keys';
 import { sceneFileIds } from '../scene-files';
 import type { Board } from '../schemas';
@@ -76,9 +75,10 @@ interface UseBoardSaveParams {
   isCanvasLoading: boolean;
   isViewer: boolean;
   lastSavedJsonRef: MutableRefObject<string>;
+  /** The files this canvas holds, shared with the loader and the upload flow (one per open board). */
+  fileState: BoardFileState;
   /** The server refused the save because the caller may no longer edit this board. */
   onRevoked: () => void;
-  excalidrawApiRef?: MutableRefObject<ExcalidrawImperativeAPI | null> | undefined;
   onReload?: (() => Promise<void> | void) | undefined;
 }
 
@@ -90,7 +90,7 @@ interface UseBoardSaveParams {
  */
 export function useBoardSave(params: UseBoardSaveParams) {
   const { boardId, cryptoKey, loadOutcome, isCanvasLoading, isViewer } = params;
-  const { lastSavedJsonRef } = params;
+  const { lastSavedJsonRef, fileState } = params;
   const queryClient = useQueryClient();
   const location = useLocation();
   const { data: session } = useSession();
@@ -101,7 +101,6 @@ export function useBoardSave(params: UseBoardSaveParams) {
   const lastSavedSceneVersionRef = useRef<number>(-1);
   const lastSavedAppStateRef = useRef<SavedAppState | null>(null);
   const currentRevisionRef = useRef<number>(0);
-  const uploadedFileIdsRef = useRef<Set<string>>(new Set());
 
   // Timers and listeners read the state through the ref, so both are always written together.
   const syncStateRef = useRef<SyncState>('saved');
@@ -209,6 +208,7 @@ export function useBoardSave(params: UseBoardSaveParams) {
   /** The board now lives at the key version its payload was sealed for. */
   const adoptSealedKey = useCallback(
     (sealed: SealedSaveResult) => {
+      if (!sealed.key) return;
       const { workspaceRef: workspace, boardId: id } = latest.current;
       if (sealed.keyVersion === readBoard()?.keyVersion) return;
       queryClient.setQueryData<Board>(boardKeys.detail(workspace ?? '', id ?? ''), (board) =>
@@ -281,30 +281,11 @@ export function useBoardSave(params: UseBoardSaveParams) {
     try {
       const activeFileIds = sceneFileIds(elements);
 
-      const files = current.excalidrawApiRef?.current?.getFiles?.() || {};
-      const uploadFiles = async (fileIds: string[], key: CryptoKey, keyVersion: number) => {
-        const uploads = fileIds.map(async (fileId) => {
-          const file = files[fileId];
-          if (!file?.dataURL) return false;
-          const { data, mimeType } = dataUrlToBytes(file.dataURL);
-          const sealedFile = await encryptBoardFile(
-            key,
-            { boardId: id, boardKeyVersion: keyVersion, fileId },
-            { mimeType, data },
-          );
-          await uploadBoardFile(workspace, id, fileId, sealedFile);
-          return true;
-        });
-        return (await Promise.all(uploads)).every(Boolean);
-      };
-
-      const pendingUploads = activeFileIds.filter(
-        (fileId) => !uploadedFileIdsRef.current.has(fileId),
-      );
-      await uploadFiles(pendingUploads, activeKey, readBoard()?.keyVersion ?? 1);
-      for (const fileId of pendingUploads) {
-        if (files[fileId]?.dataURL) uploadedFileIdsRef.current.add(fileId);
-      }
+      // Dropping an image from the scene forgets it here too, so a later re-add uploads it again
+      // and the server prunes the object this save no longer names.
+      fileState.retain(activeFileIds);
+      const boardKeyVersion = readBoard()?.keyVersion ?? 1;
+      await fileState.upload(activeFileIds, activeKey, boardKeyVersion);
 
       const sealed = await sealAndSaveBoard({
         workspaceRef: workspace,
@@ -324,11 +305,10 @@ export function useBoardSave(params: UseBoardSaveParams) {
           workspaceRef: workspace,
         },
         key: current.cryptoKey,
-        keyVersion: readBoard()?.keyVersion ?? 1,
+        keyVersion: boardKeyVersion,
         revision: currentRevisionRef.current,
         fileIds: activeFileIds,
-        reencryptFiles: (newKey, newKeyVersion) =>
-          uploadFiles(activeFileIds, newKey, newKeyVersion),
+        fileState,
         readBoard,
         refreshBoard,
         onSealed: (sealedBytes) => {
@@ -389,6 +369,10 @@ export function useBoardSave(params: UseBoardSaveParams) {
         latest.current.onRevoked();
       } else if (outcome.action === 'sign-in-required') {
         showSignInRequired();
+      } else if (outcome.action === 'files-not-ready') {
+        // Nothing was submitted and the board keeps its key; the scene is stashed and retried, so
+        // the key switch happens once every image can follow it.
+        retryLater(FALLBACK_RETRY_MS);
       } else if (outcome.action === 'key-rotated') {
         retryLater(FALLBACK_RETRY_MS);
       } else {
@@ -414,6 +398,7 @@ export function useBoardSave(params: UseBoardSaveParams) {
     adoptSealedKey,
     showSignInRequired,
     lastSavedJsonRef,
+    fileState,
   ]);
   useEffect(() => {
     performSaveRef.current = performSave;

@@ -12,6 +12,7 @@ import { decryptBoardFile } from '@/lib/crypto-format';
 import { bytesToDataUrl } from '@/lib/image-resize';
 import { getBoardFile, getBoardPayload } from '../api';
 import { resolveAccountBoardKey } from '../board-keys';
+import type { BoardFileState } from '../file-state';
 import {
   classifyLoadFailure,
   classifyPayloadStatus,
@@ -83,6 +84,8 @@ interface UseBoardLoadParams {
   board: BoardMetadata | undefined;
   /** Updated with the scene that was loaded, so the saver can tell real edits from none. */
   lastSavedJsonRef: MutableRefObject<string>;
+  /** The one record of this canvas's files; loading marks what the server already holds. */
+  fileState: BoardFileState;
 }
 
 /**
@@ -92,7 +95,12 @@ interface UseBoardLoadParams {
  * a 5xx, a network failure, a missing object, a payload no key opens) is a blocked board that
  * explains itself and offers a retry, and can never issue a save (audit C3).
  */
-export function useBoardLoad({ workspaceRef, board, lastSavedJsonRef }: UseBoardLoadParams) {
+export function useBoardLoad({
+  workspaceRef,
+  board,
+  lastSavedJsonRef,
+  fileState,
+}: UseBoardLoadParams) {
   const { data: session } = useSession();
   const { privateKey, isUnlocked, promptUnlock } = useKeyContext();
   const userId = session?.user?.id;
@@ -144,6 +152,8 @@ export function useBoardLoad({ workspaceRef, board, lastSavedJsonRef }: UseBoard
       setLoadOutcome(null);
       setCryptoKey(null);
       setPendingStash(null);
+      // A reload may land on a newer key version; the earlier session's file versions are stale.
+      fileState.reset();
 
       // The board key comes from the account hierarchy only. A board with no wrapped key is
       // blocked; there is no URL fragment or local copy to fall back to.
@@ -216,6 +226,12 @@ export function useBoardLoad({ workspaceRef, board, lastSavedJsonRef }: UseBoard
           (fileId) => getBoardFile(workspace, current.id, fileId),
         );
         if (cancelled) return;
+        // The server already holds these at this version: the next save does not upload them again,
+        // but a rotation re-encrypts them from the bytes just decrypted.
+        fileState.markStored(
+          activeFileIds.filter((fileId) => fileId in loadedFiles),
+          current.keyVersion,
+        );
       }
 
       lastSavedJsonRef.current = JSON.stringify(outcome.scene.elements);
@@ -242,6 +258,7 @@ export function useBoardLoad({ workspaceRef, board, lastSavedJsonRef }: UseBoard
     userId,
     promptUnlock,
     lastSavedJsonRef,
+    fileState,
   ]);
 
   return {

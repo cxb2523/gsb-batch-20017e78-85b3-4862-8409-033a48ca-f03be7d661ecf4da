@@ -11,12 +11,22 @@ import { clearRevisionStore, setHighestSeenRevision } from '@/lib/revision-store
 import { getBoardFile, getBoardPayload } from '../api';
 import { resolveAccountBoardKey } from '../board-keys';
 import type { BoardMetadata } from '../board-metadata';
+import { BoardFileState } from '../file-state';
 import { useBoardLoad } from './useBoardLoad';
 
 vi.mock('../api', () => ({
   getBoardPayload: vi.fn(),
   getBoardFile: vi.fn(),
 }));
+
+/** A file record with no upload side, enough to check what a load marks as already stored. */
+function testFileState(): BoardFileState {
+  return new BoardFileState({
+    read: async () => null,
+    seal: async () => new Uint8Array(),
+    upload: async () => {},
+  });
+}
 
 vi.mock('../board-keys', () => ({
   resolveAccountBoardKey: vi.fn(),
@@ -65,6 +75,7 @@ function createWrapper() {
 
 describe('useBoardLoad', () => {
   let cryptoKey: CryptoKey;
+  let fileState: BoardFileState;
   const lastSavedJsonRef = { current: '' };
 
   const testBoard: BoardMetadata = {
@@ -84,6 +95,8 @@ describe('useBoardLoad', () => {
     vi.clearAllMocks();
     await clearRevisionStore();
     cryptoKey = await generateSymmetricKey();
+    // A stable instance: a new one each render would restart the load effect.
+    fileState = testFileState();
     lastSavedJsonRef.current = '';
     vi.mocked(resolveAccountBoardKey).mockResolvedValue({
       kind: 'key',
@@ -111,6 +124,7 @@ describe('useBoardLoad', () => {
           workspaceRef: 'w1',
           board: rollbackBoard,
           lastSavedJsonRef,
+          fileState,
         }),
       { wrapper: createWrapper() },
     );
@@ -157,6 +171,7 @@ describe('useBoardLoad', () => {
           workspaceRef: 'w1',
           board: { ...testBoard, id: boardId },
           lastSavedJsonRef,
+          fileState,
         }),
       { wrapper: createWrapper() },
     );
@@ -170,6 +185,9 @@ describe('useBoardLoad', () => {
     expect(result.current.initialData?.files?.['img-1']?.dataURL).toContain(
       'data:image/png;base64,',
     );
+    // The shared file record now knows the server holds it at this version, so the next save
+    // skips a redundant upload but still re-encrypts it if the key rotates.
+    expect(fileState.keyVersionOf('img-1')).toBe(1);
   });
 
   it('shows toast once and does not block canvas when an image fails to decrypt', async () => {
@@ -204,6 +222,7 @@ describe('useBoardLoad', () => {
           workspaceRef: 'w1',
           board: testBoard,
           lastSavedJsonRef,
+          fileState,
         }),
       { wrapper: createWrapper() },
     );
@@ -217,5 +236,10 @@ describe('useBoardLoad', () => {
     // Toast error called once
     expect(toast.error).toHaveBeenCalledTimes(1);
     expect(toast.error).toHaveBeenCalledWith('Could not load one or more images');
+
+    // Files that did not decrypt are not recorded as stored: the save must not assume they are
+    // safely on the server at this version.
+    expect(fileState.keyVersionOf('corrupt-img-1')).toBeUndefined();
+    expect(fileState.keyVersionOf('corrupt-img-2')).toBeUndefined();
   });
 });

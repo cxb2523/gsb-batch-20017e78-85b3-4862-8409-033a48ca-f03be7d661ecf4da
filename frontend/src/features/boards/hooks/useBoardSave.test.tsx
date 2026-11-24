@@ -5,16 +5,19 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { DataRouter } from '@/test/data-router';
 import type { ReactNode } from 'react';
 import type { FileId } from '@excalidraw/excalidraw/element/types';
-import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types';
 import { convertToExcalidrawElements } from '@excalidraw/excalidraw';
 import { toast } from 'sonner';
 import { generateSymmetricKey } from '@/lib/crypto';
 import { ApiError } from '@/lib/http';
 import { clearRevisionStore } from '@/lib/revision-store';
+import { encryptBoardFile } from '@/lib/crypto-format';
+import { dataUrlToBytes } from '@/lib/image-resize';
 import { deleteUnsavedPayload, getUnsavedPayload } from '../unsaved-store';
 import type { BoardLoadOutcome } from '../board-load';
+import { BoardFileState } from '../file-state';
 import { boardKeys } from '../keys';
 import { saveBoardPayload, uploadBoardFile } from '../api';
+import { provisionCurrentBoardKey, resolveSealingBoardKey } from '../board-keys';
 import { useBoardSave, type SavedAppState } from './useBoardSave';
 
 vi.mock('../api', () => ({
@@ -22,6 +25,33 @@ vi.mock('../api', () => ({
   saveBoardPayload: vi.fn(),
   uploadBoardFile: vi.fn(),
 }));
+
+vi.mock('../board-keys', () => ({
+  provisionCurrentBoardKey: vi.fn(),
+  resolveSealingBoardKey: vi.fn(),
+}));
+
+interface TestFile {
+  dataURL: string;
+  mimeType: string;
+}
+
+/**
+ * A real file state over the mocked upload route, so the test exercises the shared record rather
+ * than a stand-in. Compression is left to `canvas-file-state`; here the bytes are used as given.
+ */
+function testFileState(files: Record<string, TestFile> = {}): BoardFileState {
+  return new BoardFileState({
+    read: async (fileId) => {
+      const file = files[fileId];
+      if (!file?.dataURL) return null;
+      return dataUrlToBytes(file.dataURL);
+    },
+    seal: (fileId, plaintext, key, keyVersion) =>
+      encryptBoardFile(key, { boardId: 'b1', boardKeyVersion: keyVersion, fileId }, plaintext),
+    upload: (fileId, ciphertext) => uploadBoardFile('w1', 'b1', fileId, ciphertext),
+  });
+}
 
 vi.mock('@/lib/auth-client', () => ({
   useSession: () => ({ data: { user: { id: 'u1' } } }),
@@ -80,6 +110,7 @@ function createWrapper() {
 
 describe('useBoardSave', () => {
   let cryptoKey: CryptoKey;
+  let defaultFileState: BoardFileState;
   const lastSavedJsonRef = { current: '' };
 
   const defaultAppState: SavedAppState = {
@@ -94,6 +125,9 @@ describe('useBoardSave', () => {
     await clearRevisionStore();
     await deleteUnsavedPayload('b1');
     cryptoKey = await generateSymmetricKey();
+    // One record per render would make the save callback change identity every render, which the
+    // cleanup effect reads as the canvas going away; production keeps it stable through `useMemo`.
+    defaultFileState = testFileState();
     lastSavedJsonRef.current = '';
     vi.mocked(saveBoardPayload).mockResolvedValue({
       success: true,
@@ -118,6 +152,7 @@ describe('useBoardSave', () => {
           isCanvasLoading: false,
           isViewer: false,
           lastSavedJsonRef,
+          fileState: defaultFileState,
           onRevoked: vi.fn(),
         }),
       { wrapper: createWrapper() },
@@ -188,6 +223,7 @@ describe('useBoardSave', () => {
           isCanvasLoading: false,
           isViewer: false,
           lastSavedJsonRef,
+          fileState: defaultFileState,
           onRevoked: vi.fn(),
           onReload,
         }),
@@ -270,18 +306,13 @@ describe('useBoardSave', () => {
   });
 
   it('uploads un-uploaded images before saving the payload', async () => {
-    const excalidrawApiRef = {
-      current: {
-        getFiles: () => ({
-          'file-img-1': {
-            id: 'file-img-1',
-            dataURL:
-              'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-            mimeType: 'image/png',
-          },
-        }),
-      } as unknown as ExcalidrawImperativeAPI,
-    };
+    const fileState = testFileState({
+      'file-img-1': {
+        dataURL:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        mimeType: 'image/png',
+      },
+    });
 
     const { result } = renderHook(
       () =>
@@ -294,8 +325,8 @@ describe('useBoardSave', () => {
           isCanvasLoading: false,
           isViewer: false,
           lastSavedJsonRef,
+          fileState,
           onRevoked: vi.fn(),
-          excalidrawApiRef,
         }),
       { wrapper: createWrapper() },
     );
@@ -337,18 +368,13 @@ describe('useBoardSave', () => {
   it('keeps local stash when image upload fails', async () => {
     vi.mocked(uploadBoardFile).mockRejectedValueOnce(new Error('Upload to S3 failed'));
 
-    const excalidrawApiRef = {
-      current: {
-        getFiles: () => ({
-          'file-img-1': {
-            id: 'file-img-1',
-            dataURL:
-              'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-            mimeType: 'image/png',
-          },
-        }),
-      } as unknown as ExcalidrawImperativeAPI,
-    };
+    const fileState = testFileState({
+      'file-img-1': {
+        dataURL:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        mimeType: 'image/png',
+      },
+    });
 
     const { result } = renderHook(
       () =>
@@ -361,8 +387,8 @@ describe('useBoardSave', () => {
           isCanvasLoading: false,
           isViewer: false,
           lastSavedJsonRef,
+          fileState,
           onRevoked: vi.fn(),
-          excalidrawApiRef,
         }),
       { wrapper: createWrapper() },
     );
@@ -411,6 +437,7 @@ describe('useBoardSave', () => {
           isCanvasLoading: false,
           isViewer: false,
           lastSavedJsonRef,
+          fileState: defaultFileState,
           onRevoked,
         }),
       { wrapper: createWrapper() },
@@ -441,6 +468,137 @@ describe('useBoardSave', () => {
     expect(stashed).not.toBeNull();
   });
 
+  describe('image files and the save', () => {
+    const imagePng =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    function imageElements(...fileIds: string[]) {
+      return convertToExcalidrawElements(
+        fileIds.map((rawId, index) => {
+          if (!isFileId(rawId)) throw new Error('not a file id');
+          return { id: `img-${index}`, type: 'image' as const, fileId: rawId, x: 0, y: 0 };
+        }),
+      );
+    }
+
+    function renderWithBoard(board: typeof mockBoard, fileState: BoardFileState) {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(boardKeys.detail('w1', 'b1'), board);
+      return renderHook(
+        () =>
+          useBoardSave({
+            workspaceRef: 'w1',
+            boardId: 'b1',
+            cryptoKey,
+            setCryptoKey: vi.fn(),
+            loadOutcome: NEW_BOARD,
+            isCanvasLoading: false,
+            isViewer: false,
+            lastSavedJsonRef,
+            fileState,
+            onRevoked: vi.fn(),
+          }),
+        {
+          wrapper: ({ children }: { children: ReactNode }) => (
+            <DataRouter>
+              <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+            </DataRouter>
+          ),
+        },
+      );
+    }
+
+    it('re-encrypts every referenced image at the new key before the re-key payload', async () => {
+      const behind = {
+        ...mockBoard,
+        keyVersion: 1,
+        project: { ...mockBoard.project, keyVersion: 2 },
+      };
+      const newKey = await generateSymmetricKey();
+      vi.mocked(provisionCurrentBoardKey).mockResolvedValue({
+        boardKey: newKey,
+        encryptedBoardKey: 'wrapped-v2',
+      });
+      const fileState = testFileState({
+        'file-a': { dataURL: imagePng, mimeType: 'image/png' },
+      });
+      // The loader found this file on the server at version 1; the save must move it to 2.
+      fileState.markStored(['file-a'], 1);
+      const order: string[] = [];
+      vi.mocked(uploadBoardFile).mockImplementation(async () => {
+        order.push('file');
+      });
+      vi.mocked(saveBoardPayload).mockImplementation(async () => {
+        order.push('payload');
+        return { success: true, hasPayload: true, revision: 1, updatedAt: 'now' };
+      });
+
+      const { result } = renderWithBoard(behind, fileState);
+      act(() => result.current.handleCanvasChange(imageElements('file-a'), defaultAppState));
+
+      await waitFor(() => expect(saveBoardPayload).toHaveBeenCalledTimes(1), { timeout: 3000 });
+
+      expect(order).toEqual(['file', 'payload']);
+      expect(saveBoardPayload).toHaveBeenCalledWith(
+        'w1',
+        'b1',
+        expect.any(Uint8Array),
+        expect.objectContaining({
+          fileIds: ['file-a'],
+          encryptedBoardKey: 'wrapped-v2',
+        }),
+      );
+    });
+
+    it('submits nothing and keeps the scene when one image cannot be re-encrypted', async () => {
+      const behind = {
+        ...mockBoard,
+        keyVersion: 1,
+        project: { ...mockBoard.project, keyVersion: 2 },
+      };
+      const newKey = await generateSymmetricKey();
+      vi.mocked(provisionCurrentBoardKey).mockResolvedValue({
+        boardKey: newKey,
+        encryptedBoardKey: 'wrapped-v2',
+      });
+      vi.mocked(resolveSealingBoardKey).mockResolvedValue(cryptoKey);
+      const fileState = testFileState({
+        'file-a': { dataURL: imagePng, mimeType: 'image/png' },
+        // `file-b` has no bytes this editor can reach, so it cannot move to the new key.
+      });
+      fileState.markStored(['file-a', 'file-b'], 1);
+
+      const { result } = renderWithBoard(behind, fileState);
+      act(() =>
+        result.current.handleCanvasChange(imageElements('file-a', 'file-b'), defaultAppState),
+      );
+
+      await waitFor(() => expect(result.current.syncState).toBe('error'), { timeout: 3000 });
+
+      // The board keeps its key: no payload was submitted, and the scene is stashed for a retry.
+      expect(saveBoardPayload).not.toHaveBeenCalled();
+      expect(await getUnsavedPayload('b1')).not.toBeNull();
+    });
+
+    it('names only the images the scene still references, so a removed one is pruned', async () => {
+      const fileState = testFileState({
+        'file-a': { dataURL: imagePng, mimeType: 'image/png' },
+      });
+
+      const { result } = renderWithBoard(mockBoard, fileState);
+      act(() => result.current.handleCanvasChange(imageElements('file-a'), defaultAppState));
+      await waitFor(() => expect(saveBoardPayload).toHaveBeenCalledTimes(1), { timeout: 3000 });
+      expect(vi.mocked(saveBoardPayload).mock.calls[0]?.[3]).toMatchObject({
+        fileIds: ['file-a'],
+      });
+
+      // The image is removed from the scene: the next save names no files at all.
+      act(() => result.current.handleCanvasChange(imageElements(), defaultAppState));
+      await waitFor(() => expect(saveBoardPayload).toHaveBeenCalledTimes(2), { timeout: 3000 });
+      expect(vi.mocked(saveBoardPayload).mock.calls[1]?.[3]).toMatchObject({ fileIds: [] });
+    });
+  });
+
   describe('what counts as an edit', () => {
     const rectangle = convertToExcalidrawElements([
       { id: 'rect-1', type: 'rectangle', x: 0, y: 0 },
@@ -458,6 +616,7 @@ describe('useBoardSave', () => {
             isCanvasLoading: false,
             isViewer: false,
             lastSavedJsonRef,
+            fileState: defaultFileState,
             onRevoked: vi.fn(),
           }),
         { wrapper: createWrapper(), initialProps: { loadOutcome } },

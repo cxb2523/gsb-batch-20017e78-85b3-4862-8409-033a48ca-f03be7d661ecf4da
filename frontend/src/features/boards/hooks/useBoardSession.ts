@@ -1,9 +1,10 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import type { BinaryFiles, ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types';
 import type { ExcalidrawElementSkeleton } from '@excalidraw/excalidraw/element/transform';
 import { openStashedScene } from '../board-load';
 import type { BoardMetadata } from '../board-metadata';
+import { createCanvasFileState } from '../canvas-file-state';
 import { exportCanvasImage, placeMermaidDiagram } from '../canvas-actions';
 import { mergeRestoredElements } from '../merge-restored-elements';
 import { deleteUnsavedPayload } from '../unsaved-store';
@@ -38,7 +39,21 @@ export function useBoardSession({
   const isViewer = isReadOnlyForced || !canEdit;
   const title = board?.title ?? '';
 
-  const load = useBoardLoad({ workspaceRef, board, lastSavedJsonRef });
+  // One file record per open canvas, shared by the load (which marks what the server holds), the
+  // save (which uploads what is new) and a re-key (which re-encrypts everything the scene names).
+  // The getter is a stable callback, so the state is built once but still sees later images.
+  const getEditorFiles = useCallback(() => excalidrawApiRef.current?.getFiles?.() ?? {}, []);
+  const fileState = useMemo(
+    () =>
+      createCanvasFileState({
+        workspaceRef: workspaceRef ?? '',
+        boardId: boardId ?? '',
+        getFiles: getEditorFiles,
+      }),
+    [workspaceRef, boardId, getEditorFiles],
+  );
+
+  const load = useBoardLoad({ workspaceRef, board, lastSavedJsonRef, fileState });
 
   const exportImage = useCallback(() => {
     if (excalidrawApiRef.current) void exportCanvasImage(excalidrawApiRef.current, title);
@@ -75,8 +90,8 @@ export function useBoardSession({
     isCanvasLoading: load.isCanvasLoading,
     isViewer,
     lastSavedJsonRef,
+    fileState,
     onRevoked: handleRevoked,
-    excalidrawApiRef,
     onReload: reloadFresh,
   });
 

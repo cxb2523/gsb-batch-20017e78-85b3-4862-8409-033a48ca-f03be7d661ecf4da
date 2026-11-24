@@ -13,6 +13,7 @@ import {
   type BoardKeyContext,
 } from './board-keys';
 import type { BoardMetadata } from './board-metadata';
+import type { BoardFileSync } from './file-state';
 
 /** Rotation can happen twice in a row at most before the caller backs off. */
 const MAX_SEAL_CYCLES = 3;
@@ -30,14 +31,10 @@ export interface SealedSaveParams {
   revision?: number | undefined;
   /** Active file IDs in the scene to prune unreferenced files on the server. */
   fileIds?: string[] | undefined;
+  /** The shared file record for this canvas: uploads what is new, re-encrypts on a re-key. */
+  fileState: BoardFileSync;
   /** The latest metadata, read again for every cycle because a refresh can change it. */
   readBoard: () => BoardMetadata | null;
-  /**
-   * Uploads every file of the scene encrypted under the new key and version, before a re-key
-   * payload is sent. Returns false when a file is not available to re-encrypt, in which case the
-   * board keeps its current key and the re-key is tried again on a later save.
-   */
-  reencryptFiles: (key: CryptoKey, keyVersion: number) => Promise<boolean>;
   /** Re-reads the board after the server says its key rotated. */
   refreshBoard: () => Promise<void>;
   /** Receives each ciphertext as soon as it exists, so a failed upload can still be stashed. */
@@ -49,11 +46,14 @@ export interface SealedSaveResult {
   status: number;
   code?: string | undefined;
   message?: string | undefined;
-  /** The key and version the stored payload was sealed under. */
-  key: CryptoKey;
+  /** The key and version the stored payload was sealed under; null when nothing was submitted. */
+  key: CryptoKey | null;
   keyVersion: number;
   revision?: number | undefined;
 }
+
+/** A re-key could not move every image, so no payload was sent and the board keeps its key. */
+export const FILES_NOT_READY = 'FILES_NOT_READY';
 
 async function upload(
   workspaceRef: string,
@@ -92,7 +92,9 @@ async function upload(
 
 /**
  * Seals and uploads the scene. Returns null when the cycles ran out or the board is unknown;
- * key errors from `lib/keys` propagate.
+ * key errors from `lib/keys` propagate. When a re-key cannot move every image it returns a result
+ * with `key: null` and `FILES_NOT_READY`: nothing was submitted and the board keeps its key, so the
+ * caller can retry on a later save.
  */
 export async function sealAndSaveBoard(params: SealedSaveParams): Promise<SealedSaveResult | null> {
   const { workspaceRef, boardId, keyContext } = params;
@@ -113,9 +115,29 @@ export async function sealAndSaveBoard(params: SealedSaveParams): Promise<Sealed
     let encryptedBoardKey: string | undefined;
     if (rekey) {
       const provisioned = await provisionCurrentBoardKey(board, keyContext);
-      if (!(await params.reencryptFiles(provisioned.boardKey, board.project.keyVersion))) {
-        allowRekey = false;
-        return attempt(cycle + 1);
+      const filesMoved = await params.fileState.reencrypt(
+        params.fileIds ?? [],
+        provisioned.boardKey,
+        board.project.keyVersion,
+      );
+      if (!filesMoved) {
+        // The board cannot switch keys without every image beside it at the new version, so no
+        // payload is submitted and the board keeps its key. The scene is still sealed under the
+        // current key for the local stash, so the person's work survives even if they close the tab.
+        const currentKey = key ?? (await resolveSealingBoardKey(board, keyContext));
+        const stashBytes = await sealBoardPayload(currentKey, params.scene, {
+          boardId,
+          keyVersion: board.keyVersion,
+          revision: (params.revision ?? 0) + 1,
+        });
+        params.onSealed(stashBytes);
+        return {
+          status: 0,
+          code: FILES_NOT_READY,
+          message: 'One or more images could not be re-encrypted for the new key.',
+          key: null,
+          keyVersion: board.keyVersion,
+        };
       }
       key = provisioned.boardKey;
       keyVersion = board.project.keyVersion;

@@ -16,6 +16,8 @@ export type SaveOutcome =
   | { action: 'sign-in-required' }
   /** The project key rotated; re-fetch the keys, re-seal and retry without a dialog. */
   | { action: 'key-rotated' }
+  /** A re-key could not move every image; nothing was submitted, retry without losing the scene. */
+  | { action: 'files-not-ready'; message?: string | undefined }
   /** Concurrent modification conflict (409 BOARD_CONFLICT). */
   | { action: 'conflict'; serverRevision?: number | undefined }
   /** Network failure, 5xx, 429 or anything else transient. Retry after a delay. */
@@ -42,6 +44,9 @@ export function classifySaveResponse(
   message?: string,
 ): SaveOutcome {
   if (status >= 200 && status < 300) return { action: 'saved' };
+  if (status === 0 && code === 'FILES_NOT_READY') {
+    return { action: 'files-not-ready', message };
+  }
   if (status === 409 && code === 'KEY_ROTATED') return { action: 'key-rotated' };
   if (status === 409 && code === 'BOARD_CONFLICT') {
     return { action: 'conflict', serverRevision: revision };
