@@ -1,5 +1,6 @@
 import { compile, expressionScope } from "$library/expression";
 
+import { TStateKind } from "$library/workletState";
 import { constantCode } from "$library/constants";
 import { lfoShapes } from "$library/modulation";
 import { math } from "$library/math";
@@ -17,8 +18,9 @@ export type TEmitContext = {
   // JS-выражения входов: уже вычисленные локальные переменные
   inputs: string[];
   config: TConfig;
-  // Поле состояния экземпляра: объявляет его с начальным значением, возвращает обращение к нему
-  state(name: string, init: string): string;
+  // Поле состояния экземпляра: объявляет его с начальным значением, возвращает обращение к нему.
+  // kind нужен, чтобы состояние переживало перенос между процессорами без потери типа.
+  state(name: string, init: string, kind?: TStateKind): string;
   // Уникальное имя локальной переменной для этой ноды
   local(name: string): string;
   // Какие общие куски кода нужны: таблица Math, функции модуляции, помощники Expression, время t
@@ -112,7 +114,7 @@ export const templates: Record<string, TTemplate> = {
     emit({ inputs, config, state, local, use }) {
       const source = configValue(config, 'expression');
       const names = ['a', 'b', 'c', 'd'];
-      const y1 = state('y1', '0');
+      const y1 = state('y1', '0', 'number');
       const variables = new Map(expressionScope.variables);
 
       names.forEach((name, i) => variables.set(name, inputs[i]));
@@ -147,7 +149,8 @@ export const templates: Record<string, TTemplate> = {
     structural: [],
     ports: simple(['_value', '_write']),
     emit({ inputs: [value, write], state }) {
-      const mem = state('mem', '0');
+      // Имя как у MemoryProcessor: по нему состояние переносится в живую ноду и обратно
+      const mem = state('value', '0', 'number');
 
       // У параметра write minValue = 0: отрицательное значение не пишет
       return { code: [`if (${write} > 0) ${mem} = F(${value});`], out: mem };
@@ -182,9 +185,9 @@ export const templates: Record<string, TTemplate> = {
       const value = configValue(config, '_shape');
       // В код идёт строка из нашего списка, не из конфига; неизвестная форма — синус, как в процессоре
       const shape = lfoShapes.find(item => item === value) ?? 'sine';
-      const p = state('phase', '0');
-      const s = state('sync', '0');
-      const held = state('held', 'Math.random() * 2 - 1');
+      const p = state('phase', '0', 'number');
+      const s = state('sync', '0', 'number');
+      const held = state('held', 'Math.random() * 2 - 1', 'number');
       const inc = local('inc');
       const out = local('out');
 
@@ -208,7 +211,7 @@ export const templates: Record<string, TTemplate> = {
     structural: [],
     ports: simple(['_gate', '_attack', '_decay', '_sustain', '_release', '_peak']),
     emit({ inputs, state, use }) {
-      const env = state('env', '{ gate: 0, stage: 0, level: 0, from: 0 }');
+      const env = state('env', '{ gate: 0, stage: 0, level: 0, from: 0 }', 'object');
 
       use('modulation');
       return { code: [], out: `$f.adsrStep(${env}, ${inputs.join(', ')}, 1 / sr)` };
@@ -219,9 +222,9 @@ export const templates: Record<string, TTemplate> = {
     structural: [],
     ports: simple(['_trigger', '_step', '_reset', '_modulo']),
     emit({ inputs: [trigger, step, reset, modulo], state, use }) {
-      const t = state('trigger', '0');
-      const r = state('reset', '0');
-      const count = state('count', '0');
+      const t = state('trigger', '0', 'number');
+      const r = state('reset', '0', 'number');
+      const count = state('count', '0', 'number');
 
       use('modulation');
 
@@ -242,9 +245,9 @@ export const templates: Record<string, TTemplate> = {
     structural: [],
     ports: simple(['_trigger', '_from', '_to', '_step']),
     emit({ inputs: [trigger, from, to, step], state, use }) {
-      const t = state('trigger', '0');
-      const value = state('value', '0');
-      const fired = state('fired', 'false');
+      const t = state('trigger', '0', 'number');
+      const value = state('value', '0', 'number');
+      const fired = state('fired', 'false', 'boolean');
 
       use('modulation');
 

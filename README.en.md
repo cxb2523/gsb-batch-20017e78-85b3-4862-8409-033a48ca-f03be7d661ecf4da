@@ -93,7 +93,7 @@ On macOS use <kbd>⌘</kbd> instead of <kbd>Ctrl</kbd>.
 
 Blocks copy, save and nest like any other node. <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> unpacks a block back into its nodes.
 
-The **Compiled** switch turns a block into one AudioWorklet when it holds only Math, Expression, Memory, Slider, Toggle, LFO, ADSR, Counter, Random and Group Input/Output nodes. Feedback inside such a block is delayed by 1 sample instead of 128. If the block can't be compiled, it plays as usual and shows the reason on its face.
+The **Compiled** switch turns a block into one AudioWorklet when it holds only Math, Expression, Memory, Slider, Toggle, LFO, ADSR, Counter, Random and Group Input/Output nodes. Feedback inside such a block is delayed by 1 sample instead of 128. Block state — the formula's `y1`, LFO phase, Counter count, Memory contents, ADSR envelope — survives toggling Compiled and rebuilding after a parameter change; only stopping or deleting the block resets it. If a build fails, the previous program (or the block's own nodes) keeps playing and the reason is shown on the block.
 
 ### Expression
 

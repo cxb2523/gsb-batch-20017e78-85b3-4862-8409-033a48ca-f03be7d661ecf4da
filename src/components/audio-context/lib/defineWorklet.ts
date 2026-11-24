@@ -1,3 +1,5 @@
+import { STATE_GET, STATE_MESSAGE, STATE_REPLY, STATE_SET, TWorkletState, pushState, requestState, stateHelpersSource } from "$library/workletState";
+
 import { name } from "$library/function";
 import { ctx } from "../ctx";
 import { signal } from "@preact/signals-react";
@@ -123,9 +125,11 @@ export async function defineWorklet<
     .join(',\n');
 
   const code = `
+    ${stateHelpersSource}
+
     const data = {
       params: [
-        ${params} 
+        ${params}
       ],
       functions: {
         ${functions}
@@ -133,7 +137,7 @@ export async function defineWorklet<
       props: ${JSON.stringify(options.props ?? {})},
       ${loop}
     }
-    
+
     for(let key in data.functions) {
       data.functions[key] = data.functions[key].bind(data.functions);
     }
@@ -155,6 +159,9 @@ export async function defineWorklet<
 
         constructor(...args) {
           super(...args);
+          // Состояние из processorOptions применяется до первого process(): шва при пересборке нет
+          if (args[0] && args[0].processorOptions && args[0].processorOptions.state)
+            mergeState(this.context, args[0].processorOptions.state);
           this.port.onmessage = (data) => {
             if(data.data === '[STOP]') {
               this.running = false;
@@ -163,6 +170,20 @@ export async function defineWorklet<
 
             if(data.data === '[RESET]') {
               this.context = JSON.parse(JSON.stringify(this.initialContext));
+              return;
+            }
+
+            if(data.data && data.data.type === ${JSON.stringify(STATE_MESSAGE)}) {
+              if(data.data.action === ${JSON.stringify(STATE_GET)}) {
+                this.port.postMessage({
+                  type: ${JSON.stringify(STATE_MESSAGE)},
+                  action: ${JSON.stringify(STATE_REPLY)},
+                  id: data.data.id,
+                  state: cloneState(this.context)
+                });
+              } else if(data.data.action === ${JSON.stringify(STATE_SET)}) {
+                mergeState(this.context, data.data.state);
+              }
               return;
             }
 
@@ -219,6 +240,16 @@ export async function defineWorklet<
   );
 
   class CustomAudioWorkletNode extends AudioWorkletNode {
+    // Снимок состояния процессора: его контекст без служебных полей
+    async readWorkletState(): Promise<TWorkletState | null> {
+      return requestState(this.port);
+    }
+
+    // Применить состояние: неизвестные ключи и чужие типы отбрасываются процессором
+    writeWorkletState(state: TWorkletState) {
+      pushState(this.port, state);
+    }
+
     destroy() {
       using.value--;
       pool.push(this as InstanceType<CustomWorkletConstructor>);

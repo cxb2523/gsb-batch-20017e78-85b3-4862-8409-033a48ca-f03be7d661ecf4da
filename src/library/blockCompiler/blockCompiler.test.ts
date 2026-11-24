@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAdsrState, modulation } from "$library/modulation";
 
 import { STOP_MESSAGE } from "$library/expression";
+import type { TWorkletState } from "$library/workletState";
 import { math } from "$library/math";
 
 const SR = 48000;
@@ -11,7 +12,9 @@ const F = Math.fround;
 // Глобальные объекты, которые сгенерированный код видеть не должен
 const hidden = ['globalThis', 'window', 'self', 'global', 'process', 'eval', 'Function', 'require', 'fetch'];
 
-type Kernel = (ins: (Float32Array | undefined)[], outs: Float32Array[], ps: Float32Array[], n: number, frame: number) => void;
+type Kernel = ((ins: (Float32Array | undefined)[], outs: Float32Array[], ps: Float32Array[], n: number, frame: number) => void) & {
+  state(next?: TWorkletState): TWorkletState;
+};
 
 // new Function — только в тестах: проверяем, что сгенерированный цикл считает как эталон
 const factoryOf = (source: string): (sr: number) => Kernel => (
@@ -28,14 +31,17 @@ const compiled = (graph: TGraph) => {
 };
 
 // Прогоняет блоки по `n` сэмплов; входы — функции от номера сэмпла, параметры — значения из конфигов
-const runner = (graph: TGraph, overrides: Record<number, (i: number) => number> = {}) => {
+const runner = (graph: TGraph, overrides: Record<number, (i: number) => number> = {}, startFrame = 0) => {
   const result = compiled(graph);
   const kernel = factoryOf(result.source)(SR);
   const defaults = paramDefaults(graph, result.params);
-  var frame = 0;
+  var frame = startFrame;
 
   return {
     result,
+    kernel,
+    // Снимок/восстановление состояния — как сообщения порта процессора
+    state: (next?: TWorkletState) => kernel.state(next),
     run(n: number, inputs: ((i: number) => number)[] = []) {
       const ins = result.inputs.map((_, k) => inputs[k] && Float32Array.from({ length: n }, (_, i) => inputs[k](frame + i)));
       const outs = result.outputs.map(() => new Float32Array(n));
@@ -62,6 +68,12 @@ const OUT = (slot = 'out1'): [string, Record<string, unknown>] => ['GroupOutput'
 const MATH = (op: string, values: Record<string, number> = {}): [string, Record<string, unknown>] => (
   ['Math', { _p: op, _a: 0, _b: 0, _c: 0, _d: 0, _e: 0, ...values }]
 );
+
+// Граф с постоянными ключами нод: как из проекта, где ноды могли сдвинуться
+const keyed = (nodes: [string, Record<string, unknown>?][], connect: TLink[], keys: string[]): TGraph => ({
+  ...graph(nodes, connect),
+  keys,
+});
 
 // Номер выхода ноды Math в sortPorts: после её входов
 const mathOut = (op: keyof typeof math) => math[op].length;
@@ -311,6 +323,174 @@ describe('block compiler: Expression', () => {
   });
 });
 
+describe('block compiler: state continuity', () => {
+  const EXPR = (expression: string, values: Record<string, number> = {}): [string, Record<string, unknown>] => (
+    ['Expression', { expression, _a: 0, _b: 0, _c: 0, _d: 0, ...values }]
+  );
+
+  it('exposes one state slot per piece of node state', () => {
+    // out ← Expression(y1 + in) ; Memory(value = Expression, write = 1) → out, петля в Expression
+    const result = compiled(keyed(
+      [EXPR('y1 + a'), ['Memory', { _value: 0, _write: 1 }], OUT()],
+      [
+        [[0, 4], [1, 0]],
+        [[1, 2], [0, 0]],
+        [[0, 4], [2, 0]],
+      ],
+      ['expr', 'mem', 'out']
+    ));
+
+    expect(result.states.map(slot => `${slot.name}@${slot.node}`)).toEqual(
+      expect.arrayContaining(['y1@0', 'value@1', 'delayed@0'])
+    );
+    // Петля тоже входит в состояние: её прошлый сэмпл переносится вместе с блоком
+    expect(result.states.find(slot => slot.name === 'delayed')!.kind).toBe('number');
+  });
+
+  it('reads and writes the state of the whole block', () => {
+    const { run, state } = runner(graph(
+      [EXPR('y1 + 1'), OUT()],
+      [[[0, 4], [1, 0]]]
+    ));
+
+    run(3);
+    const snapshot = state();
+    expect(snapshot).toEqual({ 'n:0:y1': 3 });
+
+    // Снимок копируется: правка снаружи не трогает процессор
+    snapshot['n:0:y1'] = 100;
+    expect(state()).toEqual({ 'n:0:y1': 3 });
+  });
+
+  it('keeps a feedback formula continuous when the block is rebuilt', () => {
+    // in → Expression(y1 + a) → out. Две сборки подряд, вторая стартует со снимка первой.
+    const build = (startFrame = 0) => runner(keyed(
+      [IN(), EXPR('y1 + a'), OUT()],
+      [
+        [[0, 0], [1, 0]],
+        [[1, 4], [2, 0]],
+      ],
+      ['in', 'expr', 'out']
+    ), {}, startFrame);
+
+    const first = build();
+    const before = [...first.run(6, [ramp])[0]];
+    const snapshot = first.state();
+    // y1 — прошлый выход: последний сэмпл первой половины
+    expect(snapshot['n:expr:y1']).toBeCloseTo(before.at(-1)!, 6);
+
+    // Пересобрали с тем же графом и перенесли состояние: продолжение, а не сброс
+    const second = build(6);
+    second.state(snapshot);
+    const after = [...second.run(4, [ramp])[0]];
+
+    // Эталон: тот же блок, посчитанный непрерывно с нуля
+    const whole = build().run(10, [ramp])[0];
+
+    expect([...before, ...after]).toEqual(whole);
+  });
+
+  it('continues the count and phase after a slider value changes', () => {
+    // Counter считает по проводу Slider: смена значения слота меняет только живой параметр,
+    // но пересборка графа не должна обнулять счёт
+    const graphOf = (step: number) => keyed(
+      [['Slider', { _value: step }], ['Counter', { _trigger: 0, _step: 0, _reset: 0, _modulo: 0 }], OUT()],
+      [[[0, 1], [1, 1]], [[1, 4], [2, 0]]],
+      ['slider', 'counter', 'out']
+    );
+
+    const trigger = (i: number) => i % 2;
+    const first = runner(graphOf(1), { 1: trigger });
+    // Фронты на сэмплах 1, 3: счёт 1, 2
+    first.run(4);
+    const before = first.state();
+    expect(before['n:counter:count']).toBe(2);
+
+    // Пересобрали с новым значением слайдера, состояние перенесли
+    const second = runner(graphOf(2), { 1: trigger });
+    second.state(before);
+
+    expect(second.state()['n:counter:count']).toBe(2);
+    // Счёт продолжается: фронт прибавит новый шаг (2) к сохранённым 2
+    expect(second.run(2)[0]).toEqual([2, 4]);
+  });
+
+  it('keeps LFO phase and S&H value across a rebuild', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.25);
+
+    const lfo = (startFrame = 0) => runner(keyed(
+      [['LFO', { _shape: 'random', _rate: 1000, _depth: 1, _offset: 0, _phase: 0, _sync: 0 }], OUT()],
+      [[[0, 5], [1, 0]]],
+      ['lfo', 'out']
+    ), {}, startFrame);
+
+    const first = lfo();
+    const before = [...first.run(6)[0]];
+    const snapshot = first.state();
+    // rate 1000 / SR сэмплов за 6 сэмплов
+    expect(snapshot['n:lfo:phase']).toBeCloseTo(6000 / SR, 9);
+    expect(snapshot['n:lfo:held']).toBeCloseTo(0.25 * 2 - 1, 9);
+
+    const second = lfo(6);
+    second.state(snapshot);
+    const after = [...second.run(4)[0]];
+
+    // Фаза не сброшена: продолжение той же ступени S&H, а не новый цикл с rand()
+    expect(after).toEqual(before.slice(-1).flatMap(v => [v, v, v, v]));
+  });
+
+  it('keeps Memory contents across a rebuild', () => {
+    const memory = (keys = ['m', 'p', 'o']) => runner(keyed(
+      [['Memory', { _value: 0, _write: 1 }], MATH('plus', { _b: 1 }), OUT()],
+      [[[0, 2], [1, 0]], [[1, 2], [0, 0]], [[0, 2], [2, 0]]],
+      keys
+    ));
+
+    const first = memory();
+    first.run(4);
+    const snapshot = first.state();
+
+    const second = memory();
+    second.state(snapshot);
+
+    expect(second.run(3)).toEqual([[5, 6, 7]]);
+  });
+
+  it('restores state by node key, not by position', () => {
+    // Ноды переставили: ключи те же, индексы другие — состояние должно найти свои ноды
+    const before = runner(keyed(
+      [['Memory', { _value: 0, _write: 1 }], MATH('plus', { _b: 1 }), OUT()],
+      [[[0, 2], [1, 0]], [[1, 2], [0, 0]], [[0, 2], [2, 0]]],
+      ['mem', 'plus', 'out']
+    ));
+
+    before.run(3);
+    const snapshot = before.state();
+
+    // Тот же граф, но Memory теперь последней нодой перед выходом
+    const after = runner(keyed(
+      [MATH('plus', { _b: 1 }), ['Memory', { _value: 0, _write: 1 }], OUT()],
+      [[[0, 2], [1, 0]], [[1, 2], [0, 0]], [[1, 2], [2, 0]]],
+      ['plus', 'mem', 'out']
+    ));
+
+    after.state(snapshot);
+    expect(after.run(2)[0]).toEqual([4, 5]);
+  });
+
+  it('ignores foreign keys and wrong types when restoring', () => {
+    const { run, state } = runner(graph([EXPR('y1 + 1'), OUT()], [[[0, 4], [1, 0]]]));
+    run(2);
+
+    state({ 'n:0:y1': 'x' } as unknown as TWorkletState);
+    expect(state()['n:0:y1']).toBe(2);
+
+    state({ 'n:0:y1': 10, 'n:9:y1': 99 });
+    expect(state()).toEqual({ 'n:0:y1': 10 });
+    expect(run(1)).toEqual([[11]]);
+  });
+});
+
 describe('block compiler: Math table', () => {
   const inputs = [0.75, -2.5, 3, 0.125, 9];
   const skip = new Set(['random', 'srandom', 'SAMPLE_RATE']);
@@ -455,22 +635,25 @@ describe('block compiler: templates', () => {
 
 describe('block processor', () => {
   type Processor = {
-    port: { onmessage: ((event: { data: unknown; }) => void) | null; };
+    port: { onmessage: ((event: { data: unknown; }) => void) | null; postMessage(message: unknown): void; };
     process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>): boolean;
   };
 
-  const load = (result: TCompiled) => {
-    const registered: Record<string, { new(): Processor; parameterDescriptors: { name: string; }[]; }> = {};
+  const load = (result: TCompiled, processorOptions?: unknown) => {
+    const registered: Record<string, { new(options?: unknown): Processor; parameterDescriptors: { name: string; }[]; }> = {};
 
     new Function(...hidden, 'registerProcessor', 'AudioWorkletProcessor', 'sampleRate', 'currentFrame', blockProcessorSource('BlockTest', result))(
       ...hidden.map(() => undefined),
       (name: string, ctor: never) => registered[name] = ctor,
-      class { port = { onmessage: null }; },
+      class { port = { onmessage: null, postMessage() { } }; },
       SR,
       0
     );
 
-    return registered.BlockTest;
+    const Processor = registered.BlockTest;
+    const create = () => new Processor(processorOptions ? { processorOptions } : undefined);
+
+    return Object.assign(create, { parameterDescriptors: Processor.parameterDescriptors });
   };
 
   it('maps slots to inputs and outputs and params to k0…', () => {
@@ -486,7 +669,7 @@ describe('block processor', () => {
 
     expect(Processor.parameterDescriptors.map(p => p.name)).toEqual(['k0', 'k1', 'k2']);
 
-    const processor = new Processor();
+    const processor = Processor();
     const y = [new Float32Array(3), new Float32Array(3)];
     const z = [new Float32Array(3)];
 
@@ -505,12 +688,12 @@ describe('block processor', () => {
     const Processor = load(compiled(graph([IN(), MATH('plus', { _b: 1 }), OUT()], [[[0, 0], [1, 0]], [[1, 2], [2, 0]]])));
     const out = [new Float32Array(2)];
 
-    new Processor().process([[]], [out], { k0: new Float32Array([1]) });
+    Processor().process([[]], [out], { k0: new Float32Array([1]) });
     expect([...out[0]]).toEqual([1, 1]);
   });
 
   it('stops on the stop message', () => {
-    const processor = new (load(compiled(graph([OUT()], []))))();
+    const processor = load(compiled(graph([OUT()], [])))();
 
     processor.port.onmessage!({ data: STOP_MESSAGE });
     expect(processor.process([], [[new Float32Array(1)]], {})).toBe(false);
@@ -518,5 +701,90 @@ describe('block processor', () => {
 
   it('rejects unsafe processor names', () => {
     expect(() => blockProcessorSource('a"); fetch("x"); ("', compiled(graph([OUT()], [])))).toThrow();
+  });
+});
+
+describe('block processor: state', () => {
+  type Processor = {
+    port: {
+      onmessage: ((event: { data: unknown; }) => void) | null;
+      postMessage(message: unknown): void;
+    };
+    process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>): boolean;
+  };
+
+  // Процессор с подменённым портом: собранные сообщения доступны тесту
+  const load = (result: TCompiled, processorOptions?: unknown) => {
+    const registered: Record<string, { new(options?: unknown): Processor; parameterDescriptors?: { name: string; }[]; }> = {};
+    const sent: unknown[] = [];
+
+    new Function(...hidden, 'registerProcessor', 'AudioWorkletProcessor', 'sampleRate', 'currentFrame', blockProcessorSource('StateTest', result))(
+      ...hidden.map(() => undefined),
+      (name: string, ctor: never) => registered[name] = ctor,
+      class { port = { onmessage: null, postMessage: (message: unknown) => sent.push(message) }; },
+      SR,
+      0
+    );
+
+    const Processor = registered.StateTest;
+    // Web Audio всегда присылает массивы для каждого объявленного параметра
+    const parameters = () => Object.fromEntries(
+      (Processor.parameterDescriptors ?? []).map(({ name }) => [name, new Float32Array([0])])
+    );
+    const create = () => {
+      const processor = new Processor(processorOptions ? { processorOptions: { state: processorOptions } } : undefined);
+      return { processor, parameters, sent };
+    };
+
+    return create;
+  };
+
+  const feedback = () => compiled(keyed(
+    [IN(), ['Expression', { expression: 'y1 + a', _a: 0, _b: 0, _c: 0, _d: 0 }], OUT()],
+    [[[0, 0], [1, 0]], [[1, 4], [2, 0]]],
+    ['in', 'expr', 'out']
+  ));
+
+  const run = ({ processor, parameters }: ReturnType<ReturnType<typeof load>>, values: number[]) => {
+    const out = [new Float32Array(values.length)];
+    processor.process([[Float32Array.from(values)]], [out], parameters());
+    return [...out[0]];
+  };
+
+  it('replies to a snapshot request with the whole state', () => {
+    const setup = load(feedback())();
+    run(setup, [1, 1, 1]);
+
+    setup.processor.port.onmessage!({ data: { type: 'w-nodes:state', action: 'get', id: 7 } });
+
+    expect(setup.sent.at(-1)).toEqual({
+      type: 'w-nodes:state',
+      action: 'reply',
+      id: 7,
+      state: { 'n:expr:y1': 3 },
+    });
+  });
+
+  it('applies pushed state on the next block', () => {
+    const setup = load(feedback())();
+    run(setup, [0, 0]);
+
+    setup.processor.port.onmessage!({ data: { type: 'w-nodes:state', action: 'set', state: { 'n:expr:y1': 40 } } });
+
+    expect(run(setup, [2, 2])).toEqual([42, 44]);
+  });
+
+  it('starts from the state given to the constructor', () => {
+    // Пересборка: новая программа начинается ровно с того же y1, без шва в один сэмпл
+    const setup = load(feedback(), { 'n:expr:y1': 5 })();
+    expect(run(setup, [0, 0])).toEqual([5, 5]);
+  });
+
+  it('ignores a malformed seed and foreign state', () => {
+    const setup = load(feedback(), { 'n:other:y1': 99, 'n:expr:y1': 'x' })();
+    expect(run(setup, [1])).toEqual([1]);
+
+    setup.processor.port.onmessage!({ data: { type: 'w-nodes:state', action: 'set', state: 'oops' } });
+    expect(run(setup, [1])).toEqual([2]);
   });
 });

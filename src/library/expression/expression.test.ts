@@ -331,6 +331,47 @@ describe('expression processor', () => {
     expect([...out[0]]).toEqual([20, 200]);
   });
 
+  it('shares y1 with a compiled block through the state protocol', () => {
+    const processor = load('y1 + 1');
+    const out = [new Float32Array(2)];
+    processor.process([], [out], params());
+
+    // Снимок состояния — тот же ключ, что у блока
+    const replies: unknown[] = [];
+    processor.port.postMessage = (message: unknown) => replies.push(message);
+    processor.port.onmessage!({ data: { type: 'w-nodes:state', action: 'get', id: 3 } });
+    expect(replies).toEqual([{ type: 'w-nodes:state', action: 'reply', id: 3, state: { y1: 2 } }]);
+
+    // Состояние из блока подхватывается без сброса
+    processor.port.onmessage!({ data: { type: 'w-nodes:state', action: 'set', state: { y1: 10 } } });
+    processor.process([], [out], params());
+    expect([...out[0]]).toEqual([11, 12]);
+  });
+
+  it('starts from y1 given to the constructor', () => {
+    const result = compile('y1 + 1');
+    if (!result.ok) throw result.error;
+
+    const registered: Record<string, new (options?: unknown) => Processor> = {};
+
+    class AudioWorkletProcessor {
+      port = { onmessage: null, postMessage: () => { } };
+    }
+
+    run(
+      `(() => { ${processorSource('SeededExpression')} })()`,
+      ['registerProcessor', 'AudioWorkletProcessor', 'sampleRate', 'currentFrame', 'Function'],
+      [(name: string, ctor: never) => registered[name] = ctor, AudioWorkletProcessor, 48000, 0, Function]
+    );
+
+    const processor = new registered.SeededExpression({ processorOptions: { state: { y1: 5 } } });
+    processor.port.onmessage!({ data: { kernel: result.kernel } });
+
+    const out = [new Float32Array(2)];
+    processor.process([], [out], params());
+    expect([...out[0]]).toEqual([6, 7]);
+  });
+
   it('rejects unsafe processor names', () => {
     expect(() => processorSource('a"); alert(1); ("')).toThrow();
   });

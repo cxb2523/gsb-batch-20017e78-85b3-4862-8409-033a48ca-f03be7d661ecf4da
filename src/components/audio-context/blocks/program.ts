@@ -1,4 +1,5 @@
-import { TCompiled, blockProcessorSource, paramName } from "$library/blockCompiler";
+import { TCompiled, TStateSlot, blockProcessorSource, paramName } from "$library/blockCompiler";
+import { TWorkletState, requestState } from "$library/workletState";
 
 import { STOP_MESSAGE } from "$library/expression";
 import { SignalNode } from "../lib/signalNode";
@@ -14,6 +15,10 @@ export type TProgram = {
   signals: unknown[];
   // Соединения «вход блока → выход блока» мимо процессора
   passthrough: TPair<AudioNode>[];
+  // Слоты состояния, которые понимает этот процессор
+  states: TStateSlot[];
+  // Снимок состояния процессора: по нему следующая сборка продолжает счёт
+  readState(): Promise<TWorkletState>;
   stop(): void;
 };
 
@@ -24,17 +29,23 @@ type TBuildOptions = {
   defaults: number[];
   outer(id: string): AudioNode;
   onError(): void;
+  // Состояние, с которого новый процессор начинает счёт. Функция вызывается после загрузки
+  // модуля, прямо перед созданием узла: снимок берётся как можно позже, без разрыва звука.
+  seed?: TWorkletState | (() => Promise<TWorkletState>);
 };
 
 // Один AudioWorkletNode на весь блок: вход процессора на каждый входной слот, выход — на выходной.
 // Каждый вход и выход — один канал: внутри блока всё моно, как и у параметров нод.
-export async function buildProgram({ key, result, signals, defaults, outer, onError }: TBuildOptions): Promise<TProgram> {
+export async function buildProgram({ key, result, signals, defaults, outer, onError, seed }: TBuildOptions): Promise<TProgram> {
   const passthrough = result.passthrough.map(([a, b]): TPair<AudioNode> => [outer(a), outer(b)]);
+  const states = result.states;
 
   if (!result.outputs.length)
-    return { key, signals, passthrough, stop() { } };
+    return { key, signals, passthrough, states, readState: async () => ({}), stop() { } };
 
   const processor = await defineRuntimeWorklet(`block:${result.source}`, name => blockProcessorSource(name, result));
+  // Снимок берём после загрузки модуля, чтобы перерыв между старой и новой программой был минимальным
+  const initial = typeof seed === 'function' ? await seed() : seed;
   const node = new AudioWorkletNode(ctx, processor, {
     numberOfInputs: result.inputs.length,
     numberOfOutputs: result.outputs.length,
@@ -42,6 +53,8 @@ export async function buildProgram({ key, result, signals, defaults, outer, onEr
     channelCount: 1,
     channelCountMode: 'explicit',
     channelInterpretation: 'speakers',
+    // Начальное состояние применяется в конструкторе процессора — до первого process()
+    processorOptions: initial && Object.keys(initial).length ? { state: initial } : undefined,
   });
 
   node.onprocessorerror = onError;
@@ -75,6 +88,8 @@ export async function buildProgram({ key, result, signals, defaults, outer, onEr
     key,
     signals,
     passthrough,
+    states,
+    readState: () => requestState(node.port),
     stop() {
       node.onprocessorerror = null;
       unwire();

@@ -1,4 +1,5 @@
 import { MAX_LENGTH, PROCESSOR_INPUTS, STOP_MESSAGE, compile, processorSource } from "$library/expression";
+import { STATE_MESSAGE, TWorkletState, pushState, requestState } from "$library/workletState";
 import { ReadonlySignal, Signal, computed, effect, signal, useSignalEffect } from "@preact/signals-react";
 import { group, icon } from "../_groups";
 import { prop, reactive } from "@vicimpa/decorators";
@@ -115,6 +116,23 @@ export default class extends BaseNode {
   #node: AudioWorkletNode | null = null;
   #sent = 0;
 
+  // Состояние y1 для переноса в/из скомпилированного блока: не ждём загрузки процессора
+  #pending: TWorkletState | null = null;
+
+  async readWorkletState(): Promise<TWorkletState | null> {
+    if (this.#node)
+      return requestState(this.#node.port);
+
+    return this.#pending ? { ...this.#pending } : { y1: 0 };
+  }
+
+  writeWorkletState(state: TWorkletState) {
+    if (this.#node)
+      pushState(this.#node.port, state);
+    else
+      this.#pending = { ...state };
+  }
+
   #send() {
     if (!this.#node || this.#kernel === null)
       return;
@@ -133,7 +151,10 @@ export default class extends BaseNode {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
+        // y1, отложенный до загрузки процессора (перенос состояния в блок)
+        processorOptions: this.#pending ? { state: this.#pending } : undefined,
       });
+      this.#pending = null;
 
       const unwire = dispose(
         ...PROCESSOR_INPUTS.map(key => pipe(this[`_${key}`], node.parameters.get(key)!)),
@@ -141,6 +162,10 @@ export default class extends BaseNode {
       );
 
       node.port.onmessage = ({ data }) => {
+        // Ответ на запрос состояния — не ответ на ядро, хотя id может совпасть
+        if (data?.type === STATE_MESSAGE)
+          return;
+
         // Ответ на устаревшее ядро не интересен
         if (data?.id !== this.#sent)
           return;

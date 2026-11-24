@@ -28,7 +28,7 @@ vi.stubGlobal('AudioWorkletNode', class { });
 type Processor = {
   context: any;
   props: any;
-  port: { onmessage: (e: { data: any; }) => void; };
+  port: { onmessage: (e: { data: any; }) => void; postMessage(message: unknown): void; };
   process(inputs: any[], outputs: Float32Array[][], parameters: Record<string, Float32Array>): boolean;
 };
 
@@ -36,15 +36,15 @@ const load = async (module: () => Promise<unknown>) => {
   modules.length = 0;
   await module();
 
-  var Processor: (new () => Processor) & { parameterDescriptors: { name: string, defaultValue: number; }[]; } = null!;
+  var Processor: (new (options?: unknown) => Processor) & { parameterDescriptors: { name: string, defaultValue: number; }[]; } = null!;
 
   new Function('registerProcessor', 'AudioWorkletProcessor', modules[0])(
     (_name: string, cls: typeof Processor) => Processor = cls,
-    class { port = { onmessage: null }; }
+    class { port = { onmessage: null, postMessage: () => { } }; }
   );
 
-  return () => {
-    const processor = new Processor();
+  const create = (options?: unknown) => {
+    const processor = new Processor(options);
 
     // Обрабатывает блок: значения параметров по сэмплам, неуказанные — по умолчанию
     const run = (frames: number, params: Record<string, number[] | number> = {}) => {
@@ -64,6 +64,9 @@ const load = async (module: () => Promise<unknown>) => {
 
     return { processor, run };
   };
+
+  // Новый экземпляр с опциями (например, начальным состоянием) — тот же процессор
+  return () => ({ ...create(), Processor });
 };
 
 const lfo = await load(() => import('./LfoProcessor'));
@@ -184,5 +187,34 @@ describe('Counter worklet', () => {
   it('gives reset priority over trigger on the same sample', () => {
     const { run } = counter();
     expect(run(3, { trigger: [1, 0, 1], reset: [0, 0, 1] })).toEqual([1, 1, 0]);
+  });
+
+  it('shares its context through the state protocol', () => {
+    const { run, processor } = counter();
+    run(3, { trigger: [1, 1, 0] });
+
+    const replies: unknown[] = [];
+    processor.port.postMessage = (message: unknown) => replies.push(message);
+    processor.port.onmessage({ data: { type: 'w-nodes:state', action: 'get', id: 1 } });
+
+    expect(replies).toEqual([{
+      type: 'w-nodes:state',
+      action: 'reply',
+      id: 1,
+      state: { trigger: 0, reset: 0, count: 1 },
+    }]);
+
+    // Состояние из скомпилированного блока подхватывается: счёт продолжается
+    processor.port.onmessage({ data: { type: 'w-nodes:state', action: 'set', state: { count: 9 } } });
+    expect(run(1, { trigger: 1 })).toEqual([10]);
+  });
+
+  it('starts from context passed in processorOptions', () => {
+    const { Processor } = counter();
+    const seeded = new Processor({ processorOptions: { state: { count: 7 } } });
+    const out = new Float32Array(1);
+
+    seeded.process([], [[out]], { trigger: new Float32Array([1]), step: new Float32Array([1]), reset: new Float32Array([0]), modulo: new Float32Array([0]) });
+    expect(out[0]).toBe(8);
   });
 });

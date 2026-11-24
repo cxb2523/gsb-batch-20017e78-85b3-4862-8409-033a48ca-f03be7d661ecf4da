@@ -1,10 +1,11 @@
 import { BookmarkPlus, Boxes, ChevronRight, PackageOpen, X, Zap } from "lucide-react";
-import { Editor, NodeProject, TExportPurpose, TNodeProjectProps, blurMap, focusMap } from "$components/node-editor";
+import { Editor, NodeItem, NodeProject, TExportPurpose, TNodeProjectProps, blurMap, focusMap } from "$components/node-editor";
 import { IBlock, TSlot, openBlocks, slotId } from "./state";
 import { Row, TextInput } from "../lib/Row";
 import { TProgram, buildProgram } from "./program";
 import { checkPorts, programSignals } from "./ports";
-import { compileBlock, paramDefaults, templates } from "$library/blockCompiler";
+import { TGraph, compileBlock, paramDefaults, restoreNodes, snapshotNodes, templates } from "$library/blockCompiler";
+import { compileFailure, runtimeFailure } from "./failure";
 import { computed, effect, untracked } from "@preact/signals-react";
 import { Routing, bridgePairs } from "./routing";
 import { connect } from "@vicimpa/react-decorators";
@@ -153,6 +154,33 @@ export default class Group extends BaseNode implements IBlock {
     this.reload();
   }
 
+  // Постоянный ключ каждой ноды: по нему состояние процессора переживает пересборку,
+  // даже если ноды в списке сдвинулись (добавили, удалили, переставили)
+  #nodeKeys() {
+    const { inner } = this;
+
+    if (!inner)
+      return [] as string[];
+
+    return inner.store.flatMap(item => {
+      const node = item.ref.current;
+
+      if (!node)
+        return [];
+
+      return [this.#keys.get(node) ?? this.#claimKey(node)];
+    });
+  }
+
+  #keys = new WeakMap<NodeItem, string>();
+  #nextKey = 0;
+
+  #claimKey(node: NodeItem) {
+    const key = `n${this.#nextKey++}`;
+    this.#keys.set(node, key);
+    return key;
+  }
+
   attach(inner: NodeProject) {
     this.inner = inner;
     this.reload();
@@ -247,13 +275,45 @@ export default class Group extends BaseNode implements IBlock {
     this.#compileTimer = setTimeout(() => this.recompile(), delay);
   }
 
+  // Остановка по желанию пользователя: состояние программы переезжает в живые ноды,
+  // и блок продолжает с той же фазы, счёта и y1, но уже своими нодами. Только удаление
+  // блока (dispose) сбрасывает состояние.
+  async suspendCompiled() {
+    // Пока снимаем снимок, пересборка не должна снять программу и потерять состояние
+    clearTimeout(this.#compileTimer);
+
+    const program = this.program;
+    const nodes = this.#liveNodes();
+
+    if (program) {
+      const state = await program.readState();
+
+      // Пока читали, блок снова включили или программу заменили: снимок уже не наш,
+      // и снимать программу нельзя — иначе compiled-блок останется без звука
+      if (this.program !== program || this.compiled)
+        return;
+
+      if (state && Object.keys(state).length)
+        restoreNodes(program.states, nodes, state);
+    }
+
+    this.stopCompiled();
+  }
+
+  #liveNodes(): NodeItem[] {
+    return this.inner
+      ? this.inner.store.flatMap(item => item.ref.current ?? [])
+      : [];
+  }
+
   // Собирает граф блока в один процессор. Пока сборка не готова или не удалась, блок звучит как обычно.
   async recompile() {
     const version = ++this.#compileVersion;
     const { inner } = this;
 
+    // Выключение Compiled ведёт suspendCompiled: оно должно успеть снять состояние
     if (!this.compiled || !this.mounted)
-      return this.setProgram(null);
+      return;
 
     if (this.broken)
       return this.failCompile('Block graph failed to load');
@@ -264,12 +324,14 @@ export default class Group extends BaseNode implements IBlock {
 
     const nodes = inner.store.map(item => item.ref.current!);
     const { data } = inner.serialize(nodes);
-    const result = compileBlock(data);
+    // Постоянные ключи нод — по ним состояние переживает пересборку, даже если ноды сдвинулись
+    const graph: TGraph = { ...data, keys: this.#nodeKeys() };
+    const result = compileBlock(graph);
 
     if (!result.ok)
       return this.failCompile(result.reason);
 
-    const mismatch = checkPorts(nodes, data);
+    const mismatch = checkPorts(nodes, graph);
 
     // Порты могли ещё не перемонтироваться (например, после смены операции Math): ждём немного
     if (mismatch && this.#portRetries++ < 3)
@@ -284,7 +346,7 @@ export default class Group extends BaseNode implements IBlock {
     const signals = programSignals(nodes, result);
     const current = this.program;
 
-    // Поменялись только значения или позиции — программа та же
+    // Поменялись только значения или позиции — программа та же, состояние уже внутри неё
     if (current && current.key === key && current.signals.every((signal, i) => signal === signals[i])) {
       this.compileError = '';
       return;
@@ -295,11 +357,17 @@ export default class Group extends BaseNode implements IBlock {
         key,
         result,
         signals,
-        defaults: paramDefaults(data, result.params),
+        defaults: paramDefaults(graph, result.params),
         outer: id => this.outerGain(id),
+        // Состояние для новой сборки: старая программа ещё звучит — снимаем его с неё.
+        // Если программы не было (первый запуск), берём состояние живых нод.
+        seed: () => current
+          ? current.readState()
+          : snapshotNodes(result.states, nodes),
         onError: () => {
+          // Процессор умер: его нельзя держать, иначе была бы тишина
           if (this.program === program)
-            this.failCompile('Compiled block stopped with an error');
+            this.failCompile('Compiled block stopped with an error', true);
         },
       });
 
@@ -309,6 +377,9 @@ export default class Group extends BaseNode implements IBlock {
       }
 
       this.compileError = '';
+      // Смена программы: новая уже звучит, состояние перенесено из старой — та снимается.
+      // Ноды внутри продолжают считать вхолостую; их состояние не трогаем: если блок выключат,
+      // его и так заменит снимок из программы (см. suspendCompiled).
       this.setProgram(program);
     } catch (error) {
       console.error(error);
@@ -318,9 +389,18 @@ export default class Group extends BaseNode implements IBlock {
     }
   }
 
-  failCompile(reason: string) {
-    this.compileError = reason;
-    this.setProgram(null);
+  // Ошибка сборки: причина на виду. Работающая программа продолжает звучать — иначе был бы провал
+  // в тишину; потому что новую собрать не удалось, старую не трогаем. Только рантайм-крах
+  // процессора (onError) снимает его, чтобы блок снова зазвучал своими нодами.
+  failCompile(reason: string, runtime = false) {
+    const { error, keep } = runtime
+      ? runtimeFailure<TProgram>(reason)
+      : compileFailure(reason, this.program);
+
+    this.compileError = error;
+
+    if (this.program !== keep)
+      this.setProgram(keep);
   }
 
   // Новая программа уже подключена: переключаем мосты, потом снимаем старую
@@ -334,6 +414,7 @@ export default class Group extends BaseNode implements IBlock {
     old?.stop();
   }
 
+  // Пользователь выключил Compiled, остановил или удалил блок — только здесь состояние сбрасывается
   stopCompiled() {
     this.#compileVersion++;
     clearTimeout(this.#compileTimer);
@@ -419,7 +500,8 @@ export default class Group extends BaseNode implements IBlock {
       }),
       effect(() => {
         if (!this.compiled) {
-          untracked(() => this.stopCompiled());
+          // Выключили Compiled: снимаем снимок и отдаём его нодам — блок продолжит с той же фазы
+          untracked(() => this.suspendCompiled());
           return;
         }
 
@@ -462,7 +544,8 @@ export default class Group extends BaseNode implements IBlock {
     if (this.compileError)
       return (
         <div className={s.message} data-error title={this.compileError}>
-          {this.compileError}. Playing uncompiled.
+          {/* Старая программа ещё звучит — так и пишем, чтобы не было сюрприза в звуке */}
+          {this.compileError}. {this.program ? 'Playing the last build.' : 'Playing uncompiled.'}
         </div>
       );
 

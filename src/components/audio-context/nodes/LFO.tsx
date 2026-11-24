@@ -50,6 +50,10 @@ export default class extends BaseNode {
     () => this.#processor.destroy()
   );
 
+  // Состояние фазы и S&H для переноса в/из скомпилированного блока
+  readWorkletState = () => this.#processor.readWorkletState();
+  writeWorkletState = (state: Record<string, unknown>) => this.#processor.writeWorkletState(state);
+
   output = (
     <AudioPort value={this.#processor} output />
   );

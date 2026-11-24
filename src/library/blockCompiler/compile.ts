@@ -1,4 +1,5 @@
 import { TConfig, TFeature, TPorts, configValue, mathOperation, slotOf, templates } from "./templates";
+import { TStateKind, stateHelpersSource } from "$library/workletState";
 
 import { helpers } from "$library/expression";
 import { math } from "$library/math";
@@ -10,14 +11,29 @@ export type TGraph = {
   nodes: string[];
   connect: TLink[];
   configs: TConfig[];
+  // Постоянные ключи нод (id ноды в проекте): по ним состояние переживает пересборку,
+  // даже если ноды в списке сдвинулись. Без них ключом служит индекс.
+  keys?: (string | number)[];
 };
 
 // Живой параметр: SignalNode `key` ноды `node` подаётся в параметр процессора `k<index>`
 export type TParam = { node: number; key: string; };
 
+// Состояние блока: ключи `n:<нода>:<имя>` (состояние ноды) и `d:<нода>` (прошлый сэмпл петли).
+// Значения — только числа, булевы и простые объекты, чтобы переживать structured clone.
+export type TBlockState = Record<string, unknown>;
+
+// Один слот состояния: где он в процессоре (`key`) и как называется у ноды (`name`)
+export type TStateSlot = {
+  node: number;
+  name: string;
+  key: string;
+  kind: TStateKind;
+};
+
 export type TCompiled = {
   ok: true;
-  // JS-выражение: фабрика (sr) => (ins, outs, ps, n, frame) => void
+  // JS-выражение: фабрика (sr) => (ins, outs, ps, n, frame) => void; у функции есть поле `state`
   source: string;
   // Слоты входов и выходов блока в порядке входов и выходов процессора
   inputs: string[];
@@ -27,6 +43,8 @@ export type TCompiled = {
   passthrough: [input: string, output: string][];
   // Ноды, которые читают прошлый сэмпл другой ноды (разрыв петли)
   delayed: number[];
+  // Состояние нод и петель: по нему программа продолжает счёт после пересборки
+  states: TStateSlot[];
 };
 
 export type TCompileResult = TCompiled | { ok: false; reason: string; };
@@ -180,10 +198,16 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
   // 5. Код
   const features = new Set<TFeature>();
   const state: string[] = [];
+  const slots: TStateSlot[] = [];
   const params: TParam[] = [];
   const body: string[] = [];
 
-  const value = (wire: TWire) => wire.delayed ? `s.d${wire.from}` : `v${wire.from}`;
+  // Постоянный ключ ноды: id из проекта, иначе индекс. По нему состояние переживает пересборку.
+  const keyOf = (node: number) => String(graph.keys?.[node] ?? node);
+  // Обращение к полю состояния: имя ключа не попадает в код как идентификатор
+  const stateKey = (path: string) => `s[${JSON.stringify(path)}]`;
+
+  const value = (wire: TWire) => wire.delayed ? stateKey(`d:${keyOf(wire.from)}`) : `v${wire.from}`;
 
   const inputExpr = (node: number, index: number) => {
     const list = wires[node][index];
@@ -224,9 +248,13 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
     const emitted = template.emit({
       inputs: locals,
       config: configs[node],
-      state(name, init) {
-        state.push(`n${node}_${name}: ${init}`);
-        return `s.n${node}_${name}`;
+      state(name, init, kind = 'number') {
+        const key = `n:${keyOf(node)}:${name}`;
+
+        state.push(`${JSON.stringify(key)}: ${init}`);
+        slots.push({ node, name, key, kind });
+
+        return stateKey(key);
       },
       local: name => `${name}_${node}`,
       use: feature => features.add(feature),
@@ -238,8 +266,12 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
     body.push(...emitted.code, `const v${node} = F(${emitted.out});`);
   }
 
-  for (const node of delayed)
-    state.push(`d${node}: 0`);
+  for (const node of delayed) {
+    const key = `d:${keyOf(node)}`;
+
+    state.push(`${JSON.stringify(key)}: 0`);
+    slots.push({ node, name: 'delayed', key, kind: 'number' });
+  }
 
   outputs.forEach((slot, k) => {
     const terms = sinks.get(slot)!.map(from => `v${from}`);
@@ -247,10 +279,10 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
   });
 
   for (const node of delayed)
-    body.push(`s.d${node} = v${node};`);
+    body.push(`${stateKey(`d:${keyOf(node)}`)} = v${node};`);
 
   // 6. Сборка
-  const prelude: string[] = ['const F = Math.fround;'];
+  const prelude: string[] = ['const F = Math.fround;', stateHelpersSource];
 
   if (features.has('math')) {
     const used = new Set<string | null>(order.filter(node => nodes[node] === 'Math').map(node => mathOperation(configs[node])));
@@ -274,7 +306,7 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
     'return function (sr) {',
     `const s = { ${state.join(', ')} };`,
     'let Z = new Float32Array(128);',
-    'return function (ins, outs, ps, n, frame) {',
+    'const kernel = function (ins, outs, ps, n, frame) {',
     'if (Z.length < n) Z = new Float32Array(n);',
     ...inputs.map((_, k) => `const x${k} = ins[${k}] || Z;`),
     ...outputs.map((_, k) => `const o${k} = outs[${k}];`),
@@ -284,6 +316,13 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
     ...body,
     '}',
     '};',
+    // Снимок и восстановление состояния: только известные ключи и значения того же вида
+    'kernel.state = function (next) {',
+    'if (next === undefined)',
+    'return cloneState(s);',
+    'return mergeState(s, next);',
+    '};',
+    'return kernel;',
     '};',
     '})()',
   ].join('\n');
@@ -296,6 +335,7 @@ export const compileBlock = (graph: TGraph): TCompileResult => {
     params,
     passthrough,
     delayed: [...delayed],
+    states: slots,
   };
 };
 

@@ -2,6 +2,8 @@
 // { kernel } и собирается внутри worklet — новая формула не регистрирует новый процессор.
 // Только доверенный код: ядро из генератора, имя процессора из счётчика.
 
+import { STATE_GET, STATE_MESSAGE, STATE_REPLY, STATE_SET } from "$library/workletState";
+
 export const PROCESSOR_INPUTS = ['a', 'b', 'c', 'd'] as const;
 export const STOP_MESSAGE = '[STOP]';
 
@@ -26,11 +28,30 @@ registerProcessor(${JSON.stringify(name)}, class extends AudioWorkletProcessor {
 
   constructor(options) {
     super(options);
+    // Состояние из processorOptions применяется до первого process(): шва при пересборке нет
+    const seed = options && options.processorOptions && options.processorOptions.state;
+    if (seed && typeof seed.y1 === 'number' && Number.isFinite(seed.y1))
+      this.y1 = seed.y1;
     this.port.onmessage = (event) => {
       const data = event.data;
 
       if (data === ${JSON.stringify(STOP_MESSAGE)}) {
         this.running = false;
+        return;
+      }
+
+      if (data && data.type === ${JSON.stringify(STATE_MESSAGE)}) {
+        if (data.action === ${JSON.stringify(STATE_GET)}) {
+          this.port.postMessage({
+            type: ${JSON.stringify(STATE_MESSAGE)},
+            action: ${JSON.stringify(STATE_REPLY)},
+            id: data.id,
+            state: { y1: this.y1 }
+          });
+        } else if (data.action === ${JSON.stringify(STATE_SET)} && data.state &&
+          typeof data.state.y1 === 'number' && Number.isFinite(data.state.y1)) {
+          this.y1 = data.state.y1;
+        }
         return;
       }
 
